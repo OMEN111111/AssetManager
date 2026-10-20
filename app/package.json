@@ -1,0 +1,76 @@
+{
+  "name": "assetmanager-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev:api": "tsx src/server/index.ts",
+    "dev:web": "vite",
+    "build": "vite build",
+    "start": "tsx src/server/index.ts",
+    "scan": "tsx src/cli/scan.ts",
+    "build:server": "esbuild src/server/index.ts --bundle --platform=node --format=esm --outfile=build/server.mjs",
+    "build:all": "vite build && esbuild src/server/index.ts --bundle --platform=node --format=esm --outfile=build/server.mjs",
+    "app": "electron .",
+    "dist": "electron-builder --win --x64"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "0.186.1",
+    "utif": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^35.7.5",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.25.12",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "main": "electron/main.cjs",
+  "build": {
+    "appId": "com.assetmanager.app",
+    "productName": "AssetManager",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "build/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    }
+  }
+}

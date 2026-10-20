@@ -1,0 +1,9 @@
+{
+  "name": "assetmanager-devtest",
+  "private": true,
+  "type": "module",
+  "version": "0.0.1",
+  "dependencies": {
+    "three": "0.186.1"
+  }
+}

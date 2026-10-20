@@ -1,0 +1,31 @@
+# deps / build
+node_modules/
+dist/
+*.tsbuildinfo
+
+# runtime data (sqlite, generated thumbs, logs)
+app/data/
+app/shot-*.png
+app/shot-*.jpg
+
+# build output (icons are committed intentionally)
+app/build/*
+!app/build/icon.ico
+!app/build/icon.png
+
+# packaged artifacts
+app/release/
+
+# test assets & browser profiles (large / machine specific)
+devtest/assets/
+devtest/.chrome*/
+devtest/dom.txt
+devtest/node_modules/
+devtest/ies-data/
+devtest/render.png
+
+# tooling artifacts
+.dsh-vision-router/
+*.log
+.DS_Store
+Thumbs.db
