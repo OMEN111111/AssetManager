@@ -563,3 +563,9 @@ html[data-theme="light"] ::-webkit-scrollbar-thumb{background:rgba(0,0,0,.18);ba
 /* downgrade options layout */
 .downopts{display:flex;gap:16px;flex-wrap:wrap;margin:8px 0}
 .downopts .vp-check{width:auto;flex:none;white-space:nowrap;font-size:12px}
+
+/* ===== update panel ===== */
+.updbox{margin:8px 0;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)}
+.updhead{font-size:12px;color:var(--text);margin-bottom:6px}
+.updnotes{max-height:150px;overflow:auto;white-space:pre-wrap;font:11px/1.5 ui-monospace,Consolas,monospace;
+  color:var(--text-dim);background:rgba(0,0,0,.18);border-radius:6px;padding:8px;margin:0 0 8px}

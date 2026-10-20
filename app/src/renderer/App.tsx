@@ -162,6 +162,10 @@ export default function App() {
   const lastIdx = useRef(0);
   const lastMeta = useRef('');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<any>(null);
+  const [updateStatus, setUpdateStatus] = useState('');
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [ghTokenDraft, setGhTokenDraft] = useState('');
   const [tagSel, setTagSel] = useState<Set<number>>(new Set());
   const [tagMulti, setTagMulti] = useState<Set<number>>(new Set());
   const [bulkColor, setBulkColor] = useState('#8b93a1');
@@ -195,7 +199,8 @@ export default function App() {
   const isElectron = !!win?.isElectron;
   const [menuOpen, setMenuOpen] = useState<string | null>(null);
 
-  const askText = (title: string, value = '') => new Promise<string | null>(resolve => setAsk({ title, value, resolve }));
+  const askRef = useRef<HTMLInputElement>(null);
+  const askText = (title: string, value = '', browse = false) => new Promise<string | null>(resolve => setAsk({ title, value, browse, resolve }));
   function submitAsk(v: string | null) {
     ask?.resolve(v);
     setAsk(null);
@@ -691,7 +696,7 @@ export default function App() {
   }
 
   async function addLibrary() {
-    const root = await askText('输入素材库根目录', 'F:\\02AssetLibrary\\Asset');
+    const root = await askText('输入素材库根目录', 'F:\\02AssetLibrary\\Asset', true);
     if (!root) return;
     const r = await api('/api/libraries', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ root }) });
     if (r.id) { setLib(r.id); boot(); }
@@ -1004,6 +1009,59 @@ export default function App() {
     if (t?.id) await assign(t.id, 'add');
     setDetailTagName('');
     if (lib) loadMeta(lib);
+  }
+
+  async function checkUpdate() {
+    setUpdateBusy(true);
+    setUpdateStatus('检查中…');
+    setUpdateInfo(null);
+    try {
+      const r = await api('/api/update/check');
+      setUpdateInfo(r);
+      setUpdateStatus(r.error ? '检查失败：' + r.error : r.newer ? `发现新版本 ${r.latest}` : `已是最新版本（${r.current}）`);
+    } catch (e: any) {
+      setUpdateStatus('检查失败：' + (e?.message || e));
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
+  async function installUpdate() {
+    const info = updateInfo;
+    if (!info?.newer) return;
+    const assets = (info.assets || []).filter((a: any) => /\.exe$/i.test(a.name));
+    const pick = assets.find((a: any) => /portable/i.test(a.name)) || assets.find((a: any) => /setup/i.test(a.name)) || assets[0];
+    if (!pick) { setUpdateStatus('该版本没有可用的安装包'); return; }
+    setUpdateBusy(true);
+    setUpdateStatus(`下载中…（${Math.round(pick.size / 1048576)} MB）`);
+    try {
+      const r = await api('/api/update/download', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ assetId: pick.id, name: pick.name, tag: info.tag })
+      });
+      if (!r.path) throw new Error(r.error || '下载失败');
+      const wapi = (window as any).winApi;
+      if (wapi?.applyUpdate) {
+        setUpdateStatus('下载完成，正在安装并重启…');
+        const res = await wapi.applyUpdate(r.path);
+        if (!res?.ok) setUpdateStatus('安装失败：' + (res?.error || '未知错误'));
+      } else {
+        setUpdateStatus('已下载到：' + r.path);
+      }
+    } catch (e: any) {
+      setUpdateStatus('更新失败：' + (e?.message || e));
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
+  async function saveGhToken() {
+    await api('/api/update/token', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: ghTokenDraft.trim() })
+    });
+    setGhTokenDraft('');
+    setUpdateStatus('令牌已保存（留空保存即清除）');
   }
 
   const counts = useMemo(() => ({ all: total, ...stats }), [total, stats]);
@@ -1582,6 +1640,30 @@ export default function App() {
               ))}
               {libs.length === 0 && <div className="hint" style={{ padding: 8 }}>还没有添加素材库。</div>}
             </div>
+            <div className="hint">版本与更新</div>
+            <div className="uvrow">
+              <button className="btn" onClick={checkUpdate} disabled={updateBusy}>
+                {updateBusy ? '处理中…' : '检查更新'}
+              </button>
+              <span className="hint" style={{ flex: 1 }}>
+                {updateStatus || (updateInfo ? `当前 ${updateInfo.current}` : '从 GitHub Releases 检查新版本')}
+              </span>
+            </div>
+            {updateInfo?.newer && (
+              <div className="updbox">
+                <div className="updhead">新版本 {updateInfo.latest}</div>
+                {updateInfo.notes && (
+                  <pre className="updnotes">{String(updateInfo.notes).split('\n').slice(0, 12).join('\n')}</pre>
+                )}
+                <button className="btn primary" onClick={installUpdate} disabled={updateBusy}>下载并安装</button>
+              </div>
+            )}
+            <div className="uvrow">
+              <input className="modal-input" style={{ flex: 1 }} type="password"
+                placeholder="GitHub 令牌（仅私有仓库需要，公开仓库留空）"
+                value={ghTokenDraft} onChange={e => setGhTokenDraft(e.target.value)} />
+              <button className="btn tiny" onClick={saveGhToken}>保存令牌</button>
+            </div>
             <div className="hint">忽略的文件夹名（回车或点添加，立即生效）</div>
             <div className="uvrow">
               <input className="modal-input" style={{ flex: 1 }} value={ignoreDraft} placeholder="例如 maps, textures"
@@ -1775,15 +1857,23 @@ export default function App() {
         <div className="modal-mask" onMouseDown={() => submitAsk(null)}>
           <div className="modal" onMouseDown={e => e.stopPropagation()}>
             <div className="modal-t">{ask.title}</div>
-            <input className="modal-input" autoFocus value={ask.value}
-              onChange={e => setAsk({ ...ask, value: e.target.value })}
-              onKeyDown={e => {
-                if (e.key === 'Enter') submitAsk(ask.value);
-                if (e.key === 'Escape') submitAsk(null);
-              }} />
+            <div className="uvrow" style={{ gap: 6 }}>
+              <input className="modal-input" style={{ flex: 1 }} autoFocus ref={askRef}
+                defaultValue={ask.value}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') submitAsk(askRef.current?.value ?? '');
+                  if (e.key === 'Escape') submitAsk(null);
+                }} />
+              {ask.browse && (window as any).amApi?.pickFolder && (
+                <button className="btn" onClick={async () => {
+                  const p = await (window as any).amApi.pickFolder();
+                  if (p && askRef.current) askRef.current.value = p;
+                }}>浏览…</button>
+              )}
+            </div>
             <div className="modal-b">
               <button className="btn" onClick={() => submitAsk(null)}>取消</button>
-              <button className="btn primary" onClick={() => submitAsk(ask.value)}>确定</button>
+              <button className="btn primary" onClick={() => submitAsk(askRef.current?.value ?? '')}>确定</button>
             </div>
           </div>
         </div>

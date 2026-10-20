@@ -1,7 +1,7 @@
 {
   "name": "assetmanager-app",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev:api": "tsx src/server/index.ts",
@@ -72,5 +72,6 @@
       "allowToChangeInstallationDirectory": true,
       "perMachine": false
     }
-  }
+  },
+  "license": "MIT"
 }

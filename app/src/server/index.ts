@@ -1,4 +1,5 @@
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -252,6 +253,93 @@ function getIssues(lib: number) {
 function ignoredSet() {
   const rows = db.prepare('SELECT asset_id, kind FROM issue_ignores').all() as any[];
   return new Set(rows.map(r => `${r.asset_id}|${r.kind}`));
+}
+
+function ghToken(): string {
+  if (process.env.AM_GH_TOKEN) return process.env.AM_GH_TOKEN;
+  try {
+    const f = path.join(DATA_DIR, 'github-token.txt');
+    if (fs.existsSync(f)) return fs.readFileSync(f, 'utf8').trim();
+  } catch { /* ignore */ }
+  return '';
+}
+
+function ghJson(pathname: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const token = ghToken();
+    const req = https.get({
+      host: 'api.github.com',
+      path: pathname,
+      headers: {
+        'User-Agent': 'AssetManager',
+        Accept: 'application/vnd.github+json',
+        ...(token ? { Authorization: `token ${token}` } : {})
+      }
+    }, res => {
+      if (res.statusCode && [301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        const loc = String(res.headers.location).replace(/^https?:\/\/api\.github\.com/, '');
+        resolve(ghJson(loc));
+        return;
+      }
+      let b = '';
+      res.setEncoding('utf8');
+      res.on('data', d => b += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(b)); }
+        catch { reject(new Error(`GitHub 返回异常（HTTP ${res.statusCode}）`)); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(20000, () => req.destroy(new Error('连接 GitHub 超时')));
+  });
+}
+
+function ghDownload(url: string, dest: string, redirects = 0): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const token = ghToken();
+    const req = https.get(url, {
+      headers: {
+        'User-Agent': 'AssetManager',
+        Accept: 'application/octet-stream',
+        ...(token ? { Authorization: `token ${token}` } : {})
+      }
+    }, res => {
+      if ([301, 302, 307, 308].includes(res.statusCode || 0) && res.headers.location && redirects < 6) {
+        res.resume();
+        resolve(ghDownload(String(res.headers.location), dest, redirects + 1));
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error('下载失败：HTTP ' + res.statusCode));
+        return;
+      }
+      const ws = fs.createWriteStream(dest);
+      const fail = (msg: string) => {
+        clearTimeout(idle);
+        clearTimeout(hard);
+        try { res.destroy(); ws.destroy(); } catch { /* ignore */ }
+        try { fs.unlinkSync(dest); } catch { /* ignore */ }
+        reject(new Error(msg));
+      };
+      let idle: any = setTimeout(() => fail('下载超时（30 秒无数据）'), 30000);
+      const hard: any = setTimeout(() => fail('下载超时（超过 10 分钟）'), 600000);
+      res.on('data', () => {
+        clearTimeout(idle);
+        idle = setTimeout(() => fail('下载超时（30 秒无数据）'), 30000);
+      });
+      res.pipe(ws);
+      ws.on('finish', () => {
+        clearTimeout(idle);
+        clearTimeout(hard);
+        try { resolve(fs.statSync(dest).size); } catch (e) { reject(e as any); }
+      });
+      ws.on('error', e => fail(String(e?.message || e)));
+    });
+    req.on('error', reject);
+    req.setTimeout(20000, () => req.destroy(new Error('连接超时')));
+  });
 }
 
 function fixIssue(body: any) {
@@ -530,6 +618,73 @@ function assetQuery(url: URL) {  const lib = Number(url.searchParams.get('lib') 
 async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
   const p = url.pathname;
+
+  if (p === '/api/update/token' && req.method === 'POST') {
+    const b = await body(req);
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const f = path.join(DATA_DIR, 'github-token.txt');
+    if (b.token) fs.writeFileSync(f, String(b.token).trim(), 'utf8');
+    else if (fs.existsSync(f)) fs.unlinkSync(f);
+    return json(res, 200, { ok: true });
+  }
+
+  if (p === '/api/update/check' && req.method === 'GET') {
+    const current = (() => {
+      try { return String(JSON.parse(fs.readFileSync(path.join(APP_ROOT, 'package.json'), 'utf8')).version || '0.0.0'); }
+      catch { return '0.0.0'; }
+    })();
+    try {
+      const rel = await ghJson('/repos/OMEN111111/AssetManager/releases/latest');
+      if (!rel || rel.message) throw new Error(rel?.message || 'GitHub 返回空响应');
+      const latest = String(rel.tag_name || '').replace(/^v/i, '');
+      const cmp = (a: string, b: string) => {
+        const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+          const d = (pa[i] || 0) - (pb[i] || 0);
+          if (d) return d;
+        }
+        return 0;
+      };
+      const assets = (rel.assets || []).map((a: any) => ({ id: a.id, name: a.name, size: a.size }));
+      return json(res, 200, {
+        current, latest, tag: String(rel.tag_name || ''), newer: cmp(latest, current) > 0,
+        notes: rel.body || '', publishedAt: rel.published_at || '', assets
+      });
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      const hint = /not found|404/i.test(msg)
+        ? '仓库不可访问：如果是私有仓库，请在下方填写 GitHub 令牌（需 repo 权限），或把仓库设为公开'
+        : msg;
+      return json(res, 200, { current, error: hint });
+    }
+  }
+
+  if (p === '/api/update/download' && req.method === 'POST') {
+    const b = await body(req);
+    const assetId = Number(b.assetId);
+    const name = String(b.name || '').replace(/[\\/:*?"<>|]/g, '_');
+    const tag = String(b.tag || '').replace(/[^\w.\-]/g, '');
+    if (!assetId || !/\.exe$/i.test(name)) return json(res, 400, { error: 'bad asset' });
+    const dir = path.join(DATA_DIR, 'updates');
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = path.join(dir, name);
+    const official = `https://api.github.com/repos/OMEN111111/AssetManager/releases/assets/${assetId}`;
+    const mirrors = tag
+      ? ['https://gh-proxy.com/', 'https://ghproxy.net/'].map(m => `${m}https://github.com/OMEN111111/AssetManager/releases/download/${tag}/${name}`)
+      : [];
+    const attempts = [...mirrors, official];
+    const errors: string[] = [];
+    for (const [i, url] of attempts.entries()) {
+      try {
+        const size = await ghDownload(url, dest);
+        return json(res, 200, { path: dest, size, source: i < mirrors.length ? 'mirror' : 'github' });
+      } catch (e: any) {
+        errors.push(String(e?.message || e));
+        try { fs.unlinkSync(dest); } catch { /* ignore */ }
+      }
+    }
+    return json(res, 500, { error: errors.join('；') || '下载失败' });
+  }
 
   if (p === '/api/state') {
     const libs = listLibraries(db);

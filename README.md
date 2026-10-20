@@ -1,5 +1,8 @@
 # AssetManager
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/OMEN111111/AssetManager)](https://github.com/OMEN111111/AssetManager/releases)
+
 本地 3D 资产库管理器：把散落在硬盘里的 **模型 / 材质 / 贴图 / 图纸 / HDRI / IES** 统一索引，提供预览、检索、标签与整理能力。面向 Connecter 式的工作流，纯本地运行，不上传任何文件。
 
 ![素材网格](prototype/shots/01-grid-dark.png)

@@ -162,6 +162,35 @@ app.whenReady().then(async () => {
     if (!win) return;
     win.setFullScreen(!win.isFullScreen());
   });
+  ipcMain.handle('dialog:pickFolder', async () => {
+    if (!win) return '';
+    const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] });
+    return r.canceled ? '' : (r.filePaths[0] || '');
+  });
+  ipcMain.handle('update:apply', async (_e, file) => {
+    if (!app.isPackaged) return { ok: false, error: '开发环境不支持自动更新' };
+    if (!file || !fs.existsSync(file)) return { ok: false, error: '更新文件不存在' };
+    const target = process.execPath;
+    const bat = path.join(app.getPath('temp'), `assetmanager-update-${Date.now()}.cmd`);
+    const lines = [
+      '@echo off',
+      'setlocal',
+      ':wait',
+      `tasklist /FI "PID eq ${process.pid}" /NH 2>nul | find "${process.pid}" >nul`,
+      'if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)',
+      `copy /Y "${file}" "${target}" >nul`,
+      `start "" "${target}"`,
+      'del "%~f0"'
+    ];
+    try {
+      fs.writeFileSync(bat, lines.join('\r\n'), 'utf8');
+      require('node:child_process').spawn('cmd.exe', ['/c', bat], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      setTimeout(() => app.quit(), 400);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String(e && e.message || e) };
+    }
+  });
   await createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });

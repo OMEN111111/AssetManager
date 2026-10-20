@@ -29,3 +29,6 @@ devtest/render.png
 *.log
 .DS_Store
 Thumbs.db
+
+# release upload staging
+dist-release/

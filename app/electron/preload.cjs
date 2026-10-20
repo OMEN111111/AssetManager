@@ -4,6 +4,8 @@ contextBridge.exposeInMainWorld('amApi', {
   getPath: (file) => {
     try { return webUtils.getPathForFile(file); } catch { return ''; }
   },
+  pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
+  applyUpdate: (file) => ipcRenderer.invoke('update:apply', file),
   platform: process.platform
 });
 
