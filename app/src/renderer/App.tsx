@@ -1002,6 +1002,23 @@ export default function App() {
     } finally { setBridgeBusy(false); }
   }
 
+  async function clearBridgeJobs() {
+    if (!window.confirm('清除最近任务记录？\n同时会删除队列产生的本地临时文件（拖放描述 .ms）。')) return;
+    setBridgeBusy(true);
+    try {
+      const r = await api('/api/bridge/clear', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
+      });
+      if (!r?.ok) { showToast('清除失败：' + (r?.error || '未知原因'), 'err'); return; }
+      showToast(`已清除 ${r.deleted} 条任务记录、${r.removedFiles} 个临时文件`, 'ok');
+      await loadBridge();
+    } catch (e: any) {
+      showToast('清除失败：' + String(e?.message || e), 'err');
+    } finally {
+      setBridgeBusy(false);
+    }
+  }
+
   async function installMaxPlugin() {
     setBridgeBusy(true);
     try {
@@ -2040,6 +2057,12 @@ export default function App() {
           title={maxConnected ? '3ds Max 已连接' : '3ds Max 未连接（点开插件面板）'}>
           <span className={'mxdot' + (maxConnected ? ' on' : '')} />3ds Max
         </button>
+        <button className={'bridgechip' + (blenderConnected ? ' on' : '')} onClick={() => setPluginsOpen(true)}
+          title={blenderConnected
+            ? `Blender 已连接${bridge?.targets?.blender?.version ? ' · 插件 v' + bridge.targets.blender.version : ''}`
+            : 'Blender 未连接（点开插件面板）'}>
+          <span className={'mxdot' + (blenderConnected ? ' on' : '')} />Blender
+        </button>
         <div className="status-right">
           <span className="cap">主题</span>
           {THEMES.map(t => (
@@ -2285,7 +2308,11 @@ export default function App() {
             </div>
             {bridgeJobs.length > 0 && (
               <div className="plug-sec">
-                <div className="plug-h">最近任务</div>
+                <div className="plug-h" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span>最近任务</span>
+                  <button className="btn tiny" disabled={bridgeBusy} onClick={clearBridgeJobs}
+                    title="清除最近任务记录，并删除队列临时文件">清除</button>
+                </div>
                 <div className="mxjobs">
                   {bridgeJobs.map(j => (
                     <div className="mxjob" key={j.id}>
@@ -2311,6 +2338,10 @@ export default function App() {
         <div className="modal-mask" onMouseDown={() => setSettingsOpen(false)}>
           <div className="modal wide" onMouseDown={e => e.stopPropagation()}>
             <div className="modal-t">设置 · 素材库</div>
+            <div className="uvrow" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+              <span className="hint">素材库目录（顺序影响侧栏）</span>
+              <button className="btn primary" onClick={addLibrary}>＋ 添加素材库</button>
+            </div>
             <div className="issues">
               {orderedLibs.map((l, idx) => (
                 <div className="issue" key={l.id}>
@@ -2336,17 +2367,6 @@ export default function App() {
                 if (!r?.ok) showToast(r?.error || '打开失败', 'err');
               }}>打开基本体文件夹</button>
               <span className="hint">放入 sphere / box / cylinder / plane 命名的 .glb/.gltf/.obj/.fbx 可替换默认基本体</span>
-            </div>
-            <div className="hint">Blender 插件</div>
-            <div className="uvrow">
-              <button className="btn" onClick={async () => {
-                const r = await api('/api/bridge/open-folder', {
-                  method: 'POST', headers: { 'content-type': 'application/json' },
-                  body: JSON.stringify({ which: 'blender' })
-                });
-                if (!r?.ok) showToast(r?.error || '打开失败', 'err');
-              }}>打开 Blender 插件文件夹</button>
-              <span className="hint">Blender → 偏好设置 → 插件 → 从磁盘安装：4.x 选 4.0/，3.3–3.6 LTS 选 3.6/ 里的 assetmanager_blender.py</span>
             </div>
             <div className="hint">关闭按钮行为</div>
             <div className="uvrow">
@@ -2420,7 +2440,6 @@ export default function App() {
             </div>
             <div className="modal-b">
               <button className="btn" onClick={() => setSettingsOpen(false)}>关闭</button>
-              <button className="btn primary" onClick={addLibrary}>添加素材库</button>
             </div>
           </div>
         </div>

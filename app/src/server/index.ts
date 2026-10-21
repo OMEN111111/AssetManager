@@ -2,6 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { openDb, upsertLibrary, listLibraries } from '../core/db.ts';
@@ -774,6 +775,30 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   if (p === '/api/bridge/jobs') {
     const target = url.searchParams.get('target') || 'max';
     return json(res, 200, { jobs: recentJobs(db, target, Number(url.searchParams.get('limit') || 20)) });
+  }
+
+  if (p === '/api/bridge/clear' && req.method === 'POST') {
+    const b = await body(req);
+    const target = String(b.target || '');
+    const rows = (target
+      ? db.prepare('SELECT asset_id FROM bridge_jobs WHERE target=?').all(target)
+      : db.prepare('SELECT asset_id FROM bridge_jobs').all()) as any[];
+    const del = target
+      ? db.prepare('DELETE FROM bridge_jobs WHERE target=?').run(target)
+      : db.prepare('DELETE FROM bridge_jobs').run();
+    // 一并删除这些任务产生的本地临时文件（拖放描述 .ms）
+    let removedFiles = 0;
+    try {
+      const dir = path.join(os.tmpdir(), 'AssetManager', 'drops');
+      const ids = new Set(rows.map(r => Number(r.asset_id)).filter(Boolean));
+      for (const name of fs.readdirSync(dir)) {
+        const m = name.match(/^am-drop-(\d+)\.ms$/);
+        if (!m) continue;
+        if (target && !ids.has(Number(m[1]))) continue;
+        try { fs.unlinkSync(path.join(dir, name)); removedFiles++; } catch { /* ignore */ }
+      }
+    } catch { /* 目录不存在 */ }
+    return json(res, 200, { ok: true, deleted: Number(del.changes || 0), removedFiles });
   }
 
   const mBridgeJob = p.match(/^\/api\/bridge\/job\/(\d+)$/);

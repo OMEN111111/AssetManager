@@ -685,3 +685,8 @@ input,textarea,select,pre,code,.path,.dpath,.dvalue,.selectable{user-select:text
 
 /* 3D 预览同样让出标题栏 */
 .vx{top:32px !important;bottom:0;left:0;right:0;height:auto}
+
+/* 设置弹窗内容较多：限制高度并可滚动 */
+.modal.wide{max-height:calc(100vh - 72px);overflow-y:auto;overscroll-behavior:contain}
+.modal.wide::-webkit-scrollbar{width:10px}
+.modal.wide::-webkit-scrollbar-thumb{background:rgba(255,255,255,.16);border-radius:6px}
