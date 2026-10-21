@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Asset, AssetDetail, Library, ScanState, TagNode, TreeNode } from './types';
 import Viewer from './Viewer';
 import Assembler from './Assembler';
@@ -17,7 +17,7 @@ const TYPES = [
   { key: 'scene', label: '场景' }
 ];
 
-const THEMES = ['dark', 'light', 'transparent', 'glass', 'image'];
+const THEMES = ['dark', 'light'];
 
 const PLACEHOLDER: Record<string, string> = {
   material: 'linear-gradient(145deg,#8a5c33,#3f2713)',
@@ -65,17 +65,18 @@ function FileCard({ f, onOpen, onCtx, onZoom }: { f: any; onOpen: () => void; on
   );
 }
 
-function Card({ a, active, onSelect, onOpen, onCtx, onZoom, issue, chips, onPick }: { a: Asset; active: boolean; onSelect: (e: any) => void; onOpen: () => void; onCtx?: (e: any) => void; onZoom?: (src: string) => void; issue?: string; chips?: { id: number; label: string }[]; onPick?: (id: number) => void }) {
+function Card({ a, active, onSelect, onOpen, onCtx, onZoom, issue, chips, onPick, onDrag, onPress }: { a: Asset; active: boolean; onSelect: (e: any) => void; onOpen: () => void; onCtx?: (e: any) => void; onZoom?: (src: string) => void; issue?: string; chips?: { id: number; label: string }[]; onPick?: (id: number) => void; onDrag?: (e: any) => void; onPress?: () => void }) {
   const [broken, setBroken] = useState(false);
   const badge = (a.ext || '').replace('.', '').toUpperCase();
   return (
-    <article className={'card' + (active ? ' on' : '')} onClick={onSelect} onDoubleClick={onOpen} onContextMenu={onCtx}>
+    <article className={'card' + (active ? ' on' : '')} data-asset={a.id} onClick={onSelect} onDoubleClick={onOpen} onContextMenu={onCtx}
+      onMouseDown={onPress} draggable={!!onDrag} onDragStart={onDrag}>
       <div className="thumb" style={{ background: PLACEHOLDER[a.type] || PLACEHOLDER.other }}>
         {(a as any).img_file_id && isSpecialImage(a.ext || '') ? (
           <SmartImage fileId={(a as any).img_file_id} path={a.ext || ''} />
         ) : ((a as any).has_image || a.preview_rel) && !broken ? (
-          <img src={`/api/thumb/${a.id}`} loading="lazy" alt=""
-            onDoubleClick={e => { e.stopPropagation(); onZoom?.(`/api/thumb/${a.id}`); }}
+          <img src={`/api/thumb/${a.id}?v=${encodeURIComponent((a as any).preview_rel || (a as any).thumb_file || '')}`} loading="lazy" alt=""
+            onDoubleClick={e => { e.stopPropagation(); onZoom?.(`/api/thumb/${a.id}?v=${encodeURIComponent((a as any).preview_rel || (a as any).thumb_file || '')}`); }}
             onError={() => setBroken(true)} />
         ) : null}
         <span className="badge">{badge}</span>
@@ -128,12 +129,26 @@ export default function App() {
   const [selIds, setSelIds] = useState<number[]>([]);
   const [viewer, setViewer] = useState<AssetDetail | null>(null);
   const [assembler, setAssembler] = useState<AssetDetail | null>(null);
+  const [assemblerFolder, setAssemblerFolder] = useState('');
   const [theme, setTheme] = useState(() => localStorage.getItem('am-theme') || 'dark');
   const [loading, setLoading] = useState(true);
   const [missing, setMissing] = useState(0);
   const [genBusy, setGenBusy] = useState(false);
   const [genMsg, setGenMsg] = useState<string | null>(null);
   const [ratingFilter, setRatingFilter] = useState(0);
+  const [ratingOp, setRatingOp] = useState<'gte' | 'lte' | 'eq'>('gte');
+  const [ratingInc, setRatingInc] = useState(true);
+  const [ratingOpen, setRatingOpen] = useState(false);
+  const [ratingPos, setRatingPos] = useState({ x: 0, y: 0 });
+  const ratingBtnRef = useRef<HTMLButtonElement>(null);
+  function openRatingPop() {
+    const el = ratingBtnRef.current;
+    if (el) {
+      const r = el.getBoundingClientRect();
+      setRatingPos({ x: Math.min(r.left, window.innerWidth - 270), y: r.bottom + 6 });
+    }
+    setRatingOpen(v => !v);
+  }
   const [favFilter, setFavFilter] = useState(false);
   const [extFilter, setExtFilter] = useState('');
   const [exts, setExts] = useState<{ ext: string; type: string; c: number }[]>([]);
@@ -158,24 +173,74 @@ export default function App() {
   const [issueAssets, setIssueAssets] = useState<Asset[]>([]);
   const [issueMap, setIssueMap] = useState<Map<number, string>>(new Map());
   const [ctx, setCtx] = useState<any | null>(null);
+  const ctxRef = useRef<HTMLDivElement>(null);
+  const tagMenuRef = useRef<HTMLDivElement>(null);
   const [tagMgrOpen, setTagMgrOpen] = useState(false);
+  const [tagMenu, setTagMenu] = useState<{ x: number; y: number; ids: number[]; kind: 'primary' | 'secondary' | 'empty-primary' | 'empty-secondary' } | null>(null);
+  // 菜单完全落在窗口内：放不下时向上顶，不出现滚动条
+  useLayoutEffect(() => {
+    for (const ref of [ctxRef, tagMenuRef]) {
+      const el = ref.current;
+      if (!el) continue;
+      el.style.maxHeight = 'none';
+      el.style.overflow = 'visible';
+      const h = el.offsetHeight;
+      const wantTop = Number(el.dataset.wantTop || 0);
+      const top = Math.max(8, Math.min(wantTop, window.innerHeight - h - 8));
+      el.style.top = top + 'px';
+    }
+  }, [ctx, tagMenu]);
+  const [tagColorEdit, setTagColorEdit] = useState<{ ids: number[]; value: string } | null>(null);
   const lastIdx = useRef(0);
   const lastMeta = useRef('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<any>(null);
   const [updateStatus, setUpdateStatus] = useState('');
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [closeAction, setCloseAction] = useState<'ask' | 'tray' | 'quit'>('ask');
+  useEffect(() => {
+    (window as any).amApi?.getCloseAction?.().then((v: any) => setCloseAction(v === 'tray' || v === 'quit' ? v : 'ask')).catch(() => {});
+  }, []);
+  async function changeCloseAction(v: 'ask' | 'tray' | 'quit') {
+    setCloseAction(v);
+    await (window as any).amApi?.setCloseAction?.(v);
+  }
   const [ghTokenDraft, setGhTokenDraft] = useState('');
   const [tagSel, setTagSel] = useState<Set<number>>(new Set());
   const [tagMulti, setTagMulti] = useState<Set<number>>(new Set());
   const [bulkColor, setBulkColor] = useState('#8b93a1');
   const [mgrParent, setMgrParent] = useState<number | 'none' | null>(null);
+  const [sideOpen, setSideOpen] = useState(() => localStorage.getItem('am-side-open') !== '0');
+  const [detailW, setDetailW] = useState(() => Number(localStorage.getItem('am-detail-w')) || 340);
+  useEffect(() => { localStorage.setItem('am-side-open', sideOpen ? '1' : '0'); }, [sideOpen]);
+  useEffect(() => { localStorage.setItem('am-detail-w', String(detailW)); }, [detailW]);
+  function startDetailResize(e: React.PointerEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = detailW;
+    const move = (ev: PointerEvent) => {
+      const max = Math.min(760, window.innerWidth * 0.62);
+      setDetailW(Math.min(max, Math.max(260, startW - (ev.clientX - startX))));
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      document.body.classList.remove('resizing');
+    };
+    document.body.classList.add('resizing');
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
   const [newTagName, setNewTagName] = useState('');
   const [newPrimaryName, setNewPrimaryName] = useState('');
   const [newTagParent, setNewTagParent] = useState<number | ''>('');
   const [mgrMoveTo, setMgrMoveTo] = useState<number | ''>('');
   const [detailTagName, setDetailTagName] = useState('');
   const [detailTagParent, setDetailTagParent] = useState<number | ''>('');
+  const [tagPickOpen, setTagPickOpen] = useState(false);
+  const [tagPickQ, setTagPickQ] = useState('');
+  const [tagPickParent, setTagPickParent] = useState<number | null>(null);
+  const [pickAssign, setPickAssign] = useState<{ all: number[]; any: number[] }>({ all: [], any: [] });
   const [variantGroups, setVariantGroups] = useState<{ key: string; items: any[] }[]>([]);
   const [zoom, setZoom] = useState<{ src?: string; fileId?: number; path?: string; scale: number } | null>(null);
   const [pluginsOpen, setPluginsOpen] = useState(false);
@@ -198,6 +263,17 @@ export default function App() {
   const win = (window as any).winApi;
   const isElectron = !!win?.isElectron;
   const [menuOpen, setMenuOpen] = useState<string | null>(null);
+  // DCC 桥接（3ds Max）
+  const [bridge, setBridge] = useState<any>(null);
+  const [bridgeInfo, setBridgeInfo] = useState<any>(null);
+  const [bridgeJobs, setBridgeJobs] = useState<any[]>([]);
+  const [bridgeBusy, setBridgeBusy] = useState(false);
+  const [toast, setToast] = useState<{ id: number; kind: 'ok' | 'err' | 'info'; msg: string } | null>(null);
+  const toastTimer = useRef<number | undefined>(undefined);
+  // 选中请求序号：防止慢响应把后来点的素材覆盖掉
+  const selSeq = useRef(0);
+  // 拖到 3ds Max 的「描述文件」缓存（.ms，Max 拖入即执行）
+  const dropFileCache = useRef<Map<number, string>>(new Map());
 
   const askRef = useRef<HTMLInputElement>(null);
   const askText = (title: string, value = '', browse = false) => new Promise<string | null>(resolve => setAsk({ title, value, browse, resolve }));
@@ -261,9 +337,9 @@ export default function App() {
       try {
         const d = await api(`/api/asset/${list[i].id}`);
         const url = await renderThumb(d);
-        await fetch(`/api/thumb/${list[i].id}`, {
+        await fetch('/api/preview/write', {
           method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ dataUrl: url })
+          body: JSON.stringify({ assetId: list[i].id, dataUrl: url })
         });
       } catch { /* skip broken asset */ }
     }
@@ -271,6 +347,81 @@ export default function App() {
     setGenBusy(false);
     await loadAssets(lib);
     await loadMissing(lib);
+  }
+
+  // ---------------------------------------------------------- F-003 预览图维护
+  async function rematchPreviews(ids: number[]) {
+    if (!ids.length || genBusy) return;
+    setGenBusy(true);
+    setGenMsg(`重新匹配预览图 0/${ids.length}`);
+    try {
+      const r = await api('/api/preview/rematch', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ assetIds: ids })
+      });
+      const failed = (r.results || []).filter((x: any) => !x.ok);
+      showToast(`重新匹配完成：成功 ${r.ok}/${r.total}${failed.length ? `，失败 ${failed.length}` : ''}`,
+        failed.length ? 'info' : 'ok');
+      if (lib) {
+        await loadAssets(lib);
+        await loadMissing(lib);
+        if (sel && ids.includes(sel.id)) await refreshDetail();
+      }
+    } catch (e: any) {
+      showToast('重新匹配失败：' + (e?.message || e), 'err');
+    } finally {
+      setGenMsg(null);
+      setGenBusy(false);
+    }
+  }
+
+  async function renderPreviews(ids: number[]) {
+    if (!ids.length || genBusy) return;
+    setGenBusy(true);
+    let ok = 0;
+    const failed: string[] = [];
+    for (let i = 0; i < ids.length; i++) {
+      setGenMsg(`重新渲染预览图 ${i + 1}/${ids.length}`);
+      try {
+        const d = await api(`/api/asset/${ids[i]}`);
+        const url = await renderThumb(d);
+        await fetch('/api/preview/write', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ assetId: ids[i], dataUrl: url })
+        });
+        ok++;
+      } catch (e: any) {
+        failed.push(`${ids[i]}: ${e?.message || e}`);
+      }
+    }
+    setGenMsg(null);
+    setGenBusy(false);
+    showToast(`重新渲染完成：成功 ${ok}/${ids.length}${failed.length ? `，失败 ${failed.length}` : ''}`,
+      failed.length ? 'info' : 'ok');
+    if (lib) {
+      await loadAssets(lib);
+      await loadMissing(lib);
+      if (sel && ids.includes(sel.id)) await refreshDetail();
+    }
+  }
+
+  async function refreshLibrary() {
+    if (!lib) return;
+    const root = libs.find(l => l.id === lib)?.root;
+    if (!root) return;
+    showToast('正在刷新素材库…', 'info');
+    await api('/api/libraries', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ root })
+    });
+    setScan(s => s ? { ...s, running: true } : s);
+    window.setTimeout(async () => {
+      if (!lib) return;
+      await loadAssets(lib);
+      await loadMeta(lib);
+      await refreshIssues();
+      await refreshDetail();
+    }, 1500);
   }
 
   async function loadAssets(id = lib) {
@@ -282,7 +433,7 @@ export default function App() {
       offset: String(pageSize ? (page - 1) * pageSize : 0),
       ...(activeTag ? { tag: String(activeTag) } : {}),
       ...(tagMulti.size ? { tags: [...tagMulti].join(',') } : {}),
-      ...(ratingFilter ? { minRating: String(ratingFilter) } : {}),
+      ...((ratingFilter ? { ratingOp, ratingValue: String(ratingFilter), ratingInclusive: ratingInc ? '1' : '0' } : {}) as any),
       ...(favFilter ? { fav: '1' } : {}),
       ...(extFilter ? { ext: extFilter } : {}),
       ...(excludedTypes.size ? { excludeType: [...excludedTypes].join(',') } : {}),
@@ -296,16 +447,22 @@ export default function App() {
   }
 
   useEffect(() => { boot(); }, []);
+  // 桥接状态：面板打开时 2s 刷新，平时 8s
+  useEffect(() => {
+    loadBridge();
+    const t = window.setInterval(() => { loadBridge(); }, pluginsOpen ? 2000 : 8000);
+    return () => window.clearInterval(t);
+  }, [pluginsOpen]);
   useEffect(() => { if (lib) loadMeta(lib); }, [lib]);
   useEffect(() => {
     if (!lib) return;
     window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => loadAssets(lib), 160);
     return () => window.clearTimeout(timer.current);
-  }, [lib, q, dir, recursive, sort, activeTag, tagMulti, ratingFilter, favFilter, extFilter, excludedTypes, hiddenExts, rowsPerPage, cols, page]);
+  }, [lib, q, dir, recursive, sort, activeTag, tagMulti, ratingFilter, ratingOp, ratingInc, favFilter, extFilter, excludedTypes, hiddenExts, rowsPerPage, cols, page]);
 
   // 筛选条件变化时回到第一页
-  useEffect(() => { setPage(1); }, [q, dir, recursive, sort, activeTag, ratingFilter, favFilter, extFilter, excludedTypes, hiddenExts]);
+  useEffect(() => { setPage(1); }, [q, dir, recursive, sort, activeTag, ratingFilter, ratingOp, ratingInc, favFilter, extFilter, excludedTypes, hiddenExts]);
 
   // 按容器宽度算列数（卡片 180 + 间距 16）
   useEffect(() => {
@@ -329,16 +486,34 @@ export default function App() {
     return () => { alive = false; };
   }, [sel?.id]);
 
+  const filterQs = useMemo(() => {
+    const p = new URLSearchParams({
+      q, dir, recursive: recursive ? '1' : '0',
+      ...(activeTag ? { tag: String(activeTag) } : {}),
+      ...(tagMulti.size ? { tags: [...tagMulti].join(',') } : {}),
+      ...((ratingFilter ? { ratingOp, ratingValue: String(ratingFilter), ratingInclusive: ratingInc ? '1' : '0' } : {}) as any),
+      ...(favFilter ? { fav: '1' } : {}),
+      ...(extFilter ? { ext: extFilter } : {}),
+      ...(excludedTypes.size ? { excludeType: [...excludedTypes].join(',') } : {}),
+      ...(hiddenExts.size ? { excludeExt: [...hiddenExts].join(',') } : {})
+    });
+    return p.toString();
+  }, [q, dir, recursive, activeTag, tagMulti, ratingFilter, ratingOp, ratingInc, favFilter, extFilter, excludedTypes, hiddenExts]);
+
   useEffect(() => {
     if (!lib) return;
     let alive = true;
-    api(`/api/issues?lib=${lib}`).then(r => {
+    const url = issuesOnly
+      ? `/api/issues?lib=${lib}&filter=1&${filterQs}`
+      : `/api/issues?lib=${lib}`;
+    api(url).then(r => {
       if (!alive) return;
       setIssueList(r.issues || []);
+      setIssueAssets(r.assets || []);
       setIssueMap(new Map((r.issues || []).map((i: any) => [i.assetId, i.detail || i.kind])));
     }).catch(() => { /* ignore */ });
     return () => { alive = false; };
-  }, [lib]);
+  }, [lib, issuesOnly, filterQs]);
 
   const variantMap = useMemo(() => {
     const m = new Map<number, { key: string; items: any[] }>();
@@ -357,40 +532,54 @@ export default function App() {
     const d = await api(`/api/asset/${id}`);
     setSel(d);
     setSelIds([id]);
-    if (d.type === 'material') setAssembler(d);
+    if (d.type === 'material') { setAssemblerFolder(''); setAssembler(d); }
     else if (['model', 'scene', 'hdri', 'ies'].includes(d.type)) setViewer(d);
   }
 
-  function chipsFor(a: Asset): { id: number; label: string }[] {
-    const g = variantMap.get(a.id);
-    if (g) {
-      return g.items.map(it => ({
-        id: it.id,
-        label: it.lod != null ? `LOD${it.lod}` : it.res ? `${it.res}K` : '·'
+  async function openStandaloneAssembler() {
+    let dir = '';
+    const wapi = (window as any).amApi;
+    if (wapi?.pickFolder) dir = await wapi.pickFolder();
+    else dir = (await askText('输入贴图文件夹路径', '')) || '';
+    if (!dir) return;
+    try {
+      const r = await api(`/api/folder/textures?path=${encodeURIComponent(dir)}`);
+      if (!r.files?.length) { showToast('该文件夹里没有可用的贴图', 'err'); return; }
+      const name = dir.split(/[\\/]/).filter(Boolean).pop() || 'Material';
+      const files = r.files.map((f: any, i: number) => ({
+        id: -(i + 1), rel_path: f.path, role: 'map', slot: null, size: f.size || 0
       }));
+      const pseudo: AssetDetail = {
+        id: 0, library_id: 0, rel_dir: '', name, type: 'material', ext: '.png',
+        category: null, size: 0, rating: 0, favorite: 0, preview_rel: null,
+        root: dir, files
+      } as any;
+      setAssemblerFolder(dir);
+      setAssembler(pseudo);
+    } catch (e: any) {
+      showToast('读取文件夹失败：' + (e?.message || e), 'err');
     }
+  }
+
+  function chipsFor(a: Asset): { id: number; label: string }[] {
+    // 多尺寸作为独立素材显示，每张卡只显示自己的分辨率角标
     const m = a.name.match(/(\d+)k/i);
     return m ? [{ id: a.id, label: `${m[1]}K` }] : [];
   }
 
-  const displayAssets = useMemo(() => {
-    const seen = new Set<string>();
-    return assets.filter(a => {
-      const g = variantMap.get(a.id);
-      if (!g) return true;
-      if (seen.has(g.key)) return false;
-      seen.add(g.key);
-      return true;
-    });
-  }, [assets, variantMap]);
+  const displayAssets = useMemo(() => assets, [assets]);
 
   useEffect(() => { localStorage.setItem('am-show-filedirs', showMapDirs ? '1' : '0'); }, [showMapDirs]);
   useEffect(() => { localStorage.setItem('am-ignore', JSON.stringify(ignoreNames)); }, [ignoreNames]);
 
-  function toggleType(key: string) {
+  function toggleType(key: string, only = false) {
     setExcludedTypes(prev => {
-      const s = new Set(prev);
-      if (s.has(key)) s.delete(key); else s.add(key);
+      const s = only
+        ? new Set(TYPES.filter(t => t.key !== 'all' && t.key !== key).map(t => t.key))
+        : new Set(prev);
+      if (!only) {
+        if (s.has(key)) s.delete(key); else s.add(key);
+      }
       localStorage.setItem('am-ex-types', JSON.stringify([...s]));
       return s;
     });
@@ -503,11 +692,22 @@ export default function App() {
     };
   }, [lib]);
 
+  const exFileKinds = useMemo(() => {
+    const map: Record<string, string> = {
+      model: 'model', scene: 'model', material: 'texture', texture: 'texture',
+      hdri: 'hdri', ies: 'ies', drawing: 'drawing'
+    };
+    return [...new Set([...excludedTypes].map(t => map[t]).filter(Boolean))].join(',');
+  }, [excludedTypes]);
+
   useEffect(() => {
     if (viewMode !== 'files' || !lib) return;
-    const qs = new URLSearchParams({ lib: String(lib), dir: fileDir || dir, q, limit: '300' });
-    api('/api/files?' + qs.toString()).then(r => setFiles(r.files || []));
-  }, [viewMode, lib, fileDir, dir, q]);
+    const qs = new URLSearchParams({
+      lib: String(lib), dir: fileDir || dir, q, limit: '500', filter: '1',
+      ...(exFileKinds ? { excludeFileKind: exFileKinds } : {})
+    });
+    api('/api/files?' + qs.toString() + '&' + filterQs).then(r => setFiles(r.files || []));
+  }, [viewMode, lib, fileDir, dir, q, filterQs, exFileKinds]);
 
   useEffect(() => {
     const openId = new URLSearchParams(location.search).get('open');
@@ -658,16 +858,155 @@ export default function App() {
   }
 
   async function select(a: Asset) {
-    const d = await api(`/api/asset/${a.id}`);
-    setSel(d);
+    const seq = ++selSeq.current;
+    // 先把详情切到被点的这张卡，别等接口回来（否则会短暂显示上一个素材，定位/导出也跟着错）
+    setSel(prev => (prev && prev.id === a.id
+      ? prev
+      : ({ ...(a as any), files: [], tags: [] } as any)));
     setFileSel(null);
+    const d = await api(`/api/asset/${a.id}`);
+    if (seq !== selSeq.current) return;   // 丢弃过期响应
+    setSel(d);
   }
 
   async function openViewer(a: Asset) {
+    const seq = ++selSeq.current;
     const d = await api(`/api/asset/${a.id}`);
+    if (seq !== selSeq.current) return;
     setSel(d);
-    if (a.type === 'material') setAssembler(d);
+    if (a.type === 'material') { setAssemblerFolder(''); setAssembler(d); }
     else if (['model', 'scene', 'hdri', 'ies'].includes(a.type)) setViewer(d);
+  }
+
+  // ---------------------------------------------------------- DCC 桥接
+
+  function showToast(msg: string, kind: 'ok' | 'err' | 'info' = 'info') {
+    window.clearTimeout(toastTimer.current);
+    setToast({ id: Date.now(), kind, msg });
+    toastTimer.current = window.setTimeout(() => setToast(null), kind === 'err' ? 8000 : 4500);
+  }
+
+  async function loadBridge() {
+    try {
+      const [st, info, jobs] = await Promise.all([
+        api('/api/bridge/status'), api('/api/bridge/info'), api('/api/bridge/jobs?target=max&limit=8')
+      ]);
+      setBridge(st);
+      setBridgeInfo(info);
+      setBridgeJobs(jobs.jobs || []);
+    } catch { /* 服务端未就绪时忽略 */ }
+  }
+
+  /** 素材适合哪种发送方式 */
+  function maxMode(a: Asset): 'import' | 'material' | 'texture' | null {
+    if (a.type === 'model' || a.type === 'scene') return 'import';
+    if (a.type === 'material') return 'material';
+    if (a.type === 'texture') return 'texture';
+    return null;
+  }
+
+  const maxConnected = !!bridge?.targets?.max?.connected;
+
+  async function sendToMax(a: Asset, mode?: 'import' | 'material' | 'texture') {
+    const m = mode || maxMode(a);
+    if (!m) { showToast('这类素材不支持发送到 3ds Max', 'err'); return; }
+    const label = m === 'import' ? '导入模型' : m === 'material' ? '创建材质' : '发送贴图';
+    setBridgeBusy(true);
+    try {
+      const r = await api('/api/bridge/send', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ assetId: a.id, mode: m, target: 'max' })
+      });
+      if (!r?.id) { showToast(`发送失败：${r?.error || '服务端未响应'}`, 'err'); return; }
+      const offline = !maxConnected;
+      showToast(offline
+        ? `已排队（${label}）：未检测到 3ds Max，启动 Max 后会自动执行`
+        : `已发给 3ds Max（${label}），等待处理…`);
+
+      const started = Date.now();
+      let job: any = null;
+      while (Date.now() - started < 60000) {
+        await new Promise(res => window.setTimeout(res, 700));
+        job = await api(`/api/bridge/job/${r.id}`);
+        if (!job?.status || job.status === 'done' || job.status === 'failed') break;
+        if (Date.now() - started > 8000 && !maxConnected) break;
+      }
+      if (job?.status === 'done') showToast(job.message || `${label}完成`, 'ok');
+      else if (job?.status === 'failed') showToast(`3ds Max 执行失败：${job.message || '未知原因'}`, 'err');
+      else if (job?.status === 'pending' || job?.status === 'running') {
+        showToast(`任务仍在队列中（${label}）：确认 3ds Max 已启动并安装了插件`, 'err');
+      }
+      await loadBridge();
+    } catch (e: any) {
+      showToast('发送失败：' + String(e?.message || e), 'err');
+    } finally {
+      setBridgeBusy(false);
+    }
+  }
+
+  async function installMaxPlugin() {
+    setBridgeBusy(true);
+    try {
+      const r = await api('/api/bridge/install', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      if (!r?.ok) showToast('安装失败：' + (r?.error || '未知原因'), 'err');
+      else showToast(`已安装到 ${r.installed.length} 个 3ds Max 配置，重启 Max 后生效`, 'ok');
+      await loadBridge();
+    } finally { setBridgeBusy(false); }
+  }
+
+  async function openMaxFolder(which: 'startup' | 'script' | 'copy') {
+    const r = await api('/api/bridge/open-folder', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ which })
+    });
+    if (!r?.ok) showToast(r?.error || '没有找到目录', 'err');
+  }
+
+  async function testBridge() {
+    setBridgeBusy(true);
+    try {
+      const r = await api('/api/bridge/test', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      if (r?.connected) showToast(`3ds Max 已连接（${bridge?.targets?.max?.version ? 'Max ' + bridge.targets.max.version : '未知版本'}）`, 'ok');
+      else if (bridgeInfo && !bridgeInfo.installed) showToast('未连接：插件还没安装到 3ds Max（点「安装到 3ds Max」）', 'err');
+      else showToast('未连接：请启动 3ds Max，插件会随 Max 自动加载（约 5 秒内显示在线）', 'err');
+      await loadBridge();
+    } finally { setBridgeBusy(false); }
+  }
+
+  /** 预先准备好拖到 Max 的 .ms 描述文件（按下卡片时就开始，拖起来时已经有路径） */
+  async function ensureDropFile(a: Asset) {
+    const cache = dropFileCache.current;
+    if (cache.has(a.id)) return cache.get(a.id)!;
+    try {
+      const r = await api('/api/bridge/dropfile', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ assetId: a.id })
+      });
+      if (r?.path) { cache.set(a.id, r.path); return r.path; }
+    } catch { /* 服务端没起来就退回拖原文件 */ }
+    return '';
+  }
+
+  /** 把素材拖出应用（拖到 3ds Max 视口 / 材质编辑器 / 资源管理器） */
+  function startAssetDrag(a: Asset, e: any) {
+    const am = (window as any).amApi;
+    if (!am?.startDrag) return;              // 浏览器里没有原生拖拽，保持默认行为
+    const rel = (a as any).drag_rel as string | null;
+    if (!rel) return;
+    const root = libs.find(l => l.id === a.library_id)?.root || '';
+    if (!root) return;
+    // Electron 官方模式：必须先掐掉 Chromium 自己的拖拽，否则会跟原生拖拽打架（Windows 上会让应用退出）
+    e.preventDefault();
+    const absPath = root + '\\' + String(rel).split('/').join('\\');
+    // 优先拖「描述文件」：Max 会执行 .ms，于是材质母版菜单 / 摆放 / 环境贴图都能接管；
+    // 还没准备好就退回拖原文件（走 Max 原生导入）。
+    const script = dropFileCache.current.get(a.id) || '';
+    // 先告诉服务端「正在拖这个素材」，Max 的 #postImport 也能据此认出素材
+    try {
+      const payload = JSON.stringify({ assetId: a.id, target: 'max' });
+      if (navigator.sendBeacon) navigator.sendBeacon('/api/bridge/dragging', new Blob([payload], { type: 'application/json' }));
+      else fetch('/api/bridge/dragging', { method: 'POST', headers: { 'content-type': 'application/json' }, body: payload });
+    } catch { /* ignore */ }
+    am.startDrag({ files: [script || absPath], assetId: a.id });
   }
 
   function applyLocal(id: number, body: any) {
@@ -829,7 +1168,7 @@ export default function App() {
 
   async function refreshIssues() {
     if (!lib) return;
-    const r = await api(`/api/issues?lib=${lib}`);
+    const r = await api(`/api/issues?lib=${lib}${issuesOnly ? `&filter=1&${filterQs}` : ''}`);
     setIssueList(r.issues || []);
     setIssueAssets(r.assets || []);
     setIssueMap(new Map((r.issues || []).map((i: any) => [i.assetId, i.detail || i.kind])));
@@ -956,6 +1295,79 @@ export default function App() {
     refreshDetail();
   }
 
+  function toggleTagSel(id: number) {
+    setTagSel(prev => {
+      const s = new Set(prev);
+      if (s.has(id)) s.delete(id); else s.add(id);
+      return s;
+    });
+  }
+
+  // 资源管理器式选择：单击单选，Ctrl 切换，Shift 连选，空白处清空
+  const tagLastRef = useRef<number | null>(null);
+  function selectTagRow(id: number, e: React.MouseEvent, list: number[]) {
+    if (e.shiftKey && tagLastRef.current != null) {
+      const a = list.indexOf(tagLastRef.current);
+      const b = list.indexOf(id);
+      if (a >= 0 && b >= 0) {
+        setTagSel(new Set(list.slice(Math.min(a, b), Math.max(a, b) + 1)));
+        return;
+      }
+    }
+    if (e.ctrlKey || e.metaKey) {
+      setTagSel(prev => {
+        const s = new Set(prev);
+        if (s.has(id)) s.delete(id); else s.add(id);
+        return s;
+      });
+      tagLastRef.current = id;
+      return;
+    }
+    setTagSel(new Set([id]));
+    tagLastRef.current = id;
+  }
+
+  // Eagle 式右键标签操作
+  async function tagRename(ids: number[]) {
+    const t = tags.find(x => x.id === ids[0]);
+    const v = await askText('重命名标签', t?.name || '');
+    if (v?.trim()) await updateTag(ids[0], { name: v.trim() });
+  }
+
+  async function tagNew(parentId: number | null) {
+    const v = await askText(parentId ? '新建二级标签' : '新建一级标签');
+    if (!v?.trim()) return;
+    await api('/api/tags', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: v.trim(), parentId })
+    });
+    if (lib) loadMeta(lib);
+  }
+
+  async function tagSetColor(ids: number[], color: string) {
+    for (const id of ids) await updateTag(id, { color });
+  }
+
+  // 右键菜单点空白处关闭
+  useEffect(() => {
+    if (!tagMenu) return;
+    const close = (e: MouseEvent) => {
+      const el = e.target as HTMLElement;
+      if (!el.closest('.ctxmenu')) setTagMenu(null);
+    };
+    window.addEventListener('mousedown', close, true);
+    return () => window.removeEventListener('mousedown', close, true);
+  }, [tagMenu]);
+
+  async function tagDelete(ids: number[]) {
+    if (!ids.length) return;
+    if (!window.confirm(`删除选中的 ${ids.length} 个标签？只解除关联，不会删除素材。`)) return;
+    for (const id of ids) await api(`/api/tags/${id}`, { method: 'DELETE' });
+    setTagSel(new Set());
+    if (lib) loadMeta(lib);
+    refreshDetail();
+  }
+
   async function batchColorTags() {
     if (!tagSel.size) return;
     for (const id of tagSel) await updateTag(id, { color: bulkColor });
@@ -1009,6 +1421,59 @@ export default function App() {
     if (t?.id) await assign(t.id, 'add');
     setDetailTagName('');
     if (lib) loadMeta(lib);
+  }
+
+  // 拖标签到素材 / 批量添加
+  async function assignTagTo(tagId: number, ids: number[]) {
+    await api('/api/tags/assign', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tagId, assetIds: ids })
+    });
+    if (lib) loadMeta(lib);
+    if (sel && ids.includes(sel.id)) await refreshDetail();
+    showToast(`已添加标签到 ${ids.length} 个素材`, 'ok');
+  }
+
+  // 详情页标签选择器（单选/多选一致）：默认一级，点箭头展开二级
+  function tagTargetIds(): number[] {
+    return selIds.length > 1 ? selIds : (sel ? [sel.id] : []);
+  }
+
+  async function refreshPickAssign() {
+    const ids = tagTargetIds();
+    if (!ids.length) { setPickAssign({ all: [], any: [] }); return; }
+    try {
+      const sets = await Promise.all(ids.map(async id => {
+        const d = await api(`/api/asset/${id}`);
+        return new Set<number>((d.tags || []).map((t: any) => t.id));
+      }));
+      const all = [...sets[0]].filter(id => sets.every(s => s.has(id)));
+      const any = [...new Set(sets.flatMap(s => [...s]))];
+      setPickAssign({ all, any });
+    } catch {
+      setPickAssign({ all: [], any: [] });
+    }
+  }
+
+  async function openTagPicker() {
+    await refreshPickAssign();
+    setTagPickQ('');
+    setTagPickParent(null);
+    setTagPickOpen(true);
+  }
+
+  async function toggleTagOnTargets(tagId: number) {
+    const ids = tagTargetIds();
+    if (!ids.length) return;
+    const remove = pickAssign.all.includes(tagId);
+    await api('/api/tags/assign', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tagId, assetIds: ids, action: remove ? 'remove' : 'add' })
+    });
+    if (lib) loadMeta(lib);
+    if (sel) await refreshDetail();
+    await refreshPickAssign();
+    showToast(remove ? '已移除标签' : '已添加标签', 'ok');
   }
 
   async function checkUpdate() {
@@ -1129,7 +1594,6 @@ export default function App() {
       )}
 
       <header className="topbar">
-        <div className="brand"><span className="mark" />AssetManager</div>
         <button className="libbtn">{libs.find(l => l.id === lib)?.name || '未添加库'}</button>
         <div className="searchbox">
           <svg className="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></svg>
@@ -1140,6 +1604,7 @@ export default function App() {
         <div className="top-actions">
           <button className="iconbtn" disabled={!history.canUndo} title={`撤销${history.undoLabel ? '：' + history.undoLabel : ''}`} onClick={doUndo}>↶</button>
           <button className="iconbtn" disabled={!history.canRedo} title={`重做${history.redoLabel ? '：' + history.redoLabel : ''}`} onClick={doRedo}>↷</button>
+          <button className="iconbtn" title="材质组装器（选择文件夹，独立打开）" onClick={openStandaloneAssembler}>◍</button>
           <button className="iconbtn" title="库体检 / 断链修复" onClick={runCheck}>⚑</button>
           <button className="iconbtn" title="整理：规范化目录" onClick={openOrganize}>⧉</button>
           <button className="iconbtn" title={`补缩略图${missing ? '（' + missing + '）' : ''}`}
@@ -1155,11 +1620,18 @@ export default function App() {
         </div>
       </header>
 
-      <div className="body">
-        <aside className="sidebar">
+      <div className="body" style={{ gridTemplateColumns: `${sideOpen ? 260 : 48}px 1fr auto` }}>
+        {!sideOpen && (
+          <aside className="sidebar collapsed">
+            <button className="iconbtn" title="展开侧栏" onClick={() => setSideOpen(true)}>›</button>
+            <div className="side-mini" onClick={() => setSideOpen(true)}>{tab === 'dir' ? '目录' : '标签'}</div>
+          </aside>
+        )}
+        <aside className="sidebar" style={sideOpen ? undefined : { display: 'none' }}>
           <div className="tabs">
             <button className={tab === 'dir' ? 'on' : ''} onClick={() => setTab('dir')}>目录</button>
             <button className={tab === 'tag' ? 'on' : ''} onClick={() => setTab('tag')}>标签</button>
+            <span className="side-collapse" title="收起侧栏" onClick={() => setSideOpen(false)}>‹</span>
           </div>
           {tab === 'dir' ? (
             <div className="tree">
@@ -1222,14 +1694,15 @@ export default function App() {
               {tags.map(t => (
                 <div key={t.id}
                   className={'row' + ((activeTag === t.id || tagMulti.has(t.id)) ? ' on' : '')}
-                  style={{ paddingLeft: 8 + t.depth * 14 }} onClick={(e) => selectTag(t.id, e)}>
+                  style={{ paddingLeft: 8 + t.depth * 14 }} onClick={(e) => selectTag(t.id, e)}
+                  draggable
+                  onDragStart={e => { e.dataTransfer.setData('application/x-am-tag', String(t.id)); e.dataTransfer.effectAllowed = 'copy'; }}>
                   <span className="tdot" style={{ background: t.color || '#8b93a1' }} />
                   <span className="label">{t.name}</span>
                   <span className="count">{t.count}</span>
                 </div>
               ))}
               {tags.length === 0 && <div className="thint">还没有标签，选中素材后添加</div>}
-              <div className="row tnew" onClick={createTag}><span className="ic">＋</span>新建标签</div>
               <div className="row tnew" onClick={() => setTagMgrOpen(true)}><span className="ic">⚙</span>管理标签</div>
             </div>
           )}
@@ -1248,7 +1721,8 @@ export default function App() {
             {TYPES.filter(t => t.key !== 'all').map(t => (
               <button key={t.key}
                 className={'chip' + (excludedTypes.has(t.key) ? ' off' : '')}
-                onClick={() => toggleType(t.key)}
+                onClick={(e) => toggleType(t.key, e.altKey)}
+                title="左键隐藏/显示该类型；Alt+左键只显示该类型；右键选择要隐藏的格式"
                 onContextMenu={e => { e.preventDefault(); setExtMenu({ type: t.key, x: e.clientX, y: e.clientY }); }}
                 title="左键隐藏/显示该类型，右键选择要隐藏的格式">
                 {t.label}<span className="n">{counts[t.key] ?? 0}</span>
@@ -1266,7 +1740,36 @@ export default function App() {
             </button>
             <div className="spacer" />
             <div className="sep" />
-            <button className={'chip' + (ratingFilter === 4 ? ' on' : '')} onClick={() => setRatingFilter(r => r === 4 ? 0 : 4)}>≥ 4 星</button>
+            <button ref={ratingBtnRef} className={'chip' + (ratingFilter ? ' on' : '')} onClick={openRatingPop}>
+              评分 {ratingOp === 'gte' ? '≥' : ratingOp === 'lte' ? '≤' : '='}{ratingFilter || 0}{ratingInc ? '' : '（不含）'}
+            </button>
+            {ratingOpen && (
+              <div className="rating-pop" style={{ left: ratingPos.x, top: ratingPos.y }}>
+                <div className="rp-row">
+                  <select className="sortsel" value={ratingOp} onChange={e => setRatingOp(e.target.value as any)}>
+                    <option value="gte">大于（≥）</option>
+                    <option value="lte">小于（≤）</option>
+                    <option value="eq">等于（=）</option>
+                  </select>
+                  <label className="vp-check">
+                    <input type="checkbox" checked={ratingInc} onChange={e => setRatingInc(e.target.checked)} />
+                    包含当前星级
+                  </label>
+                </div>
+                <div className="rp-row star-set">
+                  {[1, 2, 3, 4, 5].map(v => (
+                    <button key={v} className={ratingFilter === v ? 'on' : ''}
+                      onClick={() => { setRatingFilter(v); setRatingOpen(false); }}>{'★'}</button>
+                  ))}
+                  <span className="hint" style={{ marginLeft: 6 }}>{ratingFilter || 0} 星</span>
+                </div>
+                <div className="rp-row">
+                  <button className="btn tiny" onClick={() => { setRatingFilter(0); setRatingOpen(false); }}>清除评分筛选</button>
+                  <span style={{ flex: 1 }} />
+                  <button className="btn tiny" onClick={() => setRatingOpen(false)}>关闭</button>
+                </div>
+              </div>
+            )}
             <button className={'chip' + (favFilter ? ' on' : '')} onClick={() => setFavFilter(v => !v)}>仅收藏</button>
             <select className="sortsel" value={extFilter} onChange={e => setExtFilter(e.target.value)}>
               <option value="">全部格式</option>
@@ -1310,7 +1813,21 @@ export default function App() {
             </div>
           ) : loading ? <div className="empty">加载中…</div>
             : assets.length === 0 ? <div className="empty">当前条件下没有素材{!libs.length && <button className="btn primary" onClick={addLibrary}>添加素材库</button>}</div>
-            : <div className="grid" ref={gridRef} onClick={e => { if (e.target === e.currentTarget) setSelIds([]); }}>
+            : <div className="grid" ref={gridRef} onClick={e => { if (e.target === e.currentTarget) setSelIds([]); }}
+                onDragOver={e => {
+                  if (e.dataTransfer.types.includes('application/x-am-tag')) {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'copy';
+                  }
+                }}
+                onDrop={async e => {
+                  const tid = Number(e.dataTransfer.getData('application/x-am-tag'));
+                  if (!tid) return;
+                  e.preventDefault();
+                  const el = (e.target as HTMLElement).closest('[data-asset]');
+                  const aid = Number(el?.getAttribute('data-asset'));
+                  if (aid) await assignTagTo(tid, [aid]);
+                }}>
                 {displayAssets.map(a => (
                   <Card key={a.id} a={a} active={selIds.includes(a.id)}
                     issue={issueMap.get(a.id)}
@@ -1318,6 +1835,8 @@ export default function App() {
                     onPick={openVariant}
                     onSelect={(e) => handleSelect(a, e)} onOpen={() => openViewer(a)}
                     onZoom={(src) => setZoom({ src, scale: 1 })}
+                    onDrag={(e) => startAssetDrag(a, e)}
+                    onPress={() => { ensureDropFile(a); }}
                     onCtx={(e) => { e.preventDefault(); setCtx({ kind: 'asset', x: e.clientX, y: e.clientY, asset: a }); }} />
                 ))}
               </div>}
@@ -1330,7 +1849,11 @@ export default function App() {
           )}
         </main>
 
-        <aside className={'details' + (sel ? ' open' : '')}>
+        <aside className={'details' + (sel ? ' open' : '')} style={sel ? { width: detailW } : undefined}>
+          {sel && (
+            <div className="detail-resizer" title="拖动调整详情宽度，双击恢复默认"
+              onPointerDown={startDetailResize} onDoubleClick={() => setDetailW(340)} />
+          )}
           {sel && selIds.length > 1 ? (
             <>
               <div className="dhead">
@@ -1357,22 +1880,9 @@ export default function App() {
                   </div>
                 </div>
                 <div>
-                  <div className="detail-h">加标签</div>
-                  <select className="field" value="" onChange={e => {
-                    const v = e.target.value;
-                    if (v) { batchTag(Number(v), 'add'); e.currentTarget.value = ''; }
-                  }}>
-                    <option value="">选择标签…</option>
-                    {tags.map(t => <option key={t.id} value={t.id}>{'— '.repeat(t.depth)}{t.name}</option>)}
-                  </select>
-                  <div className="detail-h" style={{ marginTop: 10 }}>移标签</div>
-                  <select className="field" value="" onChange={e => {
-                    const v = e.target.value;
-                    if (v) { batchTag(Number(v), 'remove'); e.currentTarget.value = ''; }
-                  }}>
-                    <option value="">选择标签…</option>
-                    {tags.map(t => <option key={t.id} value={t.id}>{'— '.repeat(t.depth)}{t.name}</option>)}
-                  </select>
+                  <div className="detail-h">标签</div>
+                  <button className="btn" onClick={openTagPicker}>＋ 标签（添加 / 移除）</button>
+                  <div className="hint" style={{ marginTop: 6 }}>对选中的 {selIds.length} 个素材统一操作</div>
                 </div>
                 <div className="hint">Ctrl / Shift 点击可多选；双击打开预览。</div>
               </div>
@@ -1380,23 +1890,6 @@ export default function App() {
           ) : sel ? <>
             <div className="dhead"><b>详情</b><button className="iconbtn" onClick={() => setSel(null)}>×</button></div>
             <div className="dbody">
-              <div className="preview" style={{ background: fileSel ? '#0d0f13' : (PLACEHOLDER[sel.type] || PLACEHOLDER.other) }}>
-                {fileSel ? (
-                  /\.(png|jpe?g|webp|gif|bmp)$/i.test(fileSel.rel_path)
-                    ? <img src={`/api/file/${fileSel.id}`} alt="" />
-                    : isSpecialImage(fileSel.rel_path)
-                      ? <SmartImage fileId={fileSel.id} path={fileSel.rel_path} max={0} fit="contain" />
-                      : <div className="filenopreview">
-                        <span className="fext">{(fileSel.rel_path.split('.').pop() || '').toUpperCase()}</span>
-                        <small>{fmtSize(fileSel.size)}</small>
-                      </div>
-                ) : (() => {
-                  const img = sel.files.find(f => isImgPath(f.rel_path));
-                  return img && isSpecialImage(img.rel_path)
-                    ? <SmartImage fileId={img.id} path={img.rel_path} max={0} fit="contain" />
-                    : <img src={`/api/thumb/${sel.id}`} alt="" onError={e => (e.currentTarget.style.display = 'none')} />;
-                })()}
-              </div>
               {fileSel && (
                 <div className="previewbar">
                   <span className="pbname" title={fileSel.rel_path}>{fileSel.rel_path.split('/').pop()}</span>
@@ -1417,31 +1910,17 @@ export default function App() {
                     <button className="tagx" onClick={() => assign(t.id, 'remove')} title="移除">×</button>
                   </span>
                 ))}
-                <select className="tagadd" value="" onChange={e => {
-                  const v = e.target.value;
-                  if (v === '__new') createTag();
-                  else if (v) assign(Number(v), 'add');
-                }}>
-                  <option value="">＋ 标签</option>
-                  {tags.map(t => <option key={t.id} value={t.id}>{'— '.repeat(t.depth)}{t.name}</option>)}
-                  <option value="__new">＋ 新建标签…</option>
-                </select>
-              </div>
-              <div className="uvrow" style={{ marginTop: 6 }}>
-                <input className="modal-input" style={{ flex: 1 }} placeholder="输入名称新建标签"
-                  value={detailTagName} onChange={e => setDetailTagName(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter') createDetailTag(); }} />
-                <select className="sortsel" value={detailTagParent} onChange={e => setDetailTagParent(e.target.value as any)}>
-                  <option value="">未分类（二级）</option>
-                  {primaries.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                </select>
-                <button className="btn tiny" onClick={createDetailTag}>新建</button>
+                <button className="tagadd btn tiny" onClick={openTagPicker}>＋ 标签</button>
               </div>
               <div className="btnrow">
                 {sel.type !== 'texture' && (
                   <button className="btn primary" style={{ flex: 1, justifyContent: 'center' }} onClick={() => openViewer(sel)}>
                     {sel.type === 'material' ? '打开材质组装器' : '打开 3D 预览'}
                   </button>
+                )}
+                {maxMode(sel) && (
+                  <button className="btn" disabled={bridgeBusy} onClick={() => sendToMax(sel)}
+                    title={maxConnected ? '发送到 3ds Max' : '发送到 3ds Max（当前未检测到 Max）'}>→ Max</button>
                 )}
                 <button className="btn" onClick={() => patch(sel, { favorite: sel.favorite ? 0 : 1 })}>
                   {sel.favorite ? '★ 已收藏' : '☆ 收藏'}
@@ -1497,6 +1976,10 @@ export default function App() {
       <footer className="statusbar">        <span className="live"><span className="pulse" />{total} 个素材</span>
         <span>{libs.length} 个库</span>
         <span>{scan?.running ? `扫描中 ${scan.scanned}` : '索引就绪'}</span>
+        <button className={'bridgechip' + (maxConnected ? ' on' : '')} onClick={() => setPluginsOpen(true)}
+          title={maxConnected ? '3ds Max 已连接' : '3ds Max 未连接（点开插件面板）'}>
+          <span className={'mxdot' + (maxConnected ? ' on' : '')} />3ds Max
+        </button>
         <div className="status-right">
           <span className="cap">主题</span>
           {THEMES.map(t => (
@@ -1506,8 +1989,8 @@ export default function App() {
       </footer>
       {viewer && <Viewer asset={viewer} onClose={() => setViewer(null)}
         variants={variantMap.get(viewer.id)?.items} onVariant={openVariant} />}
-      {assembler && <Assembler asset={assembler} onClose={() => setAssembler(null)}
-        variants={variantMap.get(assembler.id)?.items} onVariant={openVariant} />}
+      {assembler && <Assembler asset={assembler} onClose={() => { setAssembler(null); setAssemblerFolder(''); }}
+        folderPath={assemblerFolder || undefined} />}
       {extMenu && (
         <>
           <div className="menu-mask" onMouseDown={() => setExtMenu(null)} />
@@ -1530,13 +2013,21 @@ export default function App() {
         <>
           <div className="menu-mask" onMouseDown={() => setCtx(null)}
             onContextMenu={e => { e.preventDefault(); setCtx(null); }} />
-          <div className="ctxmenu" style={{
+          <div ref={ctxRef} className="ctxmenu" data-want-top={ctx.y} style={{
             left: Math.min(ctx.x, window.innerWidth - 230),
-            top: Math.min(ctx.y, window.innerHeight - 280)
+            top: ctx.y
           }}>
             {ctx.kind === 'asset' ? (<>
+              <button onClick={() => { setCtx(null); refreshLibrary(); }}>刷新</button>
               <button onClick={() => { setCtx(null); locateAsset(ctx.asset); }}>定位到文件夹</button>
               <button onClick={() => { setCtx(null); openViewer(ctx.asset); }}>打开预览</button>
+              {maxMode(ctx.asset) && (
+                <button onClick={() => { setCtx(null); sendToMax(ctx.asset); }} disabled={bridgeBusy}>
+                  {ctx.asset.type === 'material' ? '在 3ds Max 中创建材质'
+                    : ctx.asset.type === 'texture' ? '发送贴图到 3ds Max'
+                    : '发送到 3ds Max'}
+                </button>
+              )}
               <button onClick={() => { setCtx(null); reveal(ctx.asset); }}>在资源管理器中显示</button>
               <button onClick={() => { setCtx(null); copyText(assetFullPath(ctx.asset)); }}>复制路径</button>
               <div className="ctx-sep" />
@@ -1544,6 +2035,15 @@ export default function App() {
                 {ctx.asset.favorite ? '取消收藏' : '收藏'}
               </button>
               <button onClick={() => { setCtx(null); patch(ctx.asset, { rating: 0 }); }}>清除评分</button>
+              <div className="ctx-sep" />
+              <button onClick={() => {
+                const ids = selIds.includes(ctx.asset.id) && selIds.length > 1 ? selIds : [ctx.asset.id];
+                setCtx(null); rematchPreviews(ids);
+              }}>重新匹配预览图{selIds.includes(ctx.asset.id) && selIds.length > 1 ? `（选中 ${selIds.length} 个）` : ''}</button>
+              <button onClick={() => {
+                const ids = selIds.includes(ctx.asset.id) && selIds.length > 1 ? selIds : [ctx.asset.id];
+                setCtx(null); renderPreviews(ids);
+              }}>重新渲染预览图{selIds.includes(ctx.asset.id) && selIds.length > 1 ? `（选中 ${selIds.length} 个）` : ''}</button>
               <div className="ctx-sep" />
               <button onClick={() => { setCtx(null); ignoreIssues([ctx.asset.id]); }}>忽略此素材的问题</button>
               {selIds.length > 1 && (
@@ -1560,6 +2060,7 @@ export default function App() {
               <div className="ctx-sep" />
               <button onClick={() => { setCtx(null); openFile(ctx.file); }}>打开预览</button>
             </>) : (<>
+              <button onClick={() => { setCtx(null); refreshLibrary(); }}>刷新</button>
               <button onClick={() => { setCtx(null); revealDir(ctx.node.dir); }}>在资源管理器中打开</button>
               <button onClick={() => {
                 setCtx(null);
@@ -1605,15 +2106,69 @@ export default function App() {
             </div>
             <div className="plug-sec">
               <div className="plug-h">DCC 桥接</div>
-              {['Blender', 'SketchUp', '3ds Max', 'Houdini', 'Unreal Engine'].map(n => (
+              <div className={'maxcard' + (maxConnected ? ' on' : '')}>
+                <div className="mxhead">
+                  <span className="mxname">3ds Max</span>
+                  <span className={'mxdot' + (maxConnected ? ' on' : '')} />
+                  <span className={maxConnected ? 'plug-on' : 'plug-off'}>{maxConnected ? '已连接' : '未连接'}</span>
+                  {!!bridge?.targets?.max?.version && <span className="mxver">Max {bridge.targets.max.version}</span>}
+                  <span className="mxver">插件 v{bridge?.scriptVersion || bridgeInfo?.scriptVersion || '—'}</span>
+                </div>
+                <div className="mxmeta">
+                  服务端口 {bridge?.port || '—'} · 队列 {bridge?.targets?.max?.queued ?? 0}
+                  {' · '}运行 {bridge?.targets?.max?.running ?? 0}
+                  {bridgeInfo?.installed
+                    ? ` · 已安装到 ${bridgeInfo.installedAt?.length || 0} 个 Max 配置`
+                    : ' · 插件未安装'}
+                </div>
+                {bridge?.targets?.max?.lastJob && (
+                  <div className="mxmeta mxlast" title={`${bridge.targets.max.lastJob.title} — ${bridge.targets.max.lastJob.message || ''}`}>
+                    最近任务：{bridge.targets.max.lastJob.status === 'done' ? '✔' : bridge.targets.max.lastJob.status === 'failed' ? '✘' : '…'}
+                    {' '}{bridge.targets.max.lastJob.title}
+                    {bridge.targets.max.lastJob.message ? ` — ${bridge.targets.max.lastJob.message}` : ''}
+                  </div>
+                )}
+                <div className="uvrow" style={{ marginTop: 8 }}>
+                  <button className="btn primary" disabled={bridgeBusy} onClick={installMaxPlugin}>安装到 3ds Max</button>
+                  <button className="btn" onClick={() => openMaxFolder('startup')}>打开 startup 目录</button>
+                  <button className="btn" onClick={() => openMaxFolder('copy')} title="复制插件文件到数据目录并打开，便于手动安装">打开插件文件夹</button>
+                  <button className="btn" disabled={bridgeBusy} onClick={testBridge}>测试连接</button>
+                </div>
+                {!maxConnected && (
+                  <div className="hint">
+                    安装后需要重启 3ds Max；插件随 Max 启动自动轮询，5 秒内这里会显示「已连接」。
+                    右键素材可以发送；也可以直接把素材卡片拖进 Max 视口。
+                  </div>
+                )}
+                {maxConnected && (
+                  <div className="hint">
+                    拖模型进 Max 视口=选择摆放位置后导入；拖材质进视口=选母版并重建到精简材质编辑器。打包在 Max 侧工具栏操作。
+                  </div>
+                )}
+              </div>
+              {['Blender', 'SketchUp', 'Houdini', 'Unreal Engine'].map(n => (
                 <div className="plug-row" key={n}>
                   <span className="plug-name">{n}</span>
                   <span className="plug-desc">素材直接发送 / 一键替换</span>
-                  <span className="plug-off">未安装</span>
+                  <span className="plug-off">未开放</span>
                 </div>
               ))}
             </div>
-            <div className="hint">插件目录：%APPDATA%\assetmanager-app\plugins（桥接插件随后续版本提供）</div>
+            {bridgeJobs.length > 0 && (
+              <div className="plug-sec">
+                <div className="plug-h">最近任务</div>
+                <div className="mxjobs">
+                  {bridgeJobs.map(j => (
+                    <div className="mxjob" key={j.id}>
+                      <span className={'mxst ' + j.status}>{j.status === 'done' ? '✔' : j.status === 'failed' ? '✘' : '…'}</span>
+                      <span className="mxtitle" title={j.message || ''}>{j.title}</span>
+                      <span className="mxmsg" title={j.message || ''}>{j.message || (j.status === 'pending' ? '排队中' : j.status)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="hint">插件来源：应用目录下的 bridge/max/AssetManagerBridge.ms（安装时复制到 3ds Max 的 scripts\startup）</div>
             <div className="modal-b">
               <button className="btn" onClick={() => setPluginsOpen(false)}>关闭</button>
             </div>
@@ -1639,6 +2194,28 @@ export default function App() {
                 </div>
               ))}
               {libs.length === 0 && <div className="hint" style={{ padding: 8 }}>还没有添加素材库。</div>}
+            </div>
+            <div className="hint">材质组装器基本体</div>
+            <div className="uvrow">
+              <button className="btn" onClick={async () => {
+                const r = await api('/api/bridge/open-folder', {
+                  method: 'POST', headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ which: 'geometry' })
+                });
+                if (!r?.ok) showToast(r?.error || '打开失败', 'err');
+              }}>打开基本体文件夹</button>
+              <span className="hint">放入 sphere / box / cylinder / plane 命名的 .glb/.gltf/.obj/.fbx 可替换默认基本体</span>
+            </div>
+            <div className="hint">关闭按钮行为</div>
+            <div className="uvrow">
+              <select className="sortsel" value={closeAction}
+                onChange={e => changeCloseAction(e.target.value as 'ask' | 'tray' | 'quit')}
+                disabled={!(window as any).amApi?.setCloseAction}>
+                <option value="ask">每次询问</option>
+                <option value="tray">最小化到托盘（后台运行）</option>
+                <option value="quit">直接关闭</option>
+              </select>
+              <span className="hint">托盘后台运行会暂停渲染与扫描，占用更低</span>
             </div>
             <div className="hint">版本与更新</div>
             <div className="uvrow">
@@ -1707,73 +2284,141 @@ export default function App() {
         </div>
       )}
 
+      {tagPickOpen && sel && (
+        <div className="modal-mask" onMouseDown={() => setTagPickOpen(false)}>
+          <div className="modal" onMouseDown={e => e.stopPropagation()}>
+            <div className="modal-t">标签 · {tagTargetIds().length > 1 ? `已选 ${tagTargetIds().length} 项` : sel.name}</div>
+            <input className="modal-input" autoFocus placeholder="搜索标签；回车匹配或新建"
+              value={tagPickQ} onChange={e => setTagPickQ(e.target.value)}
+              onKeyDown={async e => {
+                if (e.key !== 'Enter') return;
+                const q = tagPickQ.trim();
+                if (!q) return;
+                const hit = tags.find(t => t.name.toLowerCase() === q.toLowerCase());
+                if (hit) { await toggleTagOnTargets(hit.id); setTagPickQ(''); return; }
+                const t = await api('/api/tags', {
+                  method: 'POST', headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ name: q })
+                });
+                if (t?.id) {
+                  const ids = tagTargetIds();
+                  await api('/api/tags/assign', {
+                    method: 'POST', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ tagId: t.id, assetIds: ids })
+                  });
+                  if (lib) loadMeta(lib);
+                  if (sel) await refreshDetail();
+                  await refreshPickAssign();
+                }
+                setTagPickQ('');
+              }} />
+            <div className="tagpick-list">
+              {tagPickQ.trim() ? (
+                tags.filter(t => t.name.toLowerCase().includes(tagPickQ.trim().toLowerCase())).map(t => {
+                  const has = pickAssign.all.includes(t.id);
+                  const some = pickAssign.any.includes(t.id);
+                  return (
+                    <div key={t.id} className={'row' + (has ? ' on' : '')} onClick={() => toggleTagOnTargets(t.id)}>
+                      <span className="tdot" style={{ background: t.color || '#8b93a1' }} />
+                      <span className="label">{'— '.repeat(t.depth)}{t.name}</span>
+                      <span className="count">{has ? '已添加' : some ? '部分' : ''}</span>
+                    </div>
+                  );
+                })
+              ) : (
+                primaries.map(p => (
+                  <div key={p.id}>
+                    <div className={'row' + (pickAssign.all.includes(p.id) ? ' on' : '')}>
+                      <span className="tdot" style={{ background: p.color || '#8b93a1' }} />
+                      <span className="label" style={{ flex: 1, cursor: 'pointer' }}
+                        onClick={() => toggleTagOnTargets(p.id)}>{p.name}</span>
+                      <span className="count">{pickAssign.all.includes(p.id) ? '已添加' : pickAssign.any.includes(p.id) ? '部分' : ''}</span>
+                      <button className="btn tiny"
+                        onClick={e => { e.stopPropagation(); setTagPickParent(tagPickParent === p.id ? null : p.id); }}>
+                        {tagPickParent === p.id ? '▾' : '▸'}
+                      </button>
+                    </div>
+                    {tagPickParent === p.id && tags.filter(t => (t as any).parentId === p.id).map(t => (
+                      <div key={t.id} className={'row' + (pickAssign.all.includes(t.id) ? ' on' : '')}
+                        style={{ paddingLeft: 26 }} onClick={() => toggleTagOnTargets(t.id)}>
+                        <span className="tdot" style={{ background: t.color || '#8b93a1' }} />
+                        <span className="label">{t.name}</span>
+                        <span className="count">{pickAssign.all.includes(t.id) ? '已添加' : pickAssign.any.includes(t.id) ? '部分' : ''}</span>
+                      </div>
+                    ))}
+                  </div>
+                ))
+              )}
+              {tags.length === 0 && <div className="hint" style={{ padding: 8 }}>还没有标签，输入名称回车新建</div>}
+            </div>
+            <div className="modal-b">
+              <button className="btn" onClick={() => setTagPickOpen(false)}>关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {tagMgrOpen && (
         <div className="modal-mask" onMouseDown={() => setTagMgrOpen(false)}>
           <div className="modal wide" onMouseDown={e => e.stopPropagation()}>
             <div className="modal-t">标签管理 · {tags.length} 个</div>
             <div className="tagmgr-body">
-              <div className="tagmgr-left">
+              <div className="tagmgr-left"
+                onClick={e => { if (e.target === e.currentTarget) { setTagSel(new Set()); tagLastRef.current = null; } }}
+                onContextMenu={e => {
+                  e.preventDefault();
+                  setTagMenu({ x: e.clientX, y: e.clientY, ids: [], kind: 'empty-primary' });
+                }}>
                 <div className={'tgm-item' + (selParent === 'none' ? ' on' : '')} onClick={() => setMgrParent('none')}>
                   <span className="label">未分类</span><span className="count">{unclassified.length}</span>
                 </div>
                 {primaries.map(p => (
-                  <div key={p.id} className={'tgm-item' + (selParent === p.id ? ' on' : '')} onClick={() => setMgrParent(p.id)}>
+                  <div key={p.id}
+                    className={'tgm-item' + (tagSel.has(p.id) ? ' on' : '')}
+                    onClick={e => { setMgrParent(p.id); selectTagRow(p.id, e, primaries.map(x => x.id)); }}
+                    onContextMenu={e => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      const ids = tagSel.has(p.id) ? [...tagSel] : [p.id];
+                      setTagSel(new Set(ids));
+                      setTagMenu({ x: e.clientX, y: e.clientY, ids, kind: 'primary' });
+                    }}>
                     <span className="tdot" style={{ background: p.color || '#8b93a1' }} />
                     <span className="label">{p.name}</span>
                     <span className="count">{p.count}</span>
                   </div>
                 ))}
-                <div className="tagmgr-new">
-                  <input className="modal-input" placeholder="新建一级标签" value={newPrimaryName}
-                    onChange={e => setNewPrimaryName(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter') createPrimaryTag(); }} />
-                  <button className="btn tiny" onClick={createPrimaryTag}>添加</button>
-                </div>
+                <div className="hint" style={{ padding: 8 }}>右键空白处新建一级标签</div>
               </div>
               <div className="tagmgr-right">
                 <div className="tagbar">
-                  <label className="vp-check">
-                    <input type="checkbox"
-                      checked={secondaries.length > 0 && secondaries.every(t => tagSel.has(t.id))}
-                      onChange={e => setTagSel(e.target.checked ? new Set(secondaries.map(t => t.id)) : new Set())} />
-                    全选
-                  </label>
                   <span className="hint">已选 {tagSel.size}</span>
                   <span style={{ flex: 1 }} />
-                  <input type="color" className="colorinput" value={bulkColor} onChange={e => setBulkColor(e.target.value)} />
-                  <button className="btn tiny" disabled={!tagSel.size} onClick={batchColorTags}>改色</button>
-                  <select className="sortsel" value={mgrMoveTo} onChange={e => setMgrMoveTo(e.target.value)}>
-                    <option value="">移到一级…</option>
-                    {primaries.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                  </select>
-                  <button className="btn tiny" disabled={!tagSel.size} onClick={batchMoveTags}>移动</button>
-                  <button className="btn tiny" disabled={!tagSel.size} onClick={batchDeleteTags}>删除</button>
+                  <span className="hint">右键标签编辑，右键空白处新建二级标签</span>
                 </div>
-                <div className="issues taglist">
-                  {secondaries.map(t => (
-                    <div className="issue trow" key={t.id}>
-                      <input type="checkbox" checked={tagSel.has(t.id)}
-                        onChange={() => setTagSel(prev => {
-                          const s = new Set(prev);
-                          if (s.has(t.id)) s.delete(t.id); else s.add(t.id);
-                          return s;
-                        })} />
-                      <input type="color" className="colorinput" value={t.color || '#8b93a1'}
-                        onChange={e => updateTag(t.id, { color: e.target.value })} />
-                      <input className="taginput" defaultValue={t.name}
-                        onBlur={e => { if (e.target.value.trim() && e.target.value !== t.name) updateTag(t.id, { name: e.target.value.trim() }); }} />
-                      <span className="inone">{t.count}</span>
-                      <button className="btn tiny" onClick={() => deleteTag(t.id)}>删除</button>
-                    </div>
-                  ))}
-                  {secondaries.length === 0 && <div className="hint" style={{ padding: 8 }}>该分类下没有二级标签。</div>}
-                </div>
-                <div className="tagmgr-new">
-                  <input className="modal-input"
-                    placeholder={selParent === 'none' ? '新建二级标签（未分类）' : '在该一级标签下新建'}
-                    value={newTagName} onChange={e => setNewTagName(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter') createSecondaryTag(); }} />
-                  <button className="btn tiny" onClick={createSecondaryTag}>添加</button>
+                <div className="taglist-wrap"
+                  onClick={e => { if (e.target === e.currentTarget) { setTagSel(new Set()); tagLastRef.current = null; } }}
+                  onContextMenu={e => {
+                    e.preventDefault();
+                    setTagMenu({ x: e.clientX, y: e.clientY, ids: [], kind: 'empty-secondary' });
+                  }}>
+                  <div className="tagchips">
+                    {secondaries.map(t => (
+                      <button key={t.id}
+                        className={'tagchip' + (tagSel.has(t.id) ? ' on' : '')}
+                        onClick={e => selectTagRow(t.id, e, secondaries.map(x => x.id))}
+                        onContextMenu={e => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          const ids = tagSel.has(t.id) ? [...tagSel] : [t.id];
+                          setTagSel(new Set(ids));
+                          setTagMenu({ x: e.clientX, y: e.clientY, ids, kind: 'secondary' });
+                        }}>
+                        <span>{t.name}</span><i>{t.count}</i>
+                      </button>
+                    ))}
+                    {secondaries.length === 0 && <div className="hint">该分类下没有二级标签（右键新建）</div>}
+                  </div>
                 </div>
               </div>
             </div>
@@ -1781,6 +2426,33 @@ export default function App() {
               <button className="btn" onClick={() => setTagMgrOpen(false)}>关闭</button>
             </div>
           </div>
+        </div>
+      )}
+
+      {tagMenu && (
+        <div ref={tagMenuRef} className="ctxmenu" data-want-top={tagMenu.y} style={{
+          left: Math.min(tagMenu.x, window.innerWidth - 230),
+          top: tagMenu.y
+        }}>
+          {tagMenu.ids.length === 0 ? (
+            <button onClick={() => {
+              setTagMenu(null);
+              tagNew(tagMenu.kind === 'empty-secondary'
+                ? (selParent !== 'none' ? Number(selParent) : null)
+                : null);
+            }}>{tagMenu.kind === 'empty-secondary' ? '新建二级标签…' : '新建一级标签…'}</button>
+          ) : (<>
+            {tagMenu.ids.length === 1 && (
+              <button onClick={() => { const ids = tagMenu.ids; setTagMenu(null); tagRename(ids); }}>重命名…</button>
+            )}
+            {tagMenu.ids.length === 1 && tagMenu.kind === 'primary' && (
+              <button onClick={() => { const id = tagMenu.ids[0]; setTagMenu(null); tagNew(id); }}>新建子标签…</button>
+            )}
+            <div className="ctx-sep" />
+            <button onClick={() => { const ids = tagMenu.ids; setTagMenu(null); tagDelete(ids); }}>
+              删除{tagMenu.ids.length > 1 ? ` ${tagMenu.ids.length} 个` : ''}
+            </button>
+          </>)}
         </div>
       )}
 
@@ -1911,6 +2583,11 @@ export default function App() {
           {importLog.map((l, i) => <div key={i}>{l}</div>)}
         </div>
       )}
+
+      {toast && (
+        <div className={'toast ' + toast.kind} onClick={() => setToast(null)} title="点击关闭">{toast.msg}</div>
+      )}
     </div>
   );
 }
+

@@ -6,6 +6,12 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { openDb, upsertLibrary, listLibraries } from '../core/db.ts';
 import { scanLibrary, scanState } from '../core/scan.ts';
+import {
+  bridgeStatus, sendJob, nextJob, finishJob, heartbeat, touchClient, recentJobs, jobById,
+  installForMax, installInfo, maxStartupDirs, bridgeScriptPath, writeLocator,
+  resolvePath, assetInfo, writeDropScript,
+  BRIDGE_PROTOCOL, BRIDGE_SCRIPT_VERSION
+} from '../core/bridge.ts';
 import type { DB } from '../core/db.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -574,6 +580,15 @@ function assetQuery(url: URL) {  const lib = Number(url.searchParams.get('lib') 
   }
 
   if (url.searchParams.get('minRating')) { where.push('rating >= ?'); params.push(Number(url.searchParams.get('minRating'))); }
+  const rOp = url.searchParams.get('ratingOp');
+  const rVal = Number(url.searchParams.get('ratingValue') || -1);
+  if (rOp && rVal >= 0) {
+    const inc = url.searchParams.get('ratingInclusive') === '1';
+    if (rOp === 'gte') where.push(inc ? 'rating >= ?' : 'rating > ?');
+    else if (rOp === 'lte') where.push(inc ? 'rating <= ?' : 'rating < ?');
+    else where.push(inc ? 'rating = ?' : 'rating <> ?');
+    params.push(rVal);
+  }
   if (url.searchParams.get('fav') === '1') where.push('favorite = 1');
   if (url.searchParams.get('missingThumb') === '1') {
     where.push("type IN ('material','model','scene') AND preview_rel IS NULL AND thumb_file IS NULL");
@@ -614,6 +629,9 @@ function assetQuery(url: URL) {  const lib = Number(url.searchParams.get('lib') 
 
   return { where: where.join(' AND '), params, order, limit, offset };
 }
+
+/** 最近一次从 AssetManager 拖出去的素材（内存即可；Max 的 #postImport 用它认素材） */
+const lastDrag = new Map<string, { assetId: number; at: number }>();
 
 async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
@@ -686,6 +704,146 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     return json(res, 500, { error: errors.join('；') || '下载失败' });
   }
 
+  // ---------------- DCC 桥接（3ds Max 优先） ----------------
+  if (p === '/api/bridge/status') {
+    return json(res, 200, { ...bridgeStatus(db), port: PORT });
+  }
+
+  if (p === '/api/bridge/info') {
+    return json(res, 200, {
+      ...installInfo(APP_ROOT),
+      port: PORT,
+      protocol: BRIDGE_PROTOCOL,
+      scriptVersion: BRIDGE_SCRIPT_VERSION
+    });
+  }
+
+  // 拖放素材进来时按文件路径反查（返回源目录、材质规格、文件清单）
+  if (p === '/api/bridge/resolve') {
+    const q = req.method === 'POST' ? await body(req) : {};
+    const filePath = String(q.path || url.searchParams.get('path') || '');
+    const r = resolvePath(db, filePath);
+    if (!r) return json(res, 404, { error: '这个文件不在任何素材库里' });
+    return json(res, 200, r);
+  }
+
+  // 生成「拖放描述文件」：把 .ms 拖进 Max，Max 执行它 → 插件接管（材质菜单 / 摆放 / 环境贴图）
+  if (p === '/api/bridge/dropfile' && req.method === 'POST') {
+    const b = await body(req);
+    const r = writeDropScript(db, Number(b.assetId), APP_ROOT);
+    if (!r) return json(res, 404, { error: 'asset not found' });
+    return json(res, 200, r);
+  }
+
+  const mBridgeAsset = p.match(/^\/api\/bridge\/asset\/(\d+)$/);
+  if (mBridgeAsset) {
+    const r = assetInfo(db, Number(mBridgeAsset[1]));
+    if (!r) return json(res, 404, { error: 'asset not found' });
+    return json(res, 200, r);
+  }
+
+  // 拖放提示：AssetManager 开始拖拽某个素材时登记一次，Max 的 #postImport 据此认素材
+  if (p === '/api/bridge/dragging') {
+    if (req.method === 'POST') {
+      const b = await body(req);
+      lastDrag.set(String(b.target || 'max'), { assetId: Number(b.assetId) || 0, at: Date.now() });
+      return json(res, 200, { ok: true });
+    }
+    const t = String(url.searchParams.get('target') || 'max');
+    const d = lastDrag.get(t);
+    if (!d || Date.now() - d.at > 120000) return json(res, 200, { dragging: null });
+    return json(res, 200, { dragging: { assetId: d.assetId, at: d.at, asset: assetInfo(db, d.assetId) } });
+  }
+
+  if (p === '/api/bridge/jobs') {
+    const target = url.searchParams.get('target') || 'max';
+    return json(res, 200, { jobs: recentJobs(db, target, Number(url.searchParams.get('limit') || 20)) });
+  }
+
+  const mBridgeJob = p.match(/^\/api\/bridge\/job\/(\d+)$/);
+  if (mBridgeJob) {
+    const j = jobById(db, Number(mBridgeJob[1]));
+    if (!j) return json(res, 404, { error: 'not found' });
+    return json(res, 200, j);
+  }
+
+  if (p === '/api/bridge/send' && req.method === 'POST') {
+    const b = await body(req);
+    const assetId = Number(b.assetId);
+    const mode = String(b.mode || 'import');
+    const target = String(b.target || 'max');
+    if (!assetId) return json(res, 400, { error: 'assetId required' });
+    if (!['import', 'material', 'texture'].includes(mode)) return json(res, 400, { error: '未知的发送模式' });
+    const r = sendJob(db, assetId, target, mode);
+    if ('error' in r) return json(res, 400, r);
+    return json(res, 200, r);
+  }
+
+  if (p === '/api/bridge/install' && req.method === 'POST') {
+    return json(res, 200, installForMax(APP_ROOT));
+  }
+
+  if (p === '/api/bridge/test' && req.method === 'POST') {
+    const st = bridgeStatus(db);
+    const max = (st.targets as any).max;
+    return json(res, 200, { ok: !!max?.connected, target: 'max', connected: !!max?.connected, lastSeen: max?.lastSeen ?? null });
+  }
+
+  if (p === '/api/bridge/open-folder' && req.method === 'POST') {
+    const b = await body(req);
+    const which = String(b.which || 'startup');
+    const scriptPath = bridgeScriptPath(APP_ROOT);
+    const dirs = maxStartupDirs();
+    let dir = '';
+    if (which === 'script') {
+      dir = fs.existsSync(scriptPath) ? path.dirname(scriptPath) : '';
+    } else if (which === 'copy') {
+      // 复制一份到数据目录，便于用户手动安装（asar 里的路径资源管理器打不开）
+      const outDir = path.join(DATA_DIR, 'plugins', '3dsmax');
+      try {
+        fs.mkdirSync(outDir, { recursive: true });
+        if (fs.existsSync(scriptPath)) fs.copyFileSync(scriptPath, path.join(outDir, 'AssetManagerBridge.ms'));
+      } catch { /* ignore */ }
+      dir = outDir;
+    } else if (which === 'geometry') {
+      const outDir = path.join(DATA_DIR, 'geometry');
+      try { fs.mkdirSync(outDir, { recursive: true }); } catch { /* ignore */ }
+      dir = outDir;
+    } else {
+      dir = dirs[0] || '';
+    }
+    if (!dir) return json(res, 404, { error: '没有找到 3ds Max startup 目录，请先启动一次 3ds Max' });
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+    spawn('explorer.exe', [dir], { detached: true, stdio: 'ignore' }).unref();
+    return json(res, 200, { ok: true, path: dir });
+  }
+
+  // 插件侧接口：/api/bridge/<target>/(next|result|heartbeat)
+  const mBridgeTarget = p.match(/^\/api\/bridge\/(max|su|blender|houdini|ue)\/(next|result|heartbeat)$/);
+  if (mBridgeTarget) {
+    const target = mBridgeTarget[1];
+    const action = mBridgeTarget[2];
+
+    if (action === 'next' && req.method === 'GET') {
+      touchClient(db, target);
+      const job = nextJob(db, target);
+      if (!job) { res.writeHead(204); return res.end(); }
+      return json(res, 200, job);
+    }
+
+    if (action === 'heartbeat' && req.method === 'POST') {
+      const b = await body(req);
+      return json(res, 200, heartbeat(db, target, b.version, b.host, b));
+    }
+
+    if (action === 'result' && req.method === 'POST') {
+      const b = await body(req);
+      const id = Number(b.id);
+      if (!id) return json(res, 400, { error: 'id required' });
+      return json(res, 200, finishJob(db, target, id, !!b.ok, b.message, b.detail));
+    }
+  }
+
   if (p === '/api/state') {
     const libs = listLibraries(db);
     const total = libs.length ? (db.prepare('SELECT COUNT(*) c FROM assets WHERE library_id=?').get((libs[0] as any).id) as any).c : 0;
@@ -724,7 +882,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
         lower(f2.rel_path) LIKE '%.png' OR lower(f2.rel_path) LIKE '%.jpg' OR lower(f2.rel_path) LIKE '%.jpeg'
         OR lower(f2.rel_path) LIKE '%.webp' OR lower(f2.rel_path) LIKE '%.gif' OR lower(f2.rel_path) LIKE '%.bmp'
         OR lower(f2.rel_path) LIKE '%.tif' OR lower(f2.rel_path) LIKE '%.tiff' OR lower(f2.rel_path) LIKE '%.tga'
-      )) AS has_image
+      )) AS has_image,
+      (SELECT f3.rel_path FROM files f3 WHERE f3.asset_id = a.id AND (
+        f3.role IN ('model','main','map')
+        OR lower(f3.rel_path) LIKE '%.fbx' OR lower(f3.rel_path) LIKE '%.obj' OR lower(f3.rel_path) LIKE '%.glb'
+        OR lower(f3.rel_path) LIKE '%.hdr' OR lower(f3.rel_path) LIKE '%.exr'
+        OR lower(f3.rel_path) LIKE '%.png' OR lower(f3.rel_path) LIKE '%.jpg' OR lower(f3.rel_path) LIKE '%.jpeg'
+        OR lower(f3.rel_path) LIKE '%.tga' OR lower(f3.rel_path) LIKE '%.tif' OR lower(f3.rel_path) LIKE '%.tiff'
+      ) ORDER BY CASE f3.role WHEN 'model' THEN 0 WHEN 'main' THEN 1 WHEN 'map' THEN 2 ELSE 3 END,
+                 CASE WHEN lower(f3.rel_path) LIKE '%.hdr' OR lower(f3.rel_path) LIKE '%.exr' THEN 0 ELSE 1 END,
+                 f3.rel_path LIMIT 1) AS drag_rel
       FROM assets a WHERE ${where.replace(/\btype\b/g, 'a.type').replace(/\bext\b/g, 'a.ext')} ORDER BY ${order} LIMIT ? OFFSET ?`)
       .all(...params, limit, offset);
     const total = (db.prepare(`SELECT COUNT(*) c FROM assets WHERE ${where}`).get(...params) as any).c;
@@ -739,7 +906,25 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const files = db.prepare('SELECT id,rel_path,role,slot,size FROM files WHERE asset_id=? ORDER BY role DESC, rel_path').all(id);
     const tags = db.prepare('SELECT t.id,t.name,t.color,t.parent_id FROM tags t JOIN asset_tags at ON at.tag_id=t.id WHERE at.asset_id=? ORDER BY t.name').all(id);
     const lib = db.prepare('SELECT root FROM libraries WHERE id=?').get(a.library_id) as any;
-    return json(res, 200, { ...a, root: lib?.root, files, tags });
+    // 回写时插件会写 asset_maps.json（槽位→文件名），有它就按它来，避免预览按文件名猜错通道
+    let slotMap: Record<string, string> | null = null;
+    try {
+      if (lib?.root) {
+        const mp = path.join(lib.root, String(a.rel_dir), 'asset_maps.json');
+        if (fs.existsSync(mp)) {
+          const raw = JSON.parse(fs.readFileSync(mp, 'utf8'));
+          const map: Record<string, string> = {};
+          for (const [k, v] of Object.entries(raw)) {
+            const name = String(v).toLowerCase();
+            const hit = (files as any[]).find(f => String(f.rel_path).split('/').pop()?.toLowerCase() === name)
+              || (files as any[]).find(f => String(f.rel_path).toLowerCase().endsWith('/' + name));
+            if (hit) map[k] = hit.rel_path;
+          }
+          if (Object.keys(map).length) slotMap = map;
+        }
+      }
+    } catch { /* ignore */ }
+    return json(res, 200, { ...a, root: lib?.root, files, tags, slotMap });
   }
 
   if (mAsset && req.method === 'PATCH') {
@@ -785,7 +970,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const b = await body(req);
     const f = db.prepare(`SELECT f.rel_path, l.root, l.id AS lib FROM files f
       JOIN assets a ON a.id=f.asset_id JOIN libraries l ON l.id=a.library_id WHERE f.id=?`).get(Number(b.fileId)) as any;
-    const m = String(b.dataUrl || '').match(/^data:image\/png;base64,(.+)$/);
+    const m = String(b.dataUrl || '').match(/^data:image\/(png|jpeg);base64,(.+)$/);
     if (!f || !m) return json(res, 400, { error: 'bad request' });
     const src = path.join(f.root, f.rel_path);
     if (!fs.existsSync(src)) return json(res, 404, { error: 'missing source' });
@@ -796,9 +981,59 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const out = (b.mode === 'overwrite' && ext === '.png')
       ? src
       : path.join(dir, wanted || `${base}_edited.png`);
-    fs.writeFileSync(out, Buffer.from(m[1], 'base64'));
+    fs.writeFileSync(out, Buffer.from(m[2], 'base64'));
     setTimeout(() => { try { scanLibrary(db, f.lib, f.root); } catch (e) { console.error('rescan failed', e); } }, 200);
     return json(res, 200, { path: out, overwritten: out === src });
+  }
+
+  const mOverrides = p.match(/^\/api\/model\/(\d+)\/overrides$/);
+  if (mOverrides) {
+    const id = Number(mOverrides[1]);
+    const a = db.prepare('SELECT rel_dir, name, type FROM assets WHERE id=?').get(id) as any;
+    if (!a) return json(res, 404, { error: 'not found' });
+    const key = `${a.rel_dir}|${a.name}|${a.type}`;
+    if (req.method === 'GET') {
+      const rows = db.prepare('SELECT material, channel, file_rel FROM material_overrides WHERE asset_key=?').all(key) as any[];
+      const out: Record<string, Record<string, string>> = {};
+      for (const r of rows) {
+        out[r.material] = out[r.material] || {};
+        out[r.material][r.channel] = r.file_rel;
+      }
+      return json(res, 200, { overrides: out });
+    }
+    if (req.method === 'POST' || req.method === 'PUT') {
+      const b = await body(req);
+      const material = String(b.material || '').trim();
+      const channel = String(b.channel || '').trim();
+      const fileRel = b.fileRel ? String(b.fileRel) : '';
+      if (!material || !channel) return json(res, 400, { error: 'bad request' });
+      if (!fileRel) {
+        db.prepare('DELETE FROM material_overrides WHERE asset_key=? AND material=? AND channel=?').run(key, material, channel);
+      } else {
+        db.prepare(`INSERT INTO material_overrides(asset_key, material, channel, file_rel, updated_at)
+          VALUES(?,?,?,?,?)
+          ON CONFLICT(asset_key, material, channel) DO UPDATE SET file_rel=excluded.file_rel, updated_at=excluded.updated_at`)
+          .run(key, material, channel, fileRel, Date.now());
+      }
+      return json(res, 200, { ok: true });
+    }
+  }
+
+  if (p === '/api/override-file') {
+    const id = Number(url.searchParams.get('assetId') || 0);
+    const rel = String(url.searchParams.get('rel') || '');
+    const a = db.prepare(`SELECT a.rel_dir, a.name, a.type, l.root FROM assets a
+      JOIN libraries l ON l.id=a.library_id WHERE a.id=?`).get(id) as any;
+    if (!a || !rel) return json(res, 404, { error: 'not found' });
+    const key = `${a.rel_dir}|${a.name}|${a.type}`;
+    const hit = db.prepare('SELECT 1 FROM material_overrides WHERE asset_key=? AND file_rel=?').get(key, rel);
+    if (!hit) return json(res, 403, { error: 'not allowed' });
+    const abs = path.resolve(a.root, rel);
+    if (!abs.startsWith(path.resolve(a.root)) || !fs.existsSync(abs)) return json(res, 404, { error: 'missing' });
+    const ext = path.extname(abs).toLowerCase();
+    const mime: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.bmp': 'image/bmp', '.tga': 'image/x-tga', '.tif': 'image/tiff', '.tiff': 'image/tiff' };
+    res.writeHead(200, { 'content-type': mime[ext] || 'application/octet-stream', 'cache-control': 'public, max-age=3600' });
+    return fs.createReadStream(abs).pipe(res);
   }
 
   const mThumbSave = p.match(/^\/api\/thumb\/(\d+)$/);
@@ -812,7 +1047,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const file = path.join(dir, `${mThumbSave[1]}.${ext}`);
     fs.writeFileSync(file, Buffer.from(m[2], 'base64'));
     const relFile = path.relative(DATA_DIR, file).split(path.sep).join('/');
-    db.prepare('UPDATE assets SET thumb_file=? WHERE id=?').run(relFile, Number(mThumbSave[1]));
+    db.prepare('UPDATE assets SET thumb_file=?, preview_rel=NULL WHERE id=?').run(relFile, Number(mThumbSave[1]));
     return json(res, 200, { ok: true, file });
   }
 
@@ -968,10 +1203,27 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const params: any[] = [lib];
     if (dir) { where.push('f.rel_path LIKE ?'); params.push(`${dir}/%`); }
     if (qtxt) { where.push('f.rel_path LIKE ?'); params.push(`%${qtxt}%`); }
+    // B-001：文件视图与素材网格共用同一套筛选
+    if (url.searchParams.get('filter') === '1') {
+      const fq = assetQuery(url);
+      where.push(`a.id IN (SELECT id FROM assets WHERE ${fq.where})`);
+      params.push(...fq.params);
+    }
     const limit = Math.min(Number(url.searchParams.get('limit') || 300), 1000);
-    const rows = db.prepare(`SELECT f.id, f.rel_path, f.role, f.size, a.id aid, a.name aname, a.type atype
+    const fileKind = (rel: string) => {
+      const p = String(rel).toLowerCase();
+      if (/\.(fbx|obj|glb|gltf|stl|3ds|abc|usdz|blend|max)$/.test(p)) return 'model';
+      if (/\.(hdr|exr)$/.test(p)) return 'hdri';
+      if (/\.ies$/.test(p)) return 'ies';
+      if (/\.(dwg|dxf)$/.test(p)) return 'drawing';
+      if (/\.(png|jpe?g|webp|bmp|tga|tiff?)$/.test(p)) return 'texture';
+      return 'other';
+    };
+    const exKinds = (url.searchParams.get('excludeFileKind') || '').split(',').filter(Boolean);
+    let rows = db.prepare(`SELECT f.id, f.rel_path, f.role, f.size, a.id aid, a.name aname, a.type atype
       FROM files f JOIN assets a ON a.id=f.asset_id
-      WHERE ${where.join(' AND ')} ORDER BY f.rel_path LIMIT ?`).all(...params, limit);
+      WHERE ${where.join(' AND ')} ORDER BY f.rel_path LIMIT ?`).all(...params, exKinds.length ? limit * 8 : limit) as any[];
+    if (exKinds.length) rows = rows.filter(r => !exKinds.includes(fileKind(r.rel_path))).slice(0, limit);
     return json(res, 200, { files: rows });
   }
 
@@ -1006,11 +1258,179 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     return json(res, 200, { groups });
   }
 
+  if (p === '/api/geometry/list' && req.method === 'GET') {
+    const dir = path.join(DATA_DIR, 'geometry');
+    fs.mkdirSync(dir, { recursive: true });
+    const kinds = ['sphere', 'box', 'cylinder', 'plane'];
+    const out: any[] = [];
+    try {
+      for (const n of fs.readdirSync(dir)) {
+        const base = n.replace(/\.[^.]+$/, '').toLowerCase();
+        const ext = path.extname(n).toLowerCase();
+        if (kinds.includes(base) && ['.glb', '.gltf', '.obj', '.fbx'].includes(ext)) {
+          out.push({ kind: base, file: n, ext, size: fs.statSync(path.join(dir, n)).size });
+        }
+      }
+    } catch { /* ignore */ }
+    return json(res, 200, { dir, files: out });
+  }
+
+  if (p === '/api/geometry/file') {
+    const kind = String(url.searchParams.get('kind') || '').toLowerCase();
+    if (!['sphere', 'box', 'cylinder', 'plane'].includes(kind)) return json(res, 400, { error: 'bad kind' });
+    const dir = path.join(DATA_DIR, 'geometry');
+    const order = ['.glb', '.gltf', '.obj', '.fbx'];
+    let hit = '';
+    for (const ext of order) {
+      const f = path.join(dir, kind + ext);
+      if (fs.existsSync(f)) { hit = f; break; }
+    }
+    if (!hit) return json(res, 404, { error: 'no custom geometry' });
+    const ext = path.extname(hit).toLowerCase();
+    const mime = ext === '.glb' ? 'model/gltf-binary' : ext === '.gltf' ? 'model/gltf+json'
+      : ext === '.obj' ? 'text/plain' : 'application/octet-stream';
+    res.writeHead(200, { 'content-type': mime, 'x-ext': ext, 'cache-control': 'no-cache' });
+    return fs.createReadStream(hit).pipe(res);
+  }
+
+  if (p === '/api/path/write-text' && req.method === 'POST') {
+    const b = await body(req);
+    const dir = String(b.dir || '');
+    const name = String(b.name || '').replace(/[\\/:*?"<>|]/g, '_');
+    if (!dir || !name || typeof b.text !== 'string') return json(res, 400, { error: 'bad request' });
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return json(res, 404, { error: '目录不存在' });
+    const out = path.join(dir, name);
+    fs.writeFileSync(out, String(b.text), 'utf8');
+    return json(res, 200, { path: out });
+  }
+
+  if (p === '/api/path/write-image' && req.method === 'POST') {
+    const b = await body(req);
+    const dir = String(b.dir || '');
+    const name = String(b.name || '').replace(/[\\/:*?"<>|]/g, '_');
+    const m = String(b.dataUrl || '').match(/^data:image\/(png|jpeg);base64,(.+)$/);
+    if (!dir || !name || !m) return json(res, 400, { error: 'bad request' });
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return json(res, 404, { error: '目录不存在' });
+    const out = path.join(dir, name);
+    fs.writeFileSync(out, Buffer.from(m[2], 'base64'));
+    return json(res, 200, { path: out });
+  }
+
+  if (p === '/api/folder/textures' && req.method === 'GET') {
+    const dir = String(url.searchParams.get('path') || '');
+    if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+      return json(res, 404, { error: '目录不存在' });
+    }
+    const out: any[] = [];
+    const walk = (d: string, depth: number) => {
+      if (depth > 1) return;
+      let names: string[] = [];
+      try { names = fs.readdirSync(d); } catch { return; }
+      for (const n of names) {
+        const full = path.join(d, n);
+        let st: fs.Stats;
+        try { st = fs.statSync(full); } catch { continue; }
+        if (st.isDirectory()) { walk(full, depth + 1); continue; }
+        if (!/\.(png|jpe?g|webp|bmp|tga|tiff?)$/i.test(n)) continue;
+        out.push({ path: full, rel: path.relative(dir, full).split(path.sep).join('/'), size: st.size });
+      }
+    };
+    walk(dir, 0);
+    return json(res, 200, { folder: dir, files: out });
+  }
+
+  if (p === '/api/path-file') {
+    const file = String(url.searchParams.get('path') || '');
+    if (!file || !fs.existsSync(file) || !fs.statSync(file).isFile()) return json(res, 404, { error: 'missing' });
+    if (!/\.(png|jpe?g|webp|bmp|tga|tiff?|hdr|exr)$/i.test(file)) return json(res, 403, { error: 'not allowed' });
+    const ext = path.extname(file).toLowerCase();
+    const mime: Record<string, string> = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+      '.bmp': 'image/bmp', '.tga': 'image/x-tga', '.tif': 'image/tiff', '.tiff': 'image/tiff'
+    };
+    res.writeHead(200, { 'content-type': mime[ext] || 'application/octet-stream', 'cache-control': 'public, max-age=3600' });
+    return fs.createReadStream(file).pipe(res);
+  }
+
+  if (p === '/api/asset/write-text' && req.method === 'POST') {
+    const b = await body(req);
+    const id = Number(b.assetId);
+    const name = String(b.name || '').replace(/[\\/:*?"<>|]/g, '_');
+    if (!id || !name || typeof b.text !== 'string') return json(res, 400, { error: 'bad request' });
+    const a = db.prepare(`SELECT a.rel_dir, l.root FROM assets a
+      JOIN libraries l ON l.id=a.library_id WHERE a.id=?`).get(id) as any;
+    if (!a) return json(res, 404, { error: 'not found' });
+    const dir = path.join(a.root, a.rel_dir);
+    fs.mkdirSync(dir, { recursive: true });
+    const out = path.join(dir, name);
+    fs.writeFileSync(out, String(b.text), 'utf8');
+    return json(res, 200, { path: out });
+  }
+
+  if (p === '/api/preview/write' && req.method === 'POST') {
+    const b = await body(req);
+    const m = String(b.dataUrl || '').match(/^data:image\/(png|jpeg|webp);base64,(.+)$/);
+    const id = Number(b.assetId);
+    if (!m || !id) return json(res, 400, { error: 'bad request' });
+    const a = db.prepare(`SELECT a.rel_dir, a.name, a.type, l.root FROM assets a
+      JOIN libraries l ON l.id=a.library_id WHERE a.id=?`).get(id) as any;
+    if (!a) return json(res, 404, { error: 'not found' });
+    const dir = path.join(a.root, a.rel_dir);
+    fs.mkdirSync(dir, { recursive: true });
+    const safe = String(a.name).replace(/[\\/:*?"<>|]/g, '_');
+    const wanted = b.name ? String(b.name).replace(/[\\/:*?"<>|]/g, '_') : '';
+    const fileName = wanted || `${safe}_Preview.${m[1] === 'jpeg' ? 'jpg' : m[1]}`;
+    fs.writeFileSync(path.join(dir, fileName), Buffer.from(m[2], 'base64'));
+    const rel = `${a.rel_dir}/${fileName}`.replace(/^\/+/, '');
+    db.prepare('UPDATE assets SET preview_rel=?, thumb_file=NULL WHERE id=?').run(rel, id);
+    return json(res, 200, { path: path.join(dir, fileName), rel });
+  }
+
+  if (p === '/api/preview/rematch' && req.method === 'POST') {
+    const b = await body(req);
+    const ids = (Array.isArray(b.assetIds) ? b.assetIds : []).map(Number).filter(Boolean);
+    const out: any[] = [];
+    for (const id of ids) {
+      try {
+        const a = db.prepare(`SELECT a.rel_dir, a.name, a.type, l.root FROM assets a
+          JOIN libraries l ON l.id=a.library_id WHERE a.id=?`).get(id) as any;
+        if (!a) { out.push({ id, ok: false, error: '素材不存在' }); continue; }
+        const absDir = path.join(a.root, a.rel_dir);
+        if (!fs.existsSync(absDir)) { out.push({ id, ok: false, error: '目录不存在' }); continue; }
+        const names = fs.readdirSync(absDir).filter(n => /\.(png|jpe?g|webp|bmp|tif?f|pdf)$/i.test(n));
+        const isName = (n: string) => {
+          const base = a.name.toLowerCase().replace(/\s+/g, '');
+          const s = n.toLowerCase().replace(/\s+/g, '');
+          return s.includes(base) || base.includes(s.replace(/\.[a-z0-9]+$/, ''));
+        };
+        const pick = names.find(n => /_preview\./i.test(n) && isName(n))
+          || names.find(n => /_preview\./i.test(n))
+          || names.find(n => /_render\./i.test(n))
+          || names.find(n => /preview/i.test(n))
+          || null;
+        if (!pick) { out.push({ id, ok: false, error: '目录内没有预览图' }); continue; }
+        const rel = `${a.rel_dir}/${pick}`.replace(/^\/+/, '');
+        db.prepare('UPDATE assets SET preview_rel=?, thumb_file=NULL WHERE id=?').run(rel, id);
+        out.push({ id, ok: true, path: rel });
+      } catch (e: any) {
+        out.push({ id, ok: false, error: String(e?.message || e) });
+      }
+    }
+    const okCount = out.filter(r => r.ok).length;
+    return json(res, 200, { ok: okCount, total: out.length, results: out });
+  }
+
   if (p === '/api/issues') {
     const lib = Number(url.searchParams.get('lib') || 0);
     const raw = getIssues(lib);
     const ig = ignoredSet();
-    const issues = (raw.issues as any[]).filter(i => !ig.has(`${i.assetId}|${i.kind}`));
+    let issues = (raw.issues as any[]).filter(i => !ig.has(`${i.assetId}|${i.kind}`));
+    // B-001：问题视图同样受当前筛选影响
+    if (url.searchParams.get('filter') === '1') {
+      const fq = assetQuery(url);
+      const allowed = new Set((db.prepare(`SELECT id FROM assets WHERE ${fq.where}`).all(...fq.params) as any[]).map(r => r.id));
+      issues = issues.filter(i => allowed.has(i.assetId));
+    }
     const ids = [...new Set(issues.map(i => i.assetId))];
     let rows: any[] = [];
     if (ids.length) {
@@ -1129,5 +1549,11 @@ http.createServer((req, res) => {
     else res.end();
   });
 }).listen(PORT, '127.0.0.1', () => {
-  console.log(`AssetManager API on http://127.0.0.1:${PORT}  db=${DB_FILE}`);
+  // 把端口写到 %LOCALAPPDATA%\AssetManager\bridge.json，MaxScript 插件据此找到服务
+  const version = (() => {
+    try { return String(JSON.parse(fs.readFileSync(path.join(APP_ROOT, 'package.json'), 'utf8')).version || '0.0.0'); }
+    catch { return '0.0.0'; }
+  })();
+  const locator = writeLocator(PORT, APP_ROOT, version);
+  console.log(`AssetManager API on http://127.0.0.1:${PORT}  db=${DB_FILE}  bridge=${locator || '(locator failed)'}`);
 });

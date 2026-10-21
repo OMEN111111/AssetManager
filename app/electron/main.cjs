@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, shell, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, shell, dialog, ipcMain, nativeImage, Tray } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -7,6 +7,73 @@ const { spawn } = require('node:child_process');
 const PORT = Number(process.env.AM_PORT || 8787);
 let serverProc = null;
 let win = null;
+let dragIcon = null;
+let tray = null;
+let quitting = false;
+
+function settingsFile() { return path.join(app.getPath('userData'), 'settings.json'); }
+function readSettings() {
+  try { return JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) || {}; } catch { return {}; }
+}
+function writeSettings(patch) {
+  const s = { ...readSettings(), ...patch };
+  try {
+    fs.mkdirSync(path.dirname(settingsFile()), { recursive: true });
+    fs.writeFileSync(settingsFile(), JSON.stringify(s, null, 2));
+  } catch { /* ignore */ }
+  return s;
+}
+function closeAction() {
+  const a = readSettings().closeAction;
+  return (a === 'tray' || a === 'quit') ? a : 'ask';
+}
+function showMainWindow() {
+  if (!win || win.isDestroyed()) { createWindow(); return; }
+  win.show();
+  win.focus();
+}
+function createTray() {
+  if (tray) return;
+  const p = path.join(__dirname, '..', 'build', 'icon.png');
+  let img = nativeImage.createEmpty();
+  try { if (fs.existsSync(p)) img = nativeImage.createFromBuffer(fs.readFileSync(p)); } catch { /* ignore */ }
+  try {
+    tray = new Tray(img);
+    tray.setToolTip('AssetManager');
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: '打开 AssetManager', click: () => showMainWindow() },
+      { type: 'separator' },
+      { label: '退出', click: () => { quitting = true; app.quit(); } }
+    ]));
+    tray.on('click', () => showMainWindow());
+    tray.on('double-click', () => showMainWindow());
+  } catch { tray = null; }
+}
+
+/** 拖拽时跟随鼠标的小图标：必须给 NativeImage，打包后 asar 里的路径原生代码读不了 */
+function loadDragIcon() {
+  if (dragIcon) return dragIcon;
+  const candidates = [
+    path.join(__dirname, '..', 'build', 'drag-icon.png'),
+    path.join(__dirname, '..', 'build', 'icon.png')
+  ];
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const img = nativeImage.createFromBuffer(fs.readFileSync(p));
+      if (!img.isEmpty()) { dragIcon = img; return dragIcon; }
+    } catch { /* try next */ }
+  }
+  try { dragIcon = nativeImage.createEmpty(); } catch { dragIcon = null; }
+  return dragIcon;
+}
+
+/** 拖拽排错日志（%APPDATA%\assetmanager-app\drag.log），只在开发/反馈时看 */
+function dlog(msg) {
+  try {
+    fs.appendFileSync(path.join(app.getPath('userData'), 'drag.log'), new Date().toISOString() + ' ' + msg + '\n');
+  } catch { /* ignore */ }
+}
 
 function probe(port) {
   return new Promise(resolve => {
@@ -145,6 +212,32 @@ async function createWindow() {
     return;
   }
   await win.loadURL(`http://127.0.0.1:${port}/`);
+  createTray();
+  win.on('close', async (e) => {
+    if (quitting) return;
+    const act = closeAction();
+    if (act === 'quit') { quitting = true; app.quit(); return; }
+    if (act === 'tray') { e.preventDefault(); win.hide(); return; }
+    e.preventDefault();
+    const r = await dialog.showMessageBox(win, {
+      type: 'question',
+      buttons: ['最小化到托盘', '直接关闭', '取消'],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+      checkboxLabel: '记住我的选择',
+      message: '关闭 AssetManager？',
+      detail: '最小化到托盘后程序会在后台运行（占用更低），可从托盘图标重新打开。'
+    });
+    if (r.response === 0) {
+      if (r.checkboxChecked) writeSettings({ closeAction: 'tray' });
+      win.hide();
+    } else if (r.response === 1) {
+      if (r.checkboxChecked) writeSettings({ closeAction: 'quit' });
+      quitting = true;
+      app.quit();
+    }
+  });
 }
 
 app.whenReady().then(async () => {
@@ -156,6 +249,11 @@ app.whenReady().then(async () => {
     if (win.isMaximized()) win.unmaximize(); else win.maximize();
   });
   ipcMain.on('win:close', () => win?.close());
+  ipcMain.handle('app:getCloseAction', () => closeAction());
+  ipcMain.handle('app:setCloseAction', (_e, v) => {
+    writeSettings({ closeAction: v === 'tray' || v === 'quit' ? v : 'ask' });
+    return closeAction();
+  });
   ipcMain.on('win:reload', () => win?.webContents.reload());
   ipcMain.on('win:devtools', () => win?.webContents.toggleDevTools());
   ipcMain.on('win:fullscreen', () => {
@@ -166,6 +264,25 @@ app.whenReady().then(async () => {
     if (!win) return '';
     const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] });
     return r.canceled ? '' : (r.filePaths[0] || '');
+  });
+  ipcMain.on('drag:start', (event, payload) => {
+    if (!win || !payload) return;
+    const files = (Array.isArray(payload.files) ? payload.files : [])
+      .filter(f => typeof f === 'string' && f && fs.existsSync(f));
+    if (!files.length) return;
+    // 用发送方自己的 webContents（Electron 官方示例的写法），并给拖拽图标一个真正的 NativeImage：
+    // 打包后 icon.png 在 app.asar 里，原生代码读不了 asar 路径，直接传路径可能让进程崩掉。
+    const wc = event.sender && !event.sender.isDestroyed() ? event.sender : win.webContents;
+    const icon = loadDragIcon();
+    const item = { file: files[0], files, icon };
+    try {
+      dlog('drag start ' + files[0]);
+      wc.startDrag(item);
+      dlog('drag returned');
+    } catch (err) {
+      dlog('drag failed: ' + (err && err.message ? err.message : String(err)));
+      console.error('startDrag failed', err);
+    }
   });
   ipcMain.handle('update:apply', async (_e, file) => {
     if (!app.isPackaged) return { ok: false, error: '开发环境不支持自动更新' };
@@ -196,10 +313,11 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
+  if (process.platform !== 'darwin' && (quitting || !tray)) app.quit();
 });
 
 app.on('before-quit', () => {
+  quitting = true;
   if (serverProc && !serverProc.killed) {
     try { serverProc.kill(); } catch { /* ignore */ }
   }

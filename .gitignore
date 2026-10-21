@@ -12,6 +12,7 @@ app/shot-*.jpg
 app/build/*
 !app/build/icon.ico
 !app/build/icon.png
+!app/build/drag-icon.png
 
 # packaged artifacts
 app/release/

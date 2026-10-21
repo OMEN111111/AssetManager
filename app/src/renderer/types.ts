@@ -19,6 +19,8 @@ export interface Asset {
   favorite: number;
   preview_rel: string | null;
   material_json?: string | null;
+  /** 拖出到外部软件时用的代表文件（服务端算好） */
+  drag_rel?: string | null;
 }
 
 export interface AssetFile {
@@ -41,6 +43,8 @@ export interface TagNode {
 export interface AssetDetail extends Asset {
   files: AssetFile[];
   root: string;
+  /** 插件回写时写的槽位表：baseColor/normal/... → rel_path */
+  slotMap?: Record<string, string> | null;
   material_json?: string | null;
   tags?: TagNode[];
 }

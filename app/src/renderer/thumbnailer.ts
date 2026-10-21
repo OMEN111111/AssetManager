@@ -1,5 +1,8 @@
 import * as THREE from 'three';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
+import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { buildMaterial, detectConfig } from './matlib';
 import type { AssetDetail } from './types';
@@ -10,9 +13,10 @@ let envTex: THREE.Texture | null = null;
 function setup() {
   if (renderer) return;
   const canvas = document.createElement('canvas');
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true, alpha: true });
   renderer.setPixelRatio(1);
   renderer.setSize(512, 512, false);
+  renderer.setClearColor(0x000000, 0);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
@@ -22,15 +26,35 @@ function setup() {
 
 function baseScene() {
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x15171c);
+  scene.background = null;
   if (envTex) scene.environment = envTex;
-  const key = new THREE.DirectionalLight(0xffffff, 1.6);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+  const key = new THREE.DirectionalLight(0xffffff, 1.5);
   key.position.set(-2.5, 4, 3.5);
   scene.add(key);
-  const fill = new THREE.DirectionalLight(0x9fc4ff, 0.5);
+  const fill = new THREE.DirectionalLight(0xbfd4ff, 0.45);
   fill.position.set(3, 1.5, -2.5);
   scene.add(fill);
   return scene;
+}
+
+/** 按真实几何包围球自动取景，留出透明边距，保证主体不被裁切 */
+function frameObject(camera: THREE.PerspectiveCamera, obj: THREE.Object3D) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const center = box.getCenter(new THREE.Vector3());
+  let R = 0.001;
+  obj.updateMatrixWorld(true);
+  obj.traverse((o: any) => {
+    if (!o.isMesh || !o.geometry) return;
+    if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere();
+    const s = o.geometry.boundingSphere.clone().applyMatrix4(o.matrixWorld);
+    R = Math.max(R, s.center.distanceTo(center) + s.radius);
+  });
+  const fov = (camera.fov * Math.PI) / 180;
+  const dist = (R / Math.sin(fov / 2)) * 1.05;
+  const dir = new THREE.Vector3(0.55, 0.28, 0.85).normalize();
+  camera.position.copy(center).add(dir.multiplyScalar(dist));
+  camera.lookAt(center);
 }
 
 export async function renderThumb(detail: AssetDetail): Promise<string> {
@@ -40,15 +64,45 @@ export async function renderThumb(detail: AssetDetail): Promise<string> {
   const camera = new THREE.PerspectiveCamera(34, 1, 0.05, 100);
 
   if (detail.type === 'model' || detail.type === 'scene') {
-    const f = detail.files.find(x => /\.fbx$/i.test(x.rel_path));
-    if (!f) throw new Error('no fbx');
-    const obj = await new Promise<THREE.Group>((res, rej) =>
-      new FBXLoader().load(`/api/file/${f.id}`, res, undefined, rej));
-    const mat = await buildMaterial(detail.files, detectConfig(detail.files));
+    const f = detail.files.find(x => /\.(fbx|obj|glb|gltf)$/i.test(x.rel_path));
+    if (!f) throw new Error('no model file');
+    const ext = (String(f.rel_path).match(/\.[a-z0-9]+$/i)?.[0] || '').toLowerCase();
+    const byName = new Map<string, number>();
+    for (const it of detail.files) {
+      const bn = String(it.rel_path).split('/').pop();
+      if (bn) byName.set(bn.toLowerCase(), it.id);
+    }
+    const manager = new THREE.LoadingManager();
+    manager.setURLModifier(url => {
+      if (/^(data:|blob:|https?:)/i.test(url)) return url;
+      let name = url;
+      try { name = decodeURIComponent(url.split('?')[0]); } catch { /* keep */ }
+      const id = byName.get(name.split('/').pop()!.toLowerCase());
+      return id ? `/api/file/${id}` : url;
+    });
+    let obj: THREE.Object3D;
+    if (ext === '.fbx') {
+      obj = await new Promise<THREE.Group>((res, rej) => new FBXLoader(manager).load(`/api/file/${f.id}`, res, undefined, rej));
+    } else if (ext === '.obj') {
+      const mtl = detail.files.find(x => /\.mtl$/i.test(x.rel_path));
+      const loader = new OBJLoader(manager);
+      if (mtl) {
+        const mtlLoader = new MTLLoader(manager);
+        const mats: any = await new Promise((res, rej) => mtlLoader.load(`/api/file/${mtl.id}`, res, undefined, rej));
+        if (mats?.preload) mats.preload();
+        loader.setMaterials(mats);
+      }
+      obj = await new Promise<any>((res, rej) => loader.load(`/api/file/${f.id}`, res, undefined, rej));
+    } else {
+      const gl: any = await new Promise((res, rej) => new GLTFLoader(manager).load(`/api/file/${f.id}`, res, undefined, rej));
+      obj = gl.scene || gl.scenes?.[0];
+    }
+    const mat = await buildMaterial(detail.files, detectConfig(detail.files, detail.slotMap));
     obj.traverse((o: any) => {
       if (o.isMesh) {
         if (o.geometry?.attributes?.uv) o.geometry.setAttribute('uv1', o.geometry.attributes.uv);
-        o.material = mat;
+        const own = Array.isArray(o.material) ? o.material[0] : o.material;
+        if (!own || !(own.map || own.emissiveMap)) o.material = mat;
       }
     });
     const box = new THREE.Box3().setFromObject(obj);
@@ -58,18 +112,16 @@ export async function renderThumb(detail: AssetDetail): Promise<string> {
     obj.scale.setScalar(s);
     obj.position.set(-center.x * s, -center.y * s, -center.z * s);
     scene.add(obj);
-    camera.position.set(2.1, 1.5, 3.4);
-    camera.lookAt(0, 0, 0);
+    frameObject(camera, obj);
   } else {
-    const cfg = detectConfig(detail.files);
+    const cfg = detectConfig(detail.files, detail.slotMap);
     const mat = await buildMaterial(detail.files, cfg);
     const g = new THREE.SphereGeometry(1, 128, 128);
     g.setAttribute('uv1', g.attributes.uv);
     const ball = new THREE.Mesh(g, mat);
     ball.rotation.y = -0.5;
     scene.add(ball);
-    camera.position.set(0, 0.15, 3.1);
-    camera.lookAt(0, 0, 0);
+    frameObject(camera, ball);
   }
 
   r.setSize(512, 512, false);

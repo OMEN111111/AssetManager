@@ -39,9 +39,20 @@ function listFiles(absDir: string): FileInfo[] {
   return out;
 }
 
-function findPreview(files: FileInfo[]): string | null {
-  const byName = (re: RegExp) => files.find(f => re.test(f.name) && (isImg(f.ext) || f.ext === '.pdf'));
-  return (byName(/_preview\./i) || byName(/_render\./i) || byName(/preview/i))?.name ?? null;
+function findPreview(files: FileInfo[], name = ''): string | null {
+  const isPrev = (f: FileInfo) => /_preview\./i.test(f.name) || /_render\./i.test(f.name) || /preview/i.test(f.name);
+  const prev = files.filter(f => (isImg(f.ext) || f.ext === '.pdf') && isPrev(f));
+  if (!prev.length) return null;
+  if (name) {
+    // 先找与素材名同前缀的预览（避免 1k 预览被 4k 素材抢走）
+    const exact = prev.find(f => f.name.toLowerCase().startsWith(name.toLowerCase()));
+    if (exact) return exact.name;
+    // 通用预览（名字里没有分辨率）可以用；带分辨率但不匹配的不要
+    const generic = prev.find(f => !/\d+k/i.test(f.name));
+    if (generic) return generic.name;
+    return null;
+  }
+  return prev[0]?.name ?? null;
 }
 
 function detect(absDir: string, relDir: string, files: FileInfo[], mapFiles: { name: string; size: number; mtime: number }[]): SetSpec[] {
@@ -81,14 +92,14 @@ function detect(absDir: string, relDir: string, files: FileInfo[], mapFiles: { n
 
   if (mtlx.length) {
     for (const m of mtlx) {
-      out.push(base([m], 'main', 'material', '.mtlx', stem(m.name), findPreview(files)));
+      out.push(base([m], 'main', 'material', '.mtlx', stem(m.name), findPreview(files, stem(m.name))));
     }
     return out;
   }
 
   if (models.length) {
     const type: AssetType = relDir.startsWith('06_Scene') ? 'scene' : 'model';
-    const spec = base(models, 'model', type, models[0].ext, dirName, findPreview(files));
+    const spec = base(models, 'model', type, models[0].ext, dirName, findPreview(files, dirName));
     // variants get slots
     let i = 1;
     for (const f of spec.files) if (f.role === 'model') f.slot = String(i++).padStart(2, '0');
@@ -107,7 +118,7 @@ function detect(absDir: string, relDir: string, files: FileInfo[], mapFiles: { n
 
   if (hdris.length) {
     for (const h of hdris) {
-      out.push(base([h], 'main', 'hdri', h.ext, stem(h.name), findPreview(files)));
+      out.push(base([h], 'main', 'hdri', h.ext, stem(h.name), findPreview(files, stem(h.name))));
     }
     return out;
   }
@@ -123,7 +134,7 @@ function detect(absDir: string, relDir: string, files: FileInfo[], mapFiles: { n
     const slotRe = /(basecolor|base_color|albedo|diffuse|normal|nrm|rough|metal|occlusion|_ao\b|height|displacement|gloss)/i;
     const hasSlots = images.some(f => slotRe.test(f.name));
     if (hasSlots) {
-      out.push(base([], 'map', 'texture', images[0].ext, dirName, findPreview(files)));
+      out.push(base([], 'map', 'texture', images[0].ext, dirName, findPreview(files, dirName)));
     } else {
       for (const img of images.slice(0, 500)) {
         out.push(base([img], 'map', 'texture', img.ext, stem(img.name), null, false));
@@ -225,3 +236,4 @@ export function scanLibrary(db: DB, libraryId: number, root: string): ScanResult
     scanState.running = false;
   }
 }
+

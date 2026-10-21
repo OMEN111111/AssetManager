@@ -469,6 +469,40 @@ html[data-theme="light"] ::-webkit-scrollbar-thumb{background:rgba(0,0,0,.18);ba
 .plug-on{font-size:10.5px;color:#5ad08a}
 .plug-off{font-size:10.5px;color:var(--text-faint)}
 
+/* ===== DCC 桥接 / 3ds Max ===== */
+.maxcard{display:flex;flex-direction:column;gap:5px;padding:9px 10px;border:1px solid var(--border);border-radius:8px;
+  background:var(--surface-2);font-size:11.5px}
+.maxcard.on{border-color:rgba(90,208,138,.45);background:linear-gradient(180deg,rgba(90,208,138,.07),transparent)}
+.mxhead{display:flex;align-items:center;gap:8px}
+.mxname{font-size:12.5px;font-weight:600;color:var(--text)}
+.mxdot{width:7px;height:7px;border-radius:50%;background:var(--text-faint);flex:none;box-shadow:0 0 0 2px rgba(255,255,255,.04)}
+.mxdot.on{background:#5ad08a;box-shadow:0 0 6px rgba(90,208,138,.65)}
+.mxver{margin-left:auto;font-size:10.5px;color:var(--text-faint);white-space:nowrap}
+.mxver + .mxver{margin-left:8px}
+.mxmeta{color:var(--text-dim);font-size:11px;line-height:1.5}
+.mxmeta.mxlast{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-faint)}
+.mxjobs{display:flex;flex-direction:column;gap:3px;max-height:170px;overflow:auto}
+.mxjob{display:flex;align-items:center;gap:8px;padding:5px 8px;border:1px solid var(--border-soft);border-radius:6px;
+  font-size:11px;background:var(--surface)}
+.mxst{width:14px;text-align:center;color:var(--text-faint);flex:none}
+.mxst.done{color:#5ad08a}
+.mxst.failed{color:#f87171}
+.mxtitle{color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px}
+.mxmsg{flex:1;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bridgechip{display:flex;align-items:center;gap:5px;height:20px;padding:0 8px;border-radius:10px;font-size:10.5px;
+  color:var(--text-faint);border:1px solid var(--border-soft);background:transparent}
+.bridgechip:hover{color:var(--text);background:var(--surface-2)}
+.bridgechip.on{color:#5ad08a;border-color:rgba(90,208,138,.4)}
+.bridgechip .mxdot{width:6px;height:6px}
+
+.toast{position:fixed;left:50%;bottom:56px;transform:translateX(-50%);z-index:300;max-width:min(680px,80vw);
+  padding:9px 14px;border-radius:9px;font-size:12px;line-height:1.45;color:var(--text);
+  background:var(--elev);border:1px solid var(--border);box-shadow:var(--shadow-2);cursor:pointer;
+  animation:toast-in .16s ease-out}
+.toast.ok{border-color:rgba(90,208,138,.5)}
+.toast.err{border-color:rgba(248,113,113,.55)}
+@keyframes toast-in{from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}
+
 .ci-albedo{background:radial-gradient(circle at 36% 30%, #e6d3b3, #b98b5a 55%, #6d4a2a)}
 
 .vxhint{position:fixed;left:14px;bottom:12px;z-index:120;font-size:10.5px;color:rgba(200,210,225,.55);
@@ -569,3 +603,77 @@ html[data-theme="light"] ::-webkit-scrollbar-thumb{background:rgba(0,0,0,.18);ba
 .updhead{font-size:12px;color:var(--text);margin-bottom:6px}
 .updnotes{max-height:150px;overflow:auto;white-space:pre-wrap;font:11px/1.5 ui-monospace,Consolas,monospace;
   color:var(--text-dim);background:rgba(0,0,0,.18);border-radius:6px;padding:8px;margin:0 0 8px}
+
+/* ===== F-005: 禁止空白拖动误选文本 ===== */
+html,body,#root{user-select:none}
+input,textarea,select,pre,code,.path,.dpath,.dvalue,.selectable{user-select:text}
+::selection{background:var(--accent);color:#fff}
+
+/* ===== F-001: 侧栏折叠 ===== */
+.sidebar.collapsed{padding:8px 0;align-items:center;gap:6px;overflow:hidden}
+.sidebar.collapsed .side-mini{writing-mode:vertical-rl;font-size:11px;color:var(--text-faint);letter-spacing:.14em;
+  border:1px solid var(--border);border-radius:8px;padding:10px 4px;cursor:pointer;background:var(--surface-2)}
+.sidebar.collapsed .side-mini:hover{color:var(--text)}
+.sidebar .side-collapse{margin-left:auto;font-size:12px;color:var(--text-faint);cursor:pointer;padding:0 4px}
+.sidebar .side-collapse:hover{color:var(--text)}
+
+/* ===== F-002: 详情面板拖动调宽 ===== */
+.details{position:relative}
+.details.open{transition:none}
+.detail-resizer{position:absolute;left:-3px;top:0;bottom:0;width:7px;cursor:col-resize;z-index:6;
+  background:transparent}
+.detail-resizer:hover,.detail-resizer.on{background:linear-gradient(90deg,transparent,rgba(90,160,255,.55))}
+
+/* ===== v0.2.1 交互修复 ===== */
+.ctxmenu{max-height:calc(100vh - 16px);overflow-y:auto}
+.rating-pop{position:fixed;z-index:320;background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:10px;box-shadow:0 12px 32px rgba(0,0,0,.45);display:flex;flex-direction:column;gap:8px;min-width:230px}
+.rating-pop .rp-row{display:flex;align-items:center;gap:8px}
+.rating-pop .star-set{display:flex;gap:2px}
+.rating-pop .star-set button{font-size:18px;line-height:1;color:#8b93a1;background:none;border:0;cursor:pointer}
+.rating-pop .star-set button.on{color:#f5c451}
+.tagpick-list{max-height:240px;overflow:auto;display:flex;flex-direction:column;gap:1px;margin-top:8px}
+.tagpick-list .row{padding:5px 8px;border-radius:6px}
+.tag[draggable="true"]{cursor:grab}
+.card.drop-hover{outline:2px solid var(--accent);outline-offset:-2px}
+
+.sortsel.mini{width:78px;height:22px;font-size:10.5px;padding:0 4px}
+
+.ctxmenu{max-height:min(70vh,430px)}
+
+.rating-pop{position:fixed}
+
+/* 标签管理：二级标签胶囊 + 选中高亮 */
+.taglist-wrap{flex:1;overflow:auto;padding:8px}
+.tagchips{display:flex;flex-wrap:wrap;gap:6px;align-content:flex-start}
+.tagchip{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:6px;
+  border:1px solid var(--border);background:var(--surface-2);color:var(--text-dim);font-size:11.5px;cursor:default}
+.tagchip:hover{color:var(--text);border-color:var(--border-2,rgba(255,255,255,.2))}
+.tagchip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.tagchip i{font-style:normal;font-size:10px;opacity:.75}
+.tgm-item.on{background:color-mix(in srgb, var(--accent) 22%, transparent)}
+
+/* 右键菜单不滚动：整体向上贴合窗口 */
+.ctxmenu{max-height:none;overflow:visible}
+
+/* 预览层让出标题栏，保证最小化/最大化/关闭可点 */
+.titlebar{position:relative;z-index:210}
+.viewer{inset:32px 0 0 0}
+
+/* 预览层顶部必须让出标题栏（窗口缩放时也一样） */
+.viewer{top:32px !important;bottom:0;left:0;right:0;height:auto}
+
+/* 联动 UV：回形针方形按钮 */
+.linkbtn{width:26px;height:26px;border-radius:6px;border:1px solid var(--border);background:var(--surface-2);
+  color:var(--text-dim);font-size:13px;line-height:1;display:grid;place-items:center;cursor:pointer}
+.linkbtn:hover{color:var(--text)}
+.linkbtn.on{background:var(--accent);border-color:var(--accent);color:#fff}
+
+/* 组装器顶部路径 */
+.vpath{flex:1;min-width:0;margin:0 12px;font-size:11px;color:#8b93a1;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 顶栏去掉品牌后让搜索框更靠左 */
+.topbar{padding-left:10px}
+
+/* 3D 预览同样让出标题栏 */
+.vx{top:32px !important;bottom:0;left:0;right:0;height:auto}

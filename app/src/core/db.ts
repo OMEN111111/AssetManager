@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS files(
 );
 CREATE INDEX IF NOT EXISTS idx_files_asset ON files(asset_id);
 
+CREATE TABLE IF NOT EXISTS material_overrides(
+  asset_key TEXT NOT NULL,
+  material TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  file_rel TEXT NOT NULL,
+  updated_at INTEGER,
+  PRIMARY KEY(asset_key, material, channel)
+);
+
 CREATE TABLE IF NOT EXISTS tags(
   id INTEGER PRIMARY KEY,
   parent_id INTEGER,
@@ -66,6 +75,32 @@ CREATE TABLE IF NOT EXISTS issue_ignores(
   kind TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   PRIMARY KEY(asset_id, kind)
+);
+
+-- DCC 桥接（3ds Max / SketchUp / ...）：任务队列 + 客户端心跳
+CREATE TABLE IF NOT EXISTS bridge_jobs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  target TEXT NOT NULL,
+  asset_id INTEGER,
+  mode TEXT NOT NULL,
+  title TEXT,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  message TEXT,
+  result TEXT,
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  finished_at INTEGER,
+  lease_until INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_bridge_jobs ON bridge_jobs(target, status, id);
+
+CREATE TABLE IF NOT EXISTS bridge_clients(
+  target TEXT PRIMARY KEY,
+  last_seen INTEGER NOT NULL,
+  version TEXT,
+  host TEXT,
+  info TEXT
 );
 `;
 

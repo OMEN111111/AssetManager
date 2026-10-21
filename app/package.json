@@ -1,7 +1,7 @@
 {
   "name": "assetmanager-app",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.15",
   "type": "module",
   "scripts": {
     "dev:api": "tsx src/server/index.ts",
@@ -46,6 +46,7 @@
     "files": [
       "dist/**/*",
       "build/**/*",
+      "bridge/**/*",
       "electron/**/*",
       "package.json"
     ],

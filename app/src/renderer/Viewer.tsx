@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
+import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
@@ -123,6 +126,12 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
   const [meshList, setMeshList] = useState<any[]>([]);
   const [matGroups, setMatGroups] = useState<{ name: string; count: number }[]>([]);
   const [tiles, setTiles] = useState<string[]>([]);
+  // F-007：模型材质/通道贴图覆盖
+  const [ovVersion, setOvVersion] = useState(0);
+  const [ovOpen, setOvOpen] = useState(false);
+  const [ovMatSel, setOvMatSel] = useState('');
+  const [ovChSel, setOvChSel] = useState('baseColor');
+  const [ovFileSel, setOvFileSel] = useState('');
 
   const [exposure, setExposure] = useState(1);
   const [envI, setEnvI] = useState(1);
@@ -468,10 +477,44 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       }
 
       if (isModel) {
-        const modelFile = findFile(files, '.fbx');
-        if (!modelFile) { setError('当前仅支持 FBX 模型预览'); setStatus(''); return; }
+        const extOf = (p: string) => (String(p).match(/\.[a-z0-9]+$/i)?.[0] || '').toLowerCase();
+        const modelFile = files.find(f => /\.(fbx|obj|glb|gltf)$/i.test(f.rel_path) && f.role === 'model')
+          || files.find(f => /\.(fbx|obj|glb|gltf)$/i.test(f.rel_path));
+        if (!modelFile) { setError('没有可预览的模型文件'); setStatus(''); return; }
+        const mext = extOf(modelFile.rel_path);
+        // F-004：OBJ/GLB/GLTF 的相对资源（mtl、bin、贴图）按同目录文件名映射到 /api/file/:id
+        const fileByName = new Map<string, number>();
+        for (const f of files) {
+          const bn = String(f.rel_path).split('/').pop();
+          if (bn) fileByName.set(bn.toLowerCase(), f.id);
+        }
+        const manager = new THREE.LoadingManager();
+        manager.setURLModifier(url => {
+          if (/^(data:|blob:|https?:)/i.test(url)) return url;
+          let name = url;
+          try { name = decodeURIComponent(url.split('?')[0]); } catch { /* keep */ }
+          name = name.split('/').pop()!.toLowerCase();
+          const id = fileByName.get(name);
+          return id ? `/api/file/${id}` : url;
+        });
         setStatus('解析模型…');
-        const obj = await new Promise<THREE.Group>((res, rej) => new FBXLoader().load(`/api/file/${modelFile.id}`, res, undefined, rej));
+        let obj: any;
+        if (mext === '.fbx') {
+          obj = await new Promise<THREE.Group>((res, rej) => new FBXLoader(manager).load(`/api/file/${modelFile.id}`, res, undefined, rej));
+        } else if (mext === '.obj') {
+          const mtl = files.find(f => /\.mtl$/i.test(f.rel_path));
+          const loader = new OBJLoader(manager);
+          if (mtl) {
+            const mtlLoader = new MTLLoader(manager);
+            const mats: any = await new Promise((res, rej) => mtlLoader.load(`/api/file/${mtl.id}`, res, undefined, rej));
+            if (mats?.preload) mats.preload();
+            loader.setMaterials(mats);
+          }
+          obj = await new Promise<any>((res, rej) => loader.load(`/api/file/${modelFile.id}`, res, undefined, rej));
+        } else {
+          const gl: any = await new Promise((res, rej) => new GLTFLoader(manager).load(`/api/file/${modelFile.id}`, res, undefined, rej));
+          obj = gl.scene || gl.scenes?.[0];
+        }
         const collected: any[] = [];
         const fileNameOf = (src: string) => {
           try { return decodeURIComponent(String(src).split('/').pop() || ''); } catch { return ''; }
@@ -583,6 +626,47 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           }
           if (m) m.needsUpdate = true;
         }
+        // F-007：应用手动指定的贴图覆盖（按材质名 + 通道）
+        let ovMap: Record<string, Record<string, string>> = {};
+        try {
+          const r = await fetch(`/api/model/${asset.id}/overrides`).then(x => x.json());
+          ovMap = r?.overrides || {};
+        } catch { /* ignore */ }
+        if (Object.keys(ovMap).length) {
+          const loadOv = (rel: string, srgb: boolean) => new Promise<THREE.Texture>((res, rej) => {
+            const f = files.find(x => String(x.rel_path) === rel);
+            const url = f ? `/api/file/${f.id}` : `/api/override-file?assetId=${asset.id}&rel=${encodeURIComponent(rel)}`;
+            new THREE.TextureLoader().load(url, t => {
+              t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+              t.wrapS = THREE.RepeatWrapping;
+              t.wrapT = THREE.RepeatWrapping;
+              t.anisotropy = 8;
+              res(t);
+            }, undefined, rej);
+          });
+          for (const c of collected) {
+            const ov = ovMap[c.matName];
+            if (!ov || !Object.keys(ov).length) continue;
+            const baseMat: any = Array.isArray(c.mesh.material) ? c.mesh.material[0] : c.mesh.material;
+            if (!baseMat) continue;
+            const cl: any = baseMat.clone();
+            for (const [ch, rel] of Object.entries(ov)) {
+              try {
+                if (ch === 'baseColor') cl.map = await loadOv(rel, true);
+                else if (ch === 'normal') cl.normalMap = await loadOv(rel, false);
+                else if (ch === 'roughness') { cl.roughnessMap = await loadOv(rel, false); cl.roughness = 1; }
+                else if (ch === 'metallic') { cl.metalnessMap = await loadOv(rel, false); cl.metalness = 1; }
+                else if (ch === 'ao') cl.aoMap = await loadOv(rel, false);
+                else if (ch === 'emissive') { cl.emissiveMap = await loadOv(rel, true); cl.emissive = new THREE.Color(0xffffff); }
+                else if (ch === 'height') { cl.displacementMap = await loadOv(rel, false); cl.displacementScale = 0.02; }
+                else if (ch === 'opacity') { cl.alphaMap = await loadOv(rel, false); cl.transparent = true; }
+              } catch { /* keep original channel */ }
+            }
+            cl.needsUpdate = true;
+            c.mesh.material = cl;
+            c.ownMat = cl;
+          }
+        }
         const box = new THREE.Box3().setFromObject(obj);
         const size = new THREE.Vector3(); box.getSize(size);
         const center = new THREE.Vector3(); box.getCenter(center);
@@ -691,7 +775,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       renderer.dispose();
       el.innerHTML = '';
     };
-  }, [asset.id]);
+  }, [asset.id, ovVersion]);
 
   // channel material
   useEffect(() => {
@@ -878,7 +962,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     window.addEventListener('pointerup', up);
   }
 
-  const cfg = useMemo(() => detectConfig(asset.files), [asset.files]);
+  const cfg = useMemo(() => detectConfig(asset.files, asset.slotMap), [asset.files, asset.slotMap]);
   const textureRows = Object.entries(cfg.channels)
     .map(([k, v]: any) => {
       const f = asset.files.find(x => x.id === v?.fileId);
@@ -886,6 +970,16 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     })
     .filter(Boolean) as { k: string; id: number; src: string; name: string }[];
   const shownTex = activeMat >= 0 && groupTex[activeMat] ? groupTex[activeMat] : textureRows;
+
+  async function saveOverride() {
+    if (!ovMatSel) return;
+    await fetch(`/api/model/${asset.id}/overrides`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ material: ovMatSel, channel: ovChSel, fileRel: ovFileSel })
+    });
+    setOvOpen(false);
+    setOvVersion(v => v + 1);
+  }
 
   return (
     <div className="vx">
@@ -1000,6 +1094,12 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
                     {m.name}<span className="vp-cnt">{m.count}</span>
                   </button>
                 ))}
+                <button className="btn tiny" style={{ marginTop: 6 }} onClick={() => {
+                  setOvMatSel(matGroups[activeMat >= 0 ? activeMat : 0]?.name || matGroups[0]?.name || '');
+                  setOvChSel('baseColor');
+                  setOvFileSel('');
+                  setOvOpen(true);
+                }}>贴图覆盖…</button>
               </>
             ) : (
               <>
@@ -1043,6 +1143,44 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       </div>
 
       <div className="vxhint">F 聚焦 · 拖动旋转 · 滚轮缩放 · Esc 关闭</div>
+
+      {ovOpen && (
+        <div className="modal-mask" onMouseDown={() => setOvOpen(false)}>
+          <div className="modal" onMouseDown={e => e.stopPropagation()}>
+            <div className="modal-t">贴图覆盖 · {asset.name}</div>
+            <div className="hint" style={{ fontSize: 12 }}>
+              为某个材质的通道指定贴图，保存后用于预览与发送到 3ds Max（不改 FBX 原文件）。
+            </div>
+            <div className="uvrow">
+              <label>材质</label>
+              <select className="sortsel" value={ovMatSel} onChange={e => setOvMatSel(e.target.value)}>
+                {matGroups.map(g => <option key={g.name} value={g.name}>{g.name}</option>)}
+                {matGroups.length === 0 && <option value="">（未识别到材质）</option>}
+              </select>
+            </div>
+            <div className="uvrow">
+              <label>通道</label>
+              <select className="sortsel" value={ovChSel} onChange={e => setOvChSel(e.target.value)}>
+                {['baseColor', 'normal', 'roughness', 'metallic', 'ao', 'height', 'emissive', 'opacity'].map(c =>
+                  <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div className="uvrow">
+              <label>贴图</label>
+              <select className="sortsel" style={{ flex: 1 }} value={ovFileSel} onChange={e => setOvFileSel(e.target.value)}>
+                <option value="">（清除，恢复自动）</option>
+                {asset.files.filter(f => /\.(png|jpe?g|webp|tga|tiff?)$/i.test(f.rel_path)).map(f => (
+                  <option key={f.id} value={f.rel_path}>{String(f.rel_path).split('/').pop()}</option>
+                ))}
+              </select>
+            </div>
+            <div className="modal-b">
+              <button className="btn" onClick={() => setOvOpen(false)}>关闭</button>
+              <button className="btn primary" onClick={saveOverride}>保存并重载</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {texPreview && (
         <div className="texoverlay" onMouseDown={() => setTexPreview(null)}>

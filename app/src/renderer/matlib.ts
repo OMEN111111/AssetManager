@@ -57,7 +57,22 @@ function find(files: AssetFile[], ...keys: string[]) {
   return undefined;
 }
 
-export function detectConfig(files: AssetFile[]): MaterialConfig {
+export function detectConfig(files: AssetFile[], slotMap?: Record<string, string> | null): MaterialConfig {
+  // 回写导出时插件会写 asset_maps.json（槽位→文件名），有它就直接用，别再按文件名猜
+  if (slotMap && Object.keys(slotMap).length) {
+    const byRel = new Map(files.map(f => [f.rel_path.toLowerCase(), f]));
+    const cfg: MaterialConfig = { workflow: 'MR', channels: {} };
+    const ch: Record<string, 'rgb' | 'r' | 'g' | 'b'> = { baseColor: 'rgb', normal: 'rgb', roughness: 'r', metallic: 'r', ao: 'r', height: 'r', emissive: 'rgb', opacity: 'r' };
+    for (const [slot, rel] of Object.entries(slotMap)) {
+      const f = byRel.get(String(rel).toLowerCase());
+      if (!f) continue;
+      const key = slot as ChannelKey;
+      const entry: ChannelCfg = { fileId: f.id, channel: ch[slot] || 'rgb', intensity: 1 };
+      if (slot === 'normal') entry.normalSpace = /(_dx|dx_|directx)/i.test(f.rel_path.toLowerCase()) ? 'dx' : 'gl';
+      cfg.channels[key] = entry;
+    }
+    if (Object.keys(cfg.channels).length) return cfg;
+  }
   const packed = find(files, '_arm_', '_orm_', '_omr_', '_rma_', '_arm.', '_orm.');
   const cfg: MaterialConfig = { workflow: 'MR', channels: {} };
 
@@ -84,7 +99,7 @@ export function detectConfig(files: AssetFile[]): MaterialConfig {
     if (metal) cfg.channels.metallic = { fileId: metal.id, channel: 'b', intensity: 1 };
     if (ao) cfg.channels.ao = { fileId: ao.id, channel: 'r', intensity: 1 };
   }
-  if (height) cfg.channels.height = { fileId: height.id, channel: 'r', intensity: 0.04 };
+  if (height) cfg.channels.height = { fileId: height.id, channel: 'r', intensity: 1 };
   return cfg;
 }
 
@@ -94,7 +109,10 @@ export function loadTexture(f: AssetFile, srgb = false): Promise<THREE.Texture> 
   let p = texCache.get(key);
   if (!p) {
     p = new Promise((res, rej) => {
-      new THREE.TextureLoader().load(`/api/file/${f.id}`, t => {
+      const src = /^[a-zA-Z]:[\\/]/.test(f.rel_path)
+        ? `/api/path-file?path=${encodeURIComponent(f.rel_path)}`
+        : `/api/file/${f.id}`;
+      new THREE.TextureLoader().load(src, t => {
         if (srgb) t.colorSpace = THREE.SRGBColorSpace;
         t.anisotropy = 8;
         t.wrapS = THREE.RepeatWrapping;
@@ -115,7 +133,28 @@ async function texFor(f: AssetFile, srgb: boolean, gUv?: MaterialConfig['uv']) {
   const rot = gUv?.rot ?? 0;
   const ou = gUv?.offsetU ?? 0;
   const ov = gUv?.offsetV ?? 0;
-  if (ru === 1 && rv === 1 && !rot && !ou && !ov) return base;
+  const hasUv = !(ru === 1 && rv === 1 && !rot && !ou && !ov);
+
+  // B-002：非 1:1 贴图按宽高比修正 V 方向平铺，避免被方形 UV 拉伸（几何 UV 为世界尺度）
+  if (!hasUv) {
+    const img: any = base.image;
+    const iw = img?.width || img?.videoWidth || 0;
+    const ih = img?.height || img?.videoHeight || 0;
+    const a = iw && ih ? iw / ih : 1;
+    if (Math.abs(a - 1) > 0.01) {
+      const t0 = base.clone();
+      t0.needsUpdate = true;
+      t0.wrapS = THREE.RepeatWrapping;
+      t0.wrapT = THREE.RepeatWrapping;
+      t0.center.set(0.5, 0.5);
+      t0.repeat.set(1, a);
+      t0.offset.set(0, 0);
+      t0.rotation = 0;
+      return t0;
+    }
+    return base;
+  }
+
   const t = base.clone();
   t.needsUpdate = true;
   t.wrapS = THREE.RepeatWrapping;
@@ -143,16 +182,22 @@ vec3 hsv2rgb(vec3 c){
 `;
 
 function hslPatch(target: 'map' | 'emissive', hsl: HslCfg) {
-  const h = (hsl.h / 360).toFixed(5);
-  const s = (1 + hsl.s / 100).toFixed(5);
-  const l = (1 + hsl.l / 100).toFixed(5);
+  const h = ((hsl.h ?? 0.5) - 0.5).toFixed(5);
+  const s = ((hsl.s ?? 0.5) * 2).toFixed(5);
+  const l = ((hsl.l ?? 0.5) * 2).toFixed(5);
   const adjust = (tex: string) => `
-    vec3 hslC = ${tex}.rgb;
-    vec3 hsv = rgb2hsv(hslC);
-    hsv.x = fract(hsv.x + ${h});
-    hsv.y = clamp(hsv.y * ${s}, 0.0, 1.0);
-    hsv.z = clamp(hsv.z * ${l}, 0.0, 1.0);
-    ${tex}.rgb = hsv2rgb(hsv);
+    vec3 c0 = ${tex}.rgb;
+    float ang = ${h} * 6.28318530718;
+    float ca = cos(ang), sa = sin(ang);
+    vec3 c1 = vec3(
+      dot(c0, vec3(0.213 + 0.787 * ca - 0.213 * sa, 0.715 - 0.715 * ca - 0.715 * sa, 0.072 - 0.072 * ca + 0.928 * sa)),
+      dot(c0, vec3(0.213 - 0.213 * ca + 0.143 * sa, 0.715 + 0.285 * ca + 0.140 * sa, 0.072 - 0.072 * ca - 0.283 * sa)),
+      dot(c0, vec3(0.213 - 0.213 * ca - 0.787 * sa, 0.715 - 0.715 * ca + 0.715 * sa, 0.072 + 0.928 * ca + 0.072 * sa))
+    );
+    float lum = dot(c1, vec3(0.2126, 0.7152, 0.0722));
+    c1 = mix(vec3(lum), c1, clamp(${s}, 0.0, 3.0));
+    c1 = max(c1 * clamp(${l}, 0.0, 3.0), 0.0);
+    ${tex}.rgb = c1;
   `;
   return (shader: any) => {
     if (!shader.fragmentShader.includes('rgb2hsv')) {
@@ -187,11 +232,9 @@ function scalarPatch(kind: 'roughness' | 'metalness', comp: string, invert: bool
   const factor = isRough ? 'roughnessFactor' : 'metalnessFactor';
   const baseVar = isRough ? 'roughness' : 'metalness';
   const define = isRough ? 'USE_ROUGHNESSMAP' : 'USE_METALNESSMAP';
-  const k = Math.max(-1, Math.min(1, intensity));
-  const mag = Math.abs(k).toFixed(3);
+  const k = Number.isFinite(intensity) ? intensity : 1;
   const rawName = isRough ? 'rawRough' : 'rawMetal';
-  // 负强度 = 反转；绝对值 1 对应纯黑/纯白，0 保持原贴图
-  const target = ((k < 0) !== invert) ? '0.0' : '1.0';
+  const expr = invert ? `(1.0 - ${rawName})` : rawName;
 
   return (shader: any) => {
     shader.fragmentShader = shader.fragmentShader.replace(include, `
@@ -199,7 +242,7 @@ function scalarPatch(kind: 'roughness' | 'metalness', comp: string, invert: bool
       #ifdef ${define}
         vec4 ${varName} = texture2D( ${mapName}, ${uv} );
         float ${rawName} = ${varName}.${comp};
-        ${factor} *= mix(${rawName}, ${target}, ${mag});
+        ${factor} *= clamp(${expr} * ${k.toFixed(4)}, 0.0, 1.0);
       #endif
     `);
   };
@@ -214,7 +257,7 @@ export async function buildMaterial(files: AssetFile[], cfg: MaterialConfig) {
   const patches: ((s: any) => void)[] = [];
   const keys: string[] = [];
   const patch = (key: string, fn: (s: any) => void) => { keys.push(key); patches.push(fn); };
-  const hslOn = (h?: HslCfg) => !!h && (h.h !== 0 || h.s !== 0 || h.l !== 0);
+  const hslOn = (h?: HslCfg) => !!h && ((h.h ?? 0.5) !== 0.5 || (h.s ?? 0.5) !== 0.5 || (h.l ?? 0.5) !== 0.5);
 
   const base = fileOf(c.baseColor);
   if (base) mat.map = await texFor(base, true, gUv);
@@ -226,6 +269,9 @@ export async function buildMaterial(files: AssetFile[], cfg: MaterialConfig) {
     const ns = c.normal?.normalSpace ?? 'gl';
     const ni = c.normal?.intensity ?? 1;
     mat.normalScale.set(ni, ni * (ns === 'dx' ? -1 : 1));
+    mat.userData.normalSpace = ns;
+  } else {
+    mat.userData.normalSpace = 'gl';
   }
 
   const rough = c.roughness;
@@ -254,7 +300,7 @@ export async function buildMaterial(files: AssetFile[], cfg: MaterialConfig) {
   const heightF = fileOf(c.height);
   if (heightF) {
     mat.displacementMap = await texFor(heightF, false, gUv);
-    mat.displacementScale = (c.height?.intensity ?? 0) * 0.1;
+    mat.displacementScale = (c.height?.intensity ?? 1) * 0.02;
   }
 
   const em = fileOf(c.emissive);
@@ -291,3 +337,4 @@ export function missingRequired(cfg: MaterialConfig) {
   if (!cfg.channels.normal?.fileId) miss.push('Normal');
   return miss;
 }
+

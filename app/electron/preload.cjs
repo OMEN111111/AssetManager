@@ -6,6 +6,10 @@ contextBridge.exposeInMainWorld('amApi', {
   },
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
   applyUpdate: (file) => ipcRenderer.invoke('update:apply', file),
+  getCloseAction: () => ipcRenderer.invoke('app:getCloseAction'),
+  setCloseAction: (v) => ipcRenderer.invoke('app:setCloseAction', v),
+  // 把素材拖到 3ds Max / 资源管理器：走系统原生拖拽（Chromium 的 HTML5 拖拽出不了应用）
+  startDrag: (payload) => ipcRenderer.send('drag:start', payload),
   platform: process.platform
 });
 

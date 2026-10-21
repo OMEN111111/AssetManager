@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
+import { TessellateModifier } from 'three/examples/jsm/modifiers/TessellateModifier.js';
+import { mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 /** 一个纹理重复对应的世界尺寸；所有几何体共用，保证贴图密度一致 */
 export const UV_WORLD = 2.0;
@@ -109,10 +111,48 @@ function roundedCylinder(radius: number, height: number, fillet: number, radial:
 
 export type PreviewGeometry = 'sphere' | 'box' | 'cylinder' | 'plane';
 
-export function makeGeometry(kind: PreviewGeometry): THREE.BufferGeometry {
+/** 对自定义基本体按类型重算 UV（三向世界尺度投影，避免侧面/极点/端盖拉伸） */
+export function remapUV(kind: PreviewGeometry, g: THREE.BufferGeometry) {
+  if (!g.attributes.position) return;
+  if (kind !== 'plane') planarUV(g);
+}
+
+/** 90° 旋转几何时同步旋转 UV，保持棋盘格不被拉长 */
+export function rotateUV90(g: THREE.BufferGeometry) {
+  const uv = g.attributes.uv;
+  if (!uv) return;
+  for (let i = 0; i < uv.count; i++) {
+    const u = uv.getX(i), v = uv.getY(i);
+    uv.setXY(i, v, u);
+  }
+  uv.needsUpdate = true;
+}
+
+/** 把圆柱轴摆正到 Y（用顶点分布方差判断轴向，适用于长宽接近的包围体） */
+export function uprightCylinder(g: THREE.BufferGeometry) {
+  const p = g.attributes.position;
+  let xx = 0, yy = 0, zz = 0;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    xx += x * x; yy += y * y; zz += z * z;
+  }
+  if (zz >= xx && zz >= yy) g.rotateX(-Math.PI / 2);
+  else if (xx >= yy && xx >= zz) g.rotateZ(Math.PI / 2);
+  g.computeBoundingBox();
+  const c = new THREE.Vector3();
+  g.boundingBox.getCenter(c);
+  g.translate(-c.x, -c.y, -c.z);
+}
+
+export function makeGeometry(kind: PreviewGeometry, planeAxis: 'v' | 'h' = 'v'): THREE.BufferGeometry {
   if (kind === 'box') {
     const size = 1.7;
-    const g = new RoundedBoxGeometry(size, size, size, 16, 0.16);
+    // 圆角盒：先倒角，再细分所有面，保证高度置换在平面区域也有均匀顶点
+    let g: THREE.BufferGeometry = new RoundedBoxGeometry(size, size, size, 24, 0.16);
+    g = new TessellateModifier(0.045, 4).modify(g) as THREE.BufferGeometry;
+    // 细分会拆散顶点，必须焊接后重算法线，否则倒角处出现黑缝
+    g = mergeVertices(g, 1e-4);
+    g.computeVertexNormals();
     planarUV(g);
     return withUv1(g);
   }
@@ -121,17 +161,20 @@ export function makeGeometry(kind: PreviewGeometry): THREE.BufferGeometry {
   }
   if (kind === 'plane') {
     const g = new THREE.PlaneGeometry(2.4, 2.4, 96, 96);
+    if (planeAxis === 'h') g.rotateX(-Math.PI / 2);
     const pos = g.attributes.position;
     const uv = g.attributes.uv;
     for (let i = 0; i < pos.count; i++) {
-      uv.setXY(i, pos.getX(i) / UV_WORLD + 0.5, pos.getY(i) / UV_WORLD + 0.5);
+      uv.setXY(i,
+        pos.getX(i) / UV_WORLD + 0.5,
+        (planeAxis === 'h' ? pos.getZ(i) : pos.getY(i)) / UV_WORLD + 0.5);
     }
     uv.needsUpdate = true;
     g.computeVertexNormals();
     return withUv1(g);
   }
   // 球：用「立方体球化」+ 世界尺度投影代替经纬球，消除极点挤压
-  const g = new THREE.BoxGeometry(2, 2, 2, 96, 96, 96);
+  const g = new THREE.BoxGeometry(2, 2, 2, 128, 128, 128);
   const pos = g.attributes.position;
   const p = new THREE.Vector3();
   for (let i = 0; i < pos.count; i++) {
@@ -142,3 +185,4 @@ export function makeGeometry(kind: PreviewGeometry): THREE.BufferGeometry {
   planarUV(g);
   return withUv1(g);
 }
+
