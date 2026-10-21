@@ -492,6 +492,100 @@ export function bridgeStatus(db: DB) {
   return { app: 'AssetManager', protocol: BRIDGE_PROTOCOL, scriptVersion: BRIDGE_SCRIPT_VERSION, now, targets: out };
 }
 
+// ---------------------------------------------------------------- Blender 安装
+
+const BLENDER_PLUGIN_FILE = 'assetmanager_blender.py';
+
+/** 安装包里有哪些 Blender 系列目录（3.6 / 4.0 / 5.2 …） */
+export function blenderSeries(appRoot: string): string[] {
+  const dir = path.join(appRoot, 'bridge', 'blender');
+  let ents: fs.Dirent[] = [];
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  return ents.filter(e => e.isDirectory() && /^\d+\.\d+$/.test(e.name))
+    .map(e => e.name)
+    .sort((a, b) => {
+      const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+      return (pa[0] - pb[0]) || (pa[1] - pb[1]);
+    });
+}
+
+/** 本机 Blender 的用户目录（%APPDATA%\Blender Foundation\Blender\<版本>\scripts\addons） */
+export function blenderUserDirs(): { version: string; addons: string }[] {
+  const appdata = process.env.APPDATA
+    || path.join(os.homedir(), 'AppData', 'Roaming');
+  const base = path.join(appdata, 'Blender Foundation', 'Blender');
+  let versions: fs.Dirent[] = [];
+  try { versions = fs.readdirSync(base, { withFileTypes: true }); } catch { return []; }
+  const out: { version: string; addons: string }[] = [];
+  for (const v of versions) {
+    if (!v.isDirectory() || !/^\d+\.\d+$/.test(v.name)) continue;
+    const dir = path.join(base, v.name, 'scripts', 'addons');
+    // 只认真的被 Blender 用过的版本目录（有 config 或 datafiles 才算）
+    const used = fs.existsSync(path.join(base, v.name, 'config'))
+      || fs.existsSync(path.join(base, v.name, 'datafiles'))
+      || fs.existsSync(dir);
+    if (used) out.push({ version: v.name, addons: dir });
+  }
+  return out;
+}
+
+/** 给某个 Blender 版本挑最合适的插件系列：优先同版本，其次不超过它的最高系列 */
+export function pickBlenderSeries(series: string[], blenderVersion: string): string | null {
+  if (!series.length) return null;
+  if (series.includes(blenderVersion)) return blenderVersion;
+  const [bmaj, bmin] = blenderVersion.split('.').map(Number);
+  const le = series.filter(s => {
+    const [maj, min] = s.split('.').map(Number);
+    return maj < bmaj || (maj === bmaj && min <= bmin);
+  });
+  if (le.length) return le[le.length - 1];
+  return series[0]; // Blender 比所有系列都老：给最低的那份
+}
+
+function pluginVersionOf(src: string): string {
+  try {
+    const m = fs.readFileSync(src, 'utf8').match(/BL_VERSION\s*=\s*"([^"]+)"/);
+    return m ? m[1] : '';
+  } catch { return ''; }
+}
+
+/** 一键把插件装进本机所有 Blender 用户目录（按各版本挑对应系列） */
+export function installForBlender(appRoot: string) {
+  const series = blenderSeries(appRoot);
+  if (!series.length) {
+    return { ok: false, error: '安装包缺少 bridge/blender/<Blender 版本>/ 目录（重新打包）' };
+  }
+  const dirs = blenderUserDirs();
+  if (!dirs.length) {
+    return {
+      ok: false,
+      error: '没找到 Blender 用户目录（%APPDATA%\\Blender Foundation\\Blender）：先启动一次 Blender 再装',
+      series
+    };
+  }
+
+  const installed: { blender: string; series: string; version: string; dir: string }[] = [];
+  const failed: { blender: string; error: string }[] = [];
+  for (const d of dirs) {
+    const pick = pickBlenderSeries(series, d.version);
+    if (!pick) continue;
+    const src = path.join(appRoot, 'bridge', 'blender', pick, BLENDER_PLUGIN_FILE);
+    if (!fs.existsSync(src)) {
+      failed.push({ blender: d.version, error: `缺少 ${pick}/${BLENDER_PLUGIN_FILE}` });
+      continue;
+    }
+    try {
+      fs.mkdirSync(d.addons, { recursive: true });
+      const dst = path.join(d.addons, BLENDER_PLUGIN_FILE);
+      fs.copyFileSync(src, dst);
+      installed.push({ blender: d.version, series: pick, version: pluginVersionOf(dst), dir: dst });
+    } catch (e: any) {
+      failed.push({ blender: d.version, error: String(e?.message || e) });
+    }
+  }
+  return { ok: installed.length > 0, installed, failed, series, dirs: dirs.map(d => d.addons) };
+}
+
 // ---------------------------------------------------------------- 3ds Max 安装
 
 const SCRIPT_NAME = 'AssetManagerBridge.ms';

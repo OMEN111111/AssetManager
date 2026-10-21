@@ -9,6 +9,7 @@ import { scanLibrary, scanState } from '../core/scan.ts';
 import {
   bridgeStatus, sendJob, nextJob, finishJob, heartbeat, touchClient, recentJobs, jobById,
   installForMax, installInfo, maxStartupDirs, bridgeScriptPath, writeLocator,
+  installForBlender, blenderSeries, blenderUserDirs,
   resolvePath, assetInfo, writeDropScript,
   BRIDGE_PROTOCOL, BRIDGE_SCRIPT_VERSION
 } from '../core/bridge.ts';
@@ -25,6 +26,21 @@ function findAppRoot(start: string) {
   }
   return start;
 }
+
+/** 递归复制目录（插件按 Blender 版本分目录后，整份拷到数据目录便于手动安装） */
+function copyTree(src: string, dst: string, skip = new Set<string>()) {
+  let entries: fs.Dirent[] = [];
+  try { entries = fs.readdirSync(src, { withFileTypes: true }); } catch { return; }
+  fs.mkdirSync(dst, { recursive: true });
+  for (const e of entries) {
+    if (skip.has(e.name)) continue;
+    const from = path.join(src, e.name);
+    const to = path.join(dst, e.name);
+    if (e.isDirectory()) copyTree(from, to, skip);
+    else if (e.isFile()) { try { fs.copyFileSync(from, to); } catch { /* ignore */ } }
+  }
+}
+
 const APP_ROOT = process.env.AM_ROOT ? path.resolve(process.env.AM_ROOT) : findAppRoot(__dirname);
 const DATA_DIR = process.env.AM_DATA ? path.resolve(process.env.AM_DATA) : path.join(APP_ROOT, 'data');
 const DB_FILE = process.env.ASSETMANAGER_DB || path.join(DATA_DIR, 'library.db');
@@ -783,6 +799,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     return json(res, 200, installForMax(APP_ROOT));
   }
 
+  // 一键把 Blender 插件装进本机所有 Blender 用户目录（按各版本挑对应系列）
+  if (p === '/api/bridge/install-blender' && req.method === 'POST') {
+    return json(res, 200, installForBlender(APP_ROOT));
+  }
+
+  // 只查不装：包里的系列 + 本机 Blender 用户目录
+  if (p === '/api/bridge/blender-where' && req.method === 'GET') {
+    return json(res, 200, { series: blenderSeries(APP_ROOT), dirs: blenderUserDirs() });
+  }
+
   if (p === '/api/bridge/test' && req.method === 'POST') {
     const st = bridgeStatus(db);
     const max = (st.targets as any).max;
@@ -803,6 +829,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
       try {
         fs.mkdirSync(outDir, { recursive: true });
         if (fs.existsSync(scriptPath)) fs.copyFileSync(scriptPath, path.join(outDir, 'AssetManagerBridge.ms'));
+      } catch { /* ignore */ }
+      dir = outDir;
+    } else if (which === 'blender') {
+      // 插件按 Blender 版本分目录（3.6/ 4.0/ …）：整份复制，用户按自己的版本取文件
+      const outDir = path.join(DATA_DIR, 'plugins', 'blender');
+      try {
+        copyTree(path.join(APP_ROOT, 'bridge', 'blender'), outDir, new Set(['tools', '__pycache__']));
       } catch { /* ignore */ }
       dir = outDir;
     } else if (which === 'geometry') {

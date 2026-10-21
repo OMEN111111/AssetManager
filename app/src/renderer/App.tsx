@@ -263,11 +263,13 @@ export default function App() {
   const win = (window as any).winApi;
   const isElectron = !!win?.isElectron;
   const [menuOpen, setMenuOpen] = useState<string | null>(null);
-  // DCC 桥接（3ds Max）
+  // DCC 桥接（3ds Max / Blender）
   const [bridge, setBridge] = useState<any>(null);
   const [bridgeInfo, setBridgeInfo] = useState<any>(null);
   const [bridgeJobs, setBridgeJobs] = useState<any[]>([]);
   const [bridgeBusy, setBridgeBusy] = useState(false);
+  // 「发送到…」菜单：点一个按钮列出可发送的软件，不再一个软件一个按钮
+  const [sendMenu, setSendMenu] = useState<{ asset: Asset; x: number; y: number } | null>(null);
   const [toast, setToast] = useState<{ id: number; kind: 'ok' | 'err' | 'info'; msg: string } | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
   // 选中请求序号：防止慢响应把后来点的素材覆盖掉
@@ -888,40 +890,71 @@ export default function App() {
 
   async function loadBridge() {
     try {
-      const [st, info, jobs] = await Promise.all([
-        api('/api/bridge/status'), api('/api/bridge/info'), api('/api/bridge/jobs?target=max&limit=8')
+      const [st, info, maxJobs, blJobs] = await Promise.all([
+        api('/api/bridge/status'), api('/api/bridge/info'),
+        api('/api/bridge/jobs?target=max&limit=8'), api('/api/bridge/jobs?target=blender&limit=8')
       ]);
       setBridge(st);
       setBridgeInfo(info);
-      setBridgeJobs(jobs.jobs || []);
+      // Max 与 Blender 的任务合并显示，新的在前
+      const merged = [...(maxJobs?.jobs || []), ...(blJobs?.jobs || [])]
+        .sort((a: any, b: any) => (b.id || 0) - (a.id || 0))
+        .slice(0, 8);
+      setBridgeJobs(merged);
     } catch { /* 服务端未就绪时忽略 */ }
   }
 
   /** 素材适合哪种发送方式 */
-  function maxMode(a: Asset): 'import' | 'material' | 'texture' | null {
+  function sendModeFor(a: Asset): 'import' | 'material' | 'texture' | null {
     if (a.type === 'model' || a.type === 'scene') return 'import';
     if (a.type === 'material') return 'material';
     if (a.type === 'texture') return 'texture';
     return null;
   }
 
-  const maxConnected = !!bridge?.targets?.max?.connected;
+  /** 可发送的软件（顺序=菜单顺序） */
+  const SEND_TARGETS: { key: 'max' | 'blender'; label: string }[] = [
+    { key: 'max', label: '3ds Max' },
+    { key: 'blender', label: 'Blender' }
+  ];
 
-  async function sendToMax(a: Asset, mode?: 'import' | 'material' | 'texture') {
-    const m = mode || maxMode(a);
-    if (!m) { showToast('这类素材不支持发送到 3ds Max', 'err'); return; }
+  const maxConnected = !!bridge?.targets?.max?.connected;
+  const blenderTarget = bridge?.targets?.blender;
+  const blenderConnected = !!blenderTarget?.connected;
+
+  /** 打开「发送到…」菜单（锚在按钮下方或右键位置） */
+  function openSendMenu(a: Asset, at: { x: number; y: number }) {
+    if (!sendModeFor(a)) { showToast('这类素材不支持发送到 DCC（模型/材质/贴图才有）', 'err'); return; }
+    const w = 236, h = 40 + SEND_TARGETS.length * 34;
+    setSendMenu({
+      asset: a,
+      x: Math.max(8, Math.min(at.x, window.innerWidth - w - 8)),
+      y: Math.max(8, Math.min(at.y, window.innerHeight - h - 8))
+    });
+  }
+
+  /** 按钮点击时用按钮位置当锚点 */
+  function openSendMenuFromEvent(a: Asset, e: React.MouseEvent) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openSendMenu(a, { x: r.left, y: r.bottom + 4 });
+  }
+
+  async function sendToTarget(a: Asset, target: 'max' | 'blender', mode?: 'import' | 'material' | 'texture') {
+    const tName = target === 'blender' ? 'Blender' : '3ds Max';
+    const online = !!bridge?.targets?.[target]?.connected;
+    const m = mode || sendModeFor(a);
+    if (!m) { showToast(`这类素材不支持发送到 ${tName}`, 'err'); return; }
     const label = m === 'import' ? '导入模型' : m === 'material' ? '创建材质' : '发送贴图';
     setBridgeBusy(true);
     try {
       const r = await api('/api/bridge/send', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ assetId: a.id, mode: m, target: 'max' })
+        body: JSON.stringify({ assetId: a.id, mode: m, target })
       });
       if (!r?.id) { showToast(`发送失败：${r?.error || '服务端未响应'}`, 'err'); return; }
-      const offline = !maxConnected;
-      showToast(offline
-        ? `已排队（${label}）：未检测到 3ds Max，启动 Max 后会自动执行`
-        : `已发给 3ds Max（${label}），等待处理…`);
+      showToast(online
+        ? `已发给 ${tName}（${label}），等待处理…`
+        : `已排队（${label}）：未检测到 ${tName}，启动后会自动执行`);
 
       const started = Date.now();
       let job: any = null;
@@ -929,12 +962,12 @@ export default function App() {
         await new Promise(res => window.setTimeout(res, 700));
         job = await api(`/api/bridge/job/${r.id}`);
         if (!job?.status || job.status === 'done' || job.status === 'failed') break;
-        if (Date.now() - started > 8000 && !maxConnected) break;
+        if (Date.now() - started > 8000 && !online) break;
       }
       if (job?.status === 'done') showToast(job.message || `${label}完成`, 'ok');
-      else if (job?.status === 'failed') showToast(`3ds Max 执行失败：${job.message || '未知原因'}`, 'err');
+      else if (job?.status === 'failed') showToast(`${tName} 执行失败：${job.message || '未知原因'}`, 'err');
       else if (job?.status === 'pending' || job?.status === 'running') {
-        showToast(`任务仍在队列中（${label}）：确认 3ds Max 已启动并安装了插件`, 'err');
+        showToast(`任务仍在队列中（${label}）：确认 ${tName} 已启动并安装了插件`, 'err');
       }
       await loadBridge();
     } catch (e: any) {
@@ -942,6 +975,31 @@ export default function App() {
     } finally {
       setBridgeBusy(false);
     }
+  }
+
+  /** 悬停提示：各软件的连接状态 */
+  function onlineSummary() {
+    const parts = SEND_TARGETS.map(t => {
+      const st = bridge?.targets?.[t.key];
+      return `${t.label} ${st?.connected ? '已连接' : '未检测到'}`;
+    });
+    return `发送到…（${parts.join(' · ')}）`;
+  }
+
+  /** 一键装 Blender 插件：后端按各 Blender 版本挑对应系列，写进它的用户插件目录 */
+  async function installBlenderPlugin() {
+    setBridgeBusy(true);
+    try {
+      const r = await api('/api/bridge/install-blender', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
+      });
+      if (!r?.ok) { showToast('安装失败：' + (r?.error || '未知原因'), 'err'); return; }
+      const list = (r.installed || []).map((x: any) => `Blender ${x.blender} → v${x.version}（${x.series} 系列）`);
+      showToast(`已装到 ${list.length} 个 Blender：${list.join('；')}。到「偏好设置 → 插件」勾选一次即可`, 'ok');
+      await loadBridge();
+    } catch (e: any) {
+      showToast('安装失败：' + String(e?.message || e), 'err');
+    } finally { setBridgeBusy(false); }
   }
 
   async function installMaxPlugin() {
@@ -1918,9 +1976,11 @@ export default function App() {
                     {sel.type === 'material' ? '打开材质组装器' : '打开 3D 预览'}
                   </button>
                 )}
-                {maxMode(sel) && (
-                  <button className="btn" disabled={bridgeBusy} onClick={() => sendToMax(sel)}
-                    title={maxConnected ? '发送到 3ds Max' : '发送到 3ds Max（当前未检测到 Max）'}>→ Max</button>
+                {sendModeFor(sel) && (
+                  <button className="btn" disabled={bridgeBusy} onClick={e => openSendMenuFromEvent(sel, e)}
+                    title={onlineSummary()}>
+                    → 发送到…
+                  </button>
                 )}
                 <button className="btn" onClick={() => patch(sel, { favorite: sel.favorite ? 0 : 1 })}>
                   {sel.favorite ? '★ 已收藏' : '☆ 收藏'}
@@ -2009,6 +2069,40 @@ export default function App() {
         </>
       )}
 
+      {sendMenu && (() => {
+        const m = sendModeFor(sendMenu.asset);
+        const mLabel = m === 'import' ? '导入模型' : m === 'material' ? '创建材质' : '发送贴图';
+        return (
+          <>
+            <div className="menu-mask" onMouseDown={() => setSendMenu(null)} />
+            <div className="ctxmenu sendsel" style={{ left: sendMenu.x, top: sendMenu.y }}>
+              <div className="send-h">发送到… · {mLabel}</div>
+              {SEND_TARGETS.map(t => {
+                const st = bridge?.targets?.[t.key];
+                const online = !!st?.connected;
+                return (
+                  <button key={t.key} disabled={bridgeBusy}
+                    onClick={() => { const a = sendMenu.asset; setSendMenu(null); sendToTarget(a, t.key); }}
+                    title={online
+                      ? `${t.label} 已连接${st?.version ? `（插件 v${st.version}）` : ''}`
+                      : `${t.label} 未检测到：任务会排队，软件启动后自动执行`}>
+                    <span className="send-name">
+                      <span className={'mxdot' + (online ? ' on' : '')} />
+                      {t.label}
+                    </span>
+                    <span className={'send-sub' + (online ? ' on' : '')}>
+                      {online ? `已连接${st?.version ? ` · v${st.version}` : ''}` : '未检测到'}
+                    </span>
+                  </button>
+                );
+              })}
+              <div className="ctx-sep" />
+              <div className="send-h">未连接的软件也能发：任务先排队，软件启动后自动执行</div>
+            </div>
+          </>
+        );
+      })()}
+
       {ctx && (
         <>
           <div className="menu-mask" onMouseDown={() => setCtx(null)}
@@ -2021,11 +2115,9 @@ export default function App() {
               <button onClick={() => { setCtx(null); refreshLibrary(); }}>刷新</button>
               <button onClick={() => { setCtx(null); locateAsset(ctx.asset); }}>定位到文件夹</button>
               <button onClick={() => { setCtx(null); openViewer(ctx.asset); }}>打开预览</button>
-              {maxMode(ctx.asset) && (
-                <button onClick={() => { setCtx(null); sendToMax(ctx.asset); }} disabled={bridgeBusy}>
-                  {ctx.asset.type === 'material' ? '在 3ds Max 中创建材质'
-                    : ctx.asset.type === 'texture' ? '发送贴图到 3ds Max'
-                    : '发送到 3ds Max'}
+              {sendModeFor(ctx.asset) && (
+                <button onClick={() => { const a = ctx.asset; setCtx(null); openSendMenu(a, { x: ctx.x, y: ctx.y }); }} disabled={bridgeBusy}>
+                  发送到…（3ds Max / Blender）
                 </button>
               )}
               <button onClick={() => { setCtx(null); reveal(ctx.asset); }}>在资源管理器中显示</button>
@@ -2146,7 +2238,44 @@ export default function App() {
                   </div>
                 )}
               </div>
-              {['Blender', 'SketchUp', 'Houdini', 'Unreal Engine'].map(n => (
+              <div className={'maxcard' + (blenderConnected ? ' on' : '')}>
+                <div className="mxhead">
+                  <span className="mxname">Blender</span>
+                  <span className={'mxdot' + (blenderConnected ? ' on' : '')} />
+                  <span className={blenderConnected ? 'plug-on' : 'plug-off'}>{blenderConnected ? '已连接' : '未连接'}</span>
+                  {!!blenderTarget?.version && <span className="mxver">插件 v{blenderTarget.version}</span>}
+                </div>
+                <div className="mxmeta">
+                  队列 {blenderTarget?.queued ?? 0} · 运行 {blenderTarget?.running ?? 0}
+                  {blenderTarget?.lastSeen ? ` · 最近心跳 ${new Date(blenderTarget.lastSeen).toLocaleTimeString()}` : ''}
+                </div>
+                {blenderTarget?.lastJob && (
+                  <div className="mxmeta mxlast" title={`${blenderTarget.lastJob.title} — ${blenderTarget.lastJob.message || ''}`}>
+                    最近任务：{blenderTarget.lastJob.status === 'done' ? '✔' : blenderTarget.lastJob.status === 'failed' ? '✘' : '…'}
+                    {' '}{blenderTarget.lastJob.title}
+                    {blenderTarget.lastJob.message ? ` — ${blenderTarget.lastJob.message}` : ''}
+                  </div>
+                )}
+                <div className="uvrow" style={{ marginTop: 8 }}>
+                  <button className="btn primary" disabled={bridgeBusy} onClick={installBlenderPlugin}>
+                    安装/更新插件到 Blender
+                  </button>
+                  <button className="btn" onClick={async () => {
+                    const r = await api('/api/bridge/open-folder', {
+                      method: 'POST', headers: { 'content-type': 'application/json' },
+                      body: JSON.stringify({ which: 'blender' })
+                    });
+                    if (!r?.ok) showToast(r?.error || '打开失败', 'err');
+                  }}>打开 Blender 插件文件夹</button>
+                </div>
+                <div className="hint">
+                  插件按 Blender 版本分目录：Blender 5.2+ 用 <b>5.2/</b>，4.x 用 <b>4.0/</b>，3.3–3.6 LTS 用 <b>3.6/</b>，
+                  文件名都是 assetmanager_blender.py；插件版本号独立于软件版本（见上方「插件 v…」）。
+                  「安装/更新插件到 Blender」会按各 Blender 版本自动挑对应系列写进它的用户插件目录，
+                  装完到 偏好设置 → 插件 里勾选一次即可。
+                </div>
+              </div>
+              {['SketchUp', 'Houdini', 'Unreal Engine'].map(n => (
                 <div className="plug-row" key={n}>
                   <span className="plug-name">{n}</span>
                   <span className="plug-desc">素材直接发送 / 一键替换</span>
@@ -2161,14 +2290,16 @@ export default function App() {
                   {bridgeJobs.map(j => (
                     <div className="mxjob" key={j.id}>
                       <span className={'mxst ' + j.status}>{j.status === 'done' ? '✔' : j.status === 'failed' ? '✘' : '…'}</span>
-                      <span className="mxtitle" title={j.message || ''}>{j.title}</span>
+                      <span className="mxtitle" title={j.message || ''}>
+                        {j.target === 'blender' ? 'Blender · ' : ''}{j.title}
+                      </span>
                       <span className="mxmsg" title={j.message || ''}>{j.message || (j.status === 'pending' ? '排队中' : j.status)}</span>
                     </div>
                   ))}
                 </div>
               </div>
             )}
-            <div className="hint">插件来源：应用目录下的 bridge/max/AssetManagerBridge.ms（安装时复制到 3ds Max 的 scripts\startup）</div>
+            <div className="hint">插件来源：应用目录下的 bridge/max/AssetManagerBridge.ms（安装时复制到 3ds Max 的 scripts\startup）；Blender 插件在 bridge/blender/&lt;Blender 版本&gt;/ 下。</div>
             <div className="modal-b">
               <button className="btn" onClick={() => setPluginsOpen(false)}>关闭</button>
             </div>
@@ -2205,6 +2336,17 @@ export default function App() {
                 if (!r?.ok) showToast(r?.error || '打开失败', 'err');
               }}>打开基本体文件夹</button>
               <span className="hint">放入 sphere / box / cylinder / plane 命名的 .glb/.gltf/.obj/.fbx 可替换默认基本体</span>
+            </div>
+            <div className="hint">Blender 插件</div>
+            <div className="uvrow">
+              <button className="btn" onClick={async () => {
+                const r = await api('/api/bridge/open-folder', {
+                  method: 'POST', headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ which: 'blender' })
+                });
+                if (!r?.ok) showToast(r?.error || '打开失败', 'err');
+              }}>打开 Blender 插件文件夹</button>
+              <span className="hint">Blender → 偏好设置 → 插件 → 从磁盘安装：4.x 选 4.0/，3.3–3.6 LTS 选 3.6/ 里的 assetmanager_blender.py</span>
             </div>
             <div className="hint">关闭按钮行为</div>
             <div className="uvrow">
@@ -2590,4 +2732,5 @@ export default function App() {
     </div>
   );
 }
+
 

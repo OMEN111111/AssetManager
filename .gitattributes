@@ -1,0 +1,2 @@
+# Logs 为历史记录：统一 LF，避免换行符差异导致内容变动
+Logs/** text eol=lf

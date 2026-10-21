@@ -28,6 +28,8 @@ devtest/render.png
 # tooling artifacts
 .dsh-vision-router/
 *.log
+__pycache__/
+*.pyc
 .DS_Store
 Thumbs.db
 
