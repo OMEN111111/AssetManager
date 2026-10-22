@@ -3,23 +3,34 @@
 //
 // 用法：
 //   $env:GH_TOKEN = (git credential fill 拿到的 token)
-//   node devtest/release-gh.mjs <版本号> <附件目录> [--dry]
+//   node devtest/release-gh.mjs <版本号> <附件目录> [--dry]   发布（tag + Release + 附件）
+//   node devtest/release-gh.mjs --sync                        只把本地快照同步到远端 main
 //
 // 做法：远端 HEAD 的 tree 拿来对比，本地缺的 blob 先上传，然后用「本地全量」建新 tree，
 // parent 用远端 HEAD（本地历史与远端分叉，所以不 push，直接 API 建提交）
+//
+// 仓库里只放代码与插件：Logs/、docs/ 是本地记录，默认不上传（远端若已有会被删掉）。
+// 想额外排除别的路径：$env:GH_EXCLUDE = "AGENTS.md,prototype/"
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const OWNER = 'OMEN111111';
 const REPO = 'AssetManager';
-const version = process.argv[2];
-const distDir = process.argv[3] || 'dist-release';
-const dry = process.argv.includes('--dry');
-if (!version) {
-  console.error('用法: node devtest/release-gh.mjs <版本号> [附件目录] [--dry]');
+const args = process.argv.slice(2);
+const syncOnly = args.includes('--sync');
+const dry = args.includes('--dry');
+const version = syncOnly ? '' : args.find(a => /^\d+\.\d+\.\d+$/.test(a));
+const distDir = args.find(a => /[\\/]/.test(a) || a === 'dist-release') || 'dist-release';
+if (!syncOnly && !version) {
+  console.error('用法: node devtest/release-gh.mjs <版本号> [附件目录] [--dry]  |  node devtest/release-gh.mjs --sync');
   process.exit(1);
 }
+
+/** 不上传的本地记录（仓库只放代码与插件） */
+const EXCLUDE = ['Logs/', 'docs/', ...String(process.env.GH_EXCLUDE || '').split(',').map(s => s.trim()).filter(Boolean)];
+const isExcluded = p => EXCLUDE.some(x => (x.endsWith('/') ? p.startsWith(x) : p === x));
+
 
 const token = process.env.GH_TOKEN || (() => {
   try { return fs.readFileSync(path.join(process.env.TEMP || '/tmp', 'am-token.txt'), 'utf8').trim(); } catch { return ''; }
@@ -61,11 +72,13 @@ console.log(`远端 main=${remoteHead.slice(0, 7)}，文件 ${remoteBlobs.size} 
 
 // ---------------------------------------------------------------- 2. 本地快照
 const ls = git('ls-files', '-s', '-z').split('\0').filter(Boolean);
-const localFiles = ls.map(line => {
+const allLocal = ls.map(line => {
   const m = line.match(/^(\d+)\s+([0-9a-f]+)\s+(\d+)\t(.*)$/);
   return m ? { mode: m[1], sha: m[2], path: m[4] } : null;
 }).filter(Boolean);
-console.log(`本地快照 ${localFiles.length} 个文件`);
+const localFiles = allLocal.filter(f => !isExcluded(f.path));
+const skipped = allLocal.filter(f => isExcluded(f.path));
+console.log(`本地快照 ${allLocal.length} 个文件，跳过本地记录 ${skipped.length} 个（${EXCLUDE.join(' ')}）`);
 
 const needUpload = localFiles.filter(f => remoteBlobs.get(f.path) !== f.sha);
 const removed = [...remoteBlobs.keys()].filter(p => !localFiles.some(f => f.path === p));
@@ -105,7 +118,9 @@ const tree = await api(`/repos/${OWNER}/${REPO}/git/trees`, {
 });
 console.log(`新 tree ${tree.sha.slice(0, 7)}`);
 
-const message = `release: v${version}（FBX/OBJ 自动转 GLB 进 SketchUp，SketchUp 插件 0.1.1）`;
+const message = syncOnly
+  ? 'chore: 仓库只放代码与插件，移除 Logs/ 与 docs/（本地记录不上传）'
+  : `release: v${version}（FBX/OBJ 自动转 GLB 进 SketchUp，SketchUp 插件 0.1.1）`;
 const commit = await api(`/repos/${OWNER}/${REPO}/git/commits`, {
   method: 'POST',
   body: JSON.stringify({ message, tree: tree.sha, parents: [remoteHead] })
@@ -117,6 +132,12 @@ await api(`/repos/${OWNER}/${REPO}/git/refs/heads/main`, {
   body: JSON.stringify({ sha: commit.sha, force: true })
 });
 console.log('main 已更新');
+
+if (syncOnly) {
+  console.log('\n完成（只同步了 main，没有建 tag / Release）：');
+  console.log('  提交', commit.sha);
+  process.exit(0);
+}
 
 // ---------------------------------------------------------------- 5. tag
 const tagName = `v${version}`;

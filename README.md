@@ -56,11 +56,11 @@ app/               应用本体
   src/renderer/    React 界面（App / Viewer / Assembler / matlib / geometries / glbconvert）
   bridge/          DCC 插件：max/（MaxScript）、blender/<版本>/（Python）、su/<版本>/（Ruby）
   build/           构建产物与图标（server.mjs 由构建生成）
-docs/              需求与设计文档（问答记录、功能、实现、交互、UI）
 prototype/         早期界面原型与截图
 devtest/           开发期的 CDP 验证脚本与测试页
-Logs/              版本与存档的文字记录（只追加）
 ```
+
+> 需求/设计文档（`docs/`）与版本记录（`Logs/`）只保留在本地开发环境，不随仓库与安装包发布。
 
 ## 开发
 
