@@ -12,6 +12,7 @@
  */
 import * as THREE from 'three';
 import { assertBinaryFbx } from './fbxcheck';
+import { preloadSpecialTextures } from './specialtex';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
@@ -67,18 +68,22 @@ interface DetailLike {
 }
 
 /** 按文件名把相对引用映射到 /api/file/<id>，让 FBX/OBJ 的外部贴图也能读到 */
-function managerFor(detail: DetailLike) {
+async function managerFor(detail: DetailLike) {
   const byName = new Map<string, number>();
   for (const f of detail.files) {
     const bn = String(f.rel_path).split('/').pop();
     if (bn) byName.set(bn.toLowerCase(), f.id);
   }
+  const special = await preloadSpecialTextures(detail.files as any);
   const manager = new THREE.LoadingManager();
   manager.setURLModifier(url => {
     if (/^(data:|blob:|https?:)/i.test(url)) return url;
     let name = url;
     try { name = decodeURIComponent(url.split('?')[0]); } catch { /* keep */ }
-    const id = byName.get(name.split('/').pop()!.toLowerCase());
+    const bn = name.replace(/\\/g, '/').split('/').pop()!.toLowerCase();
+    const sp = special.get(bn);
+    if (sp) return sp;
+    const id = byName.get(bn);
     return id ? `/api/file/${id}` : url;
   });
   return manager;
@@ -178,7 +183,7 @@ export async function exportGlbForSketchUp(detail: DetailLike): Promise<GlbExpor
   // 多 LOD 时优先 slot 01
   const modelFile = cand.find(f => f.slot === '01') || cand[0];
   const ext = extOf(modelFile.rel_path);
-  const manager = managerFor(detail);
+  const manager = await managerFor(detail);
   const url = `/api/file/${modelFile.id}`;
 
   let root: THREE.Object3D;

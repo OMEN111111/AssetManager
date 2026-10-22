@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { SPECIAL_TEX, specialTextureUrl } from './specialtex';
 import type { AssetFile } from './types';
 
 export type ChannelKey = 'baseColor' | 'roughness' | 'metallic' | 'normal' | 'ao' | 'height' | 'emissive' | 'opacity';
@@ -104,21 +105,45 @@ export function detectConfig(files: AssetFile[], slotMap?: Record<string, string
 }
 
 const texCache = new Map<string, Promise<THREE.Texture>>();
+function neutralTexture(srgb: boolean): THREE.Texture {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 2;
+  const c = cv.getContext('2d')!;
+  c.fillStyle = srgb ? '#ffffff' : '#808080';
+  c.fillRect(0, 0, 2, 2);
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
 export function loadTexture(f: AssetFile, srgb = false): Promise<THREE.Texture> {
   const key = f.id + (srgb ? ':s' : ':l');
   let p = texCache.get(key);
   if (!p) {
-    p = new Promise((res, rej) => {
-      const src = /^[a-zA-Z]:[\\/]/.test(f.rel_path)
+    p = (async () => {
+      let src = /^[a-zA-Z]:[\\/]/.test(f.rel_path)
         ? `/api/path-file?path=${encodeURIComponent(f.rel_path)}`
         : `/api/file/${f.id}`;
-      new THREE.TextureLoader().load(src, t => {
-        if (srgb) t.colorSpace = THREE.SRGBColorSpace;
-        t.anisotropy = 8;
-        t.wrapS = THREE.RepeatWrapping;
-        t.wrapT = THREE.RepeatWrapping;
-        res(t);
-      }, undefined, rej);
+      // TIFF / TGA 浏览器不认，先解码成 PNG blob
+      if (SPECIAL_TEX.test(f.rel_path)) {
+        const u = await specialTextureUrl(f);
+        if (u) src = u;
+      }
+      return await new Promise<THREE.Texture>((res, rej) => {
+        new THREE.TextureLoader().load(src, t => {
+          if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+          t.anisotropy = 8;
+          t.wrapS = THREE.RepeatWrapping;
+          t.wrapT = THREE.RepeatWrapping;
+          res(t);
+        }, undefined, rej);
+      });
+    })();
+    texCache.set(key, p);
+    p = p.catch(e => {
+      console.warn('[tex] 加载失败，用占位贴图：', f.rel_path, e);
+      texCache.delete(key);
+      return neutralTexture(srgb);
     });
     texCache.set(key, p);
   }

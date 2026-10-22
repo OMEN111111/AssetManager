@@ -78,7 +78,7 @@ export async function renderThumb(detail: AssetDetail): Promise<string> {
       if (/^(data:|blob:|https?:)/i.test(url)) return url;
       let name = url;
       try { name = decodeURIComponent(url.split('?')[0]); } catch { /* keep */ }
-      const id = byName.get(name.split('/').pop()!.toLowerCase());
+      const id = byName.get(name.replace(/\\/g, '/').split('/').pop()!.toLowerCase());
       return id ? `/api/file/${id}` : url;
     });
     let obj: THREE.Object3D;

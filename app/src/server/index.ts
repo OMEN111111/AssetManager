@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { openDb, upsertLibrary, listLibraries } from '../core/db.ts';
 import { scanLibrary, scanState } from '../core/scan.ts';
+import { MCP_TOOLS, callTool } from '../core/mcp.ts';
 import {
   bridgeStatus, sendJob, nextJob, finishJob, heartbeat, touchClient, recentJobs, jobById,
   installForMax, installInfo, maxStartupDirs, bridgeScriptPath, writeLocator,
@@ -49,6 +50,48 @@ const DATA_DIR = process.env.AM_DATA ? path.resolve(process.env.AM_DATA) : path.
 const DB_FILE = process.env.ASSETMANAGER_DB || path.join(DATA_DIR, 'library.db');
 const DIST = path.join(APP_ROOT, 'dist');
 const PORT = Number(process.env.PORT || 8787);
+
+// ---------------------------------------------------------------- MCP（AI 客户端）
+const MCP_CFG_FILE = path.join(DATA_DIR, 'mcp.json');
+function mcpCfg() {
+  let c = { enabled: true, allowWrite: false };
+  try { c = { ...c, ...JSON.parse(fs.readFileSync(MCP_CFG_FILE, 'utf8')) }; } catch { /* default */ }
+  return c;
+}
+function saveMcpCfg(patch: any) {
+  const cur = mcpCfg();
+  const next = { ...cur, ...patch };
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(MCP_CFG_FILE, JSON.stringify(next, null, 2), 'utf8');
+  return next;
+}
+const MCP_STDIO_SRC = `#!/usr/bin/env node
+// AssetManager MCP stdio 代理：把 stdio 的 JSON-RPC 转发到本地 HTTP /mcp
+const url = process.env.AM_MCP_URL || 'http://127.0.0.1:${process.env.PORT || 8787}/mcp';
+let buf = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', d => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, i).trim();
+    buf = buf.slice(i + 1);
+    if (line) handle(line);
+  }
+});
+async function handle(line) {
+  try {
+    const msg = JSON.parse(line);
+    const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(msg) });
+    const text = await r.text();
+    if (text) process.stdout.write(text.replace(/\n/g, '') + '\n');
+  } catch (e) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: String((e && e.message) || e) } }) + '\n');
+  }
+}
+`;
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(path.join(DATA_DIR, 'mcp-stdio.mjs'), MCP_STDIO_SRC, 'utf8'); } catch { /* ignore */ }
+
 
 const db: DB = openDb(DB_FILE);
 
@@ -724,6 +767,62 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     return json(res, 200, { ...bridgeStatus(db), port: PORT });
   }
 
+  if (p === '/api/mcp/status') {
+    const c = mcpCfg();
+    return json(res, 200, {
+      enabled: c.enabled, allowWrite: c.allowWrite, port: PORT,
+      url: `http://127.0.0.1:${PORT}/mcp`,
+      stdio: path.join(DATA_DIR, 'mcp-stdio.mjs')
+    });
+  }
+  if (p === '/api/mcp/settings' && req.method === 'POST') {
+    const b = await body(req);
+    const patch: any = {};
+    if (b.enabled !== undefined) patch.enabled = !!b.enabled;
+    if (b.allowWrite !== undefined) patch.allowWrite = !!b.allowWrite;
+    const c = saveMcpCfg(patch);
+    return json(res, 200, {
+      enabled: c.enabled, allowWrite: c.allowWrite, port: PORT,
+      url: `http://127.0.0.1:${PORT}/mcp`,
+      stdio: path.join(DATA_DIR, 'mcp-stdio.mjs')
+    });
+  }
+  if (p === '/mcp' && req.method === 'POST') {
+    const c = mcpCfg();
+    if (!c.enabled) return json(res, 403, { jsonrpc: '2.0', id: null, error: { code: -32000, message: 'MCP 已在设置里关闭' } });
+    const b = await body(req);
+    const id = b?.id ?? null;
+    const method = String(b?.method || '');
+    if (!b || b.jsonrpc !== '2.0' || !method) {
+      return json(res, 400, { jsonrpc: '2.0', id, error: { code: -32600, message: 'Invalid Request' } });
+    }
+    if (method.startsWith('notifications/')) { res.writeHead(202); return res.end(); }
+    try {
+      if (method === 'initialize') {
+        return json(res, 200, { jsonrpc: '2.0', id, result: {
+          protocolVersion: String(b?.params?.protocolVersion || '2024-11-05'),
+          capabilities: { tools: {} },
+          serverInfo: { name: 'AssetManager', version: '0.3.6' }
+        } });
+      }
+      if (method === 'ping') return json(res, 200, { jsonrpc: '2.0', id, result: {} });
+      if (method === 'tools/list') return json(res, 200, { jsonrpc: '2.0', id, result: { tools: MCP_TOOLS } });
+      if (method === 'tools/call') {
+        const name = String(b?.params?.name || '');
+        const args = b?.params?.arguments || {};
+        const out = callTool(db, name, args, c.allowWrite);
+        const isError = !!(out && (out as any).error);
+        return json(res, 200, { jsonrpc: '2.0', id, result: {
+          isError,
+          content: [{ type: 'text', text: JSON.stringify(out, null, 2) }]
+        } });
+      }
+      return json(res, 200, { jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found: ' + method } });
+    } catch (e: any) {
+      return json(res, 200, { jsonrpc: '2.0', id, error: { code: -32603, message: String(e?.message || e) } });
+    }
+  }
+
   if (p === '/api/bridge/info') {
     return json(res, 200, {
       ...installInfo(APP_ROOT),
@@ -1222,6 +1321,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     if (!rel) return json(res, 404, { error: 'no preview' });
     const file = path.join(a.root, rel);
     if (!fs.existsSync(file)) return json(res, 404, { error: 'missing' });
+    const thumbExt = path.extname(file).toLowerCase();
+    // HDR/EXR 原图几十 MB，绝不能当缩略图发（B-003）
+    if (thumbExt === '.hdr' || thumbExt === '.exr') return json(res, 404, { error: 'no bitmap preview' });
     const stat = fs.statSync(file);
     res.writeHead(200, {
       'content-type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',

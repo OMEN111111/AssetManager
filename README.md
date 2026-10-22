@@ -157,3 +157,14 @@ pnpm dist             # electron-builder：NSIS 安装版 + 便携版
 ## 许可
 
 [MIT](LICENSE)
+
+## MCP（AI 客户端接入）
+
+软件内置 MCP Server（默认开启，设置 → MCP 可关）：
+
+- HTTP：`http://127.0.0.1:8787/mcp`
+- stdio：`设置里显示的 mcp-stdio.mjs`（给 Claude Desktop 等只支持 stdio 的客户端）
+
+支持的工具：`search_assets`、`get_asset`、`list_tags`、`assign_tags`、`update_asset`、
+`send_to_dcc`（max / blender / su）、`rescan_library`、`bridge_status`。
+默认**只读**，写操作需在设置里勾选「允许 AI 修改」。

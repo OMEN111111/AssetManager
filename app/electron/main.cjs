@@ -203,6 +203,18 @@ async function createWindow() {
     return { action: 'deny' };
   });
 
+  // 渲染进程崩溃/卡死时自动重载，避免「黑屏只能重启」（B-004）
+  let lastAutoReload = 0;
+  win.webContents.on('render-process-gone', (_e, details) => {
+    console.error('[render-process-gone]', details);
+    if (Date.now() - lastAutoReload > 10000) {
+      lastAutoReload = Date.now();
+      try { win.reload(); } catch { /* ignore */ }
+    }
+  });
+  win.webContents.on('unresponsive', () => console.warn('[renderer unresponsive]'));
+  win.webContents.on('responsive', () => console.log('[renderer responsive]'));
+
   const port = await ensureServer();
   if (!port) {
     await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(

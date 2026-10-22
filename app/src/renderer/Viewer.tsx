@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { assertBinaryFbx } from './fbxcheck';
+import { SPECIAL_TEX, preloadSpecialTextures, specialTextureUrl } from './specialtex';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
@@ -10,7 +11,7 @@ import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
 import { IESLoader } from 'three/examples/jsm/loaders/IESLoader.js';
 import NumField from './NumField';
-import { detectConfig } from './matlib';
+import { detectConfig, loadTexture } from './matlib';
 import { makeGeometry } from './geometries';
 import type { AssetDetail, AssetFile } from './types';
 
@@ -106,7 +107,7 @@ function LightBall({ az, el, onChange }: { az: number; el: number; onChange: (a:
       onPointerDown={e => { drag.current = true; (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); update(e); }}
       onPointerMove={e => { if (drag.current) update(e); }}
       onPointerUp={() => { drag.current = false; }}>
-      <span className="lb-dot" style={{ left: `${50 + az / 1.8}%`, top: `${50 + el / 1.8}%` }} />
+      <span className="lb-dot" style={{ left: `${50 + az / 1.8}%`, top: `${50 - el / 1.8}%` }} />
     </div>
   );
 }
@@ -295,15 +296,8 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
 
     (async () => {
       const files = asset.files;
-      const tex = (f: AssetFile, srgb = false) => new Promise<THREE.Texture>((res, rej) => {
-        new THREE.TextureLoader().load(`/api/file/${f.id}`, t => {
-          if (srgb) t.colorSpace = THREE.SRGBColorSpace;
-          t.anisotropy = 8;
-          t.wrapS = THREE.RepeatWrapping;
-          t.wrapT = THREE.RepeatWrapping;
-          res(t);
-        }, undefined, rej);
-      });
+      // 统一走 matlib.loadTexture：TIFF/TGA 会先解码成 PNG，失败也有占位贴图兜底
+      const tex = (f: AssetFile, srgb = false) => loadTexture(f, srgb);
 
       // UDIM 分块文件（xxx_1001.jpg / xxx.1002.jpg …）合成为一张图集
       const udimAtlas = async (list: AssetFile[], keys: string[], srgb = false): Promise<THREE.Texture | null> => {
@@ -490,12 +484,16 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           const bn = String(f.rel_path).split('/').pop();
           if (bn) fileByName.set(bn.toLowerCase(), f.id);
         }
+        // TIFF / TGA 贴图先解码成 PNG blob（浏览器原生解码不了）
+        const special = await preloadSpecialTextures(files);
         const manager = new THREE.LoadingManager();
         manager.setURLModifier(url => {
           if (/^(data:|blob:|https?:)/i.test(url)) return url;
           let name = url;
           try { name = decodeURIComponent(url.split('?')[0]); } catch { /* keep */ }
-          name = name.split('/').pop()!.toLowerCase();
+          name = name.replace(/\\/g, '/').split('/').pop()!.toLowerCase();
+          const sp = special.get(name);
+          if (sp) return sp;
           const id = fileByName.get(name);
           return id ? `/api/file/${id}` : url;
         });
@@ -664,9 +662,16 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
             t.anisotropy = 8;
             return t;
           };
-          const loadOv = (rel: string, srgb: boolean, swz = 'rgb') => new Promise<THREE.Texture>((res, rej) => {
+          const loadOv = async (rel: string, srgb: boolean, swz = 'rgb') => {
             const f = files.find(x => String(x.rel_path) === rel);
-            const url = f ? `/api/file/${f.id}` : `/api/override-file?assetId=${asset.id}&rel=${encodeURIComponent(rel)}`;
+            let url = f ? `/api/file/${f.id}` : `/api/override-file?assetId=${asset.id}&rel=${encodeURIComponent(rel)}`;
+            if (f && SPECIAL_TEX.test(f.rel_path)) {
+              const u = await specialTextureUrl(f);
+              if (u) url = u;
+            }
+            return new Promise<THREE.Texture>((res, rej) => {
+            const f = files.find(x => String(x.rel_path) === rel);
+            let url = f ? `/api/file/${f.id}` : `/api/override-file?assetId=${asset.id}&rel=${encodeURIComponent(rel)}`;
             new THREE.TextureLoader().load(url, t => {
               t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
               t.wrapS = THREE.RepeatWrapping;
@@ -674,7 +679,8 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               t.anisotropy = 8;
               res(swz && swz !== 'rgb' ? bake(t, swz) : t);
             }, undefined, rej);
-          });
+            });
+          };
           for (const c of collected) {
             const ov = ovMap[c.matName];
             if (!ov || !Object.keys(ov).length) continue;

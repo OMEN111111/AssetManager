@@ -120,7 +120,7 @@ console.log(`新 tree ${tree.sha.slice(0, 7)}`);
 
 const message = syncOnly
   ? 'chore: 仓库只放代码与插件，移除 Logs/ 与 docs/（本地记录不上传）'
-  : `release: v${version}（FBX/OBJ 自动转 GLB 进 SketchUp，SketchUp 插件 0.1.1）`;
+  : `release: v${version}`;
 const commit = await api(`/repos/${OWNER}/${REPO}/git/commits`, {
   method: 'POST',
   body: JSON.stringify({ message, tree: tree.sha, parents: [remoteHead] })
@@ -210,3 +210,4 @@ for (const name of files) {
 console.log('\n完成：');
 console.log('  提交', commit.sha);
 console.log('  Release', release.html_url);
+

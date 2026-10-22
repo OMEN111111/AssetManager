@@ -75,6 +75,8 @@ function Card({ a, active, thumbVer, onSelect, onOpen, onCtx, onZoom, issue, chi
       <div className="thumb" style={{ background: PLACEHOLDER[a.type] || PLACEHOLDER.other }}>
         {(a as any).img_file_id && isSpecialImage(a.ext || '') ? (
           <SmartImage fileId={(a as any).img_file_id} path={a.ext || ''} />
+        ) : (a.type === 'hdri' || /\.(hdr|exr)$/i.test(a.ext || '')) ? (
+          <div className="fextbig">{(a.ext || 'hdr').replace('.', '').toUpperCase()}</div>
         ) : ((a as any).has_image || a.preview_rel) && !broken ? (
           <img src={`/api/thumb/${a.id}?v=${encodeURIComponent((a as any).preview_rel || (a as any).thumb_file || '')}&r=${thumbVer || 0}`} loading="lazy" alt=""
             onDoubleClick={e => { e.stopPropagation(); onZoom?.(`/api/thumb/${a.id}?v=${encodeURIComponent((a as any).preview_rel || (a as any).thumb_file || '')}&r=${thumbVer || 0}`); }}
@@ -124,6 +126,7 @@ export default function App() {
   const [selIssues, setSelIssues] = useState<any[] | null>(null);
   const [rowsPerPage, setRowsPerPage] = useState(() => Number(localStorage.getItem('am-rows') ?? 6));
   const [page, setPage] = useState(1);
+  const [pageDraft, setPageDraft] = useState('1');
   const [cols, setCols] = useState(6);
   const gridRef = useRef<HTMLDivElement>(null);
   const [fileSel, setFileSel] = useState<any | null>(null);
@@ -196,6 +199,7 @@ export default function App() {
   const lastIdx = useRef(0);
   const lastMeta = useRef('');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mcpInfo, setMcpInfo] = useState<any>(null);
   const [updateInfo, setUpdateInfo] = useState<any>(null);
   const [updateStatus, setUpdateStatus] = useState('');
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -276,6 +280,9 @@ export default function App() {
   const toastTimer = useRef<number | undefined>(undefined);
   // 选中请求序号：防止慢响应把后来点的素材覆盖掉
   const selSeq = useRef(0);
+  const loadSeq = useRef(0);
+  const pageRef = useRef(page);
+  useEffect(() => { pageRef.current = page; }, [page]);
   // 拖到 3ds Max 的「描述文件」缓存（.ms，Max 拖入即执行）
   const dropFileCache = useRef<Map<number, string>>(new Map());
 
@@ -422,22 +429,31 @@ export default function App() {
       body: JSON.stringify({ root })
     });
     setScan(s => s ? { ...s, running: true } : s);
+    // 等扫描真正结束再刷新界面，避免中途拿到半份数据导致页码/内容错位（B-007）
     window.setTimeout(async () => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < 120000) {
+        const st = await api('/api/scan').catch(() => null);
+        if (st && !st.running) break;
+        await new Promise(r => window.setTimeout(r, 700));
+      }
       if (!lib) return;
       await loadAssets(lib);
       await loadMeta(lib);
       await refreshIssues();
       await refreshDetail();
-    }, 1500);
+    }, 600);
   }
 
   async function loadAssets(id = lib) {
     if (!id) return;
+    const curPage = pageRef.current;
     const pageSize = rowsPerPage > 0 ? rowsPerPage * cols : 0;
+    const seq = ++loadSeq.current;
     const qs = new URLSearchParams({
       lib: String(id), q, dir, recursive: recursive ? '1' : '0', sort,
       limit: String(pageSize || 5000),
-      offset: String(pageSize ? (page - 1) * pageSize : 0),
+      offset: String(pageSize ? (curPage - 1) * pageSize : 0),
       ...(activeTag ? { tag: String(activeTag) } : {}),
       ...(tagMulti.size ? { tags: [...tagMulti].join(',') } : {}),
       ...((ratingFilter ? { ratingOp, ratingValue: String(ratingFilter), ratingInclusive: ratingInc ? '1' : '0' } : {}) as any),
@@ -447,8 +463,14 @@ export default function App() {
       ...(hiddenExts.size ? { excludeExt: [...hiddenExts].join(',') } : {})
     });
     const r = await api('/api/assets?' + qs.toString());
+    if (seq !== loadSeq.current) return;
+    const t = Number(r.total ?? (r.assets || []).length);
+    if (pageSize > 0 && curPage > Math.max(1, Math.ceil(t / pageSize))) {
+      setPage(Math.max(1, Math.ceil(t / pageSize)));
+      return;
+    }
     setAssets(r.assets || []);
-    setTotal(r.total ?? (r.assets || []).length);
+    setTotal(t);
     setLoading(false);
     if (!sel && r.assets?.length) select(r.assets[0]);
   }
@@ -462,6 +484,18 @@ export default function App() {
   }, [pluginsOpen]);
   useEffect(() => { if (lib) loadMeta(lib); }, [lib]);
   useEffect(() => {
+    if (settingsOpen) api('/api/mcp/status').then(setMcpInfo).catch(() => {});
+  }, [settingsOpen]);
+
+  async function setMcp(patch: any) {
+    const r = await api('/api/mcp/settings', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(patch)
+    });
+    setMcpInfo(r);
+  }
+
+  useEffect(() => {
     if (!lib) return;
     window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => loadAssets(lib), 160);
@@ -470,6 +504,7 @@ export default function App() {
 
   // 筛选条件变化时回到第一页
   useEffect(() => { setPage(1); }, [q, dir, recursive, sort, activeTag, ratingFilter, ratingOp, ratingInc, favFilter, extFilter, excludedTypes, hiddenExts]);
+  useEffect(() => { setPageDraft(String(page)); }, [page]);
 
   // 按容器宽度算列数（卡片 180 + 间距 16）
   useEffect(() => {
@@ -657,47 +692,15 @@ export default function App() {
 
   useEffect(() => {
     const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes('Files');
-    const onOver = (e: DragEvent) => {
-      if (!hasFiles(e)) return;
-      e.preventDefault();
-      setDropActive(true);
-    };
-    const onLeave = (e: DragEvent) => {
-      if (e.relatedTarget === null) setDropActive(false);
-    };
-    const onDrop = async (e: DragEvent) => {
-      if (!hasFiles(e)) return;
-      e.preventDefault();
-      setDropActive(false);
-      const files = Array.from(e.dataTransfer?.files || []);
-      const am = (window as any).amApi;
-      const paths = files.map(f => (am?.getPath ? am.getPath(f) : (f as any).path)).filter(Boolean);
-      if (!paths.length) {
-        setImportLog(['浏览器环境读不到本地路径，拖入导入需要在桌面版里用']);
-        return;
-      }
-      if (!lib) { setImportLog(['请先在设置里添加一个素材库']); return; }
-      setImporting(true);
-      const r = await api('/api/import', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ lib, paths })
-      });
-      setImporting(false);
-      setImportLog((r.results || []).map((x: any) =>
-        x.ok ? `✔ ${String(x.from).split(/[\\/]/).pop()} → ${x.to}` : `✘ ${String(x.from).split(/[\\/]/).pop()}：${x.error}`));
-      loadAssets(lib);
-      loadMeta(lib);
-      window.setTimeout(() => setImportLog([]), 9000);
-    };
-    window.addEventListener('dragover', onOver);
-    window.addEventListener('dragleave', onLeave);
-    window.addEventListener('drop', onDrop);
+    const block = (e: DragEvent) => { if (hasFiles(e)) e.preventDefault(); };
+    window.addEventListener('dragover', block);
+    window.addEventListener('drop', block);
     return () => {
-      window.removeEventListener('dragover', onOver);
-      window.removeEventListener('dragleave', onLeave);
-      window.removeEventListener('drop', onDrop);
+      window.removeEventListener('dragover', block);
+      window.removeEventListener('drop', block);
     };
-  }, [lib]);
+  }, []);
+
 
   const exFileKinds = useMemo(() => {
     const map: Record<string, string> = {
@@ -864,6 +867,14 @@ export default function App() {
     loadAssets(lib); loadMeta(lib);
   }
 
+  const pageCount = Math.max(1, Math.ceil(total / Math.max(1, rowsPerPage * cols)));
+
+  function jumpPage() {
+    const n = Math.max(1, Math.min(pageCount, Number(pageDraft) || 1));
+    setPage(n);
+    setPageDraft(String(n));
+  }
+
   async function select(a: Asset) {
     const seq = ++selSeq.current;
     // 先把详情切到被点的这张卡，别等接口回来（否则会短暂显示上一个素材，定位/导出也跟着错）
@@ -871,8 +882,9 @@ export default function App() {
       ? prev
       : ({ ...(a as any), files: [], tags: [] } as any)));
     setFileSel(null);
-    const d = await api(`/api/asset/${a.id}`);
+    const d = await api(`/api/asset/${a.id}`).catch(() => ({ error: 'not found' }));
     if (seq !== selSeq.current) return;   // 丢弃过期响应
+    if (!d || (d as any).error) { setSel(null); setSelIds([]); return; }
     setSel(d);
   }
 
@@ -1121,10 +1133,21 @@ export default function App() {
     // Electron 官方模式：必须先掐掉 Chromium 自己的拖拽，否则会跟原生拖拽打架（Windows 上会让应用退出）
     e.preventDefault();
     const absPath = root + '\\' + String(rel).split('/').join('\\');
-    // 优先拖「描述文件」：Max 会执行 .ms，于是材质母版菜单 / 摆放 / 环境贴图都能接管；
-    // 还没准备好就退回拖原文件（走 Max 原生导入）。
+    const isImage = /\.(png|jpe?g|webp|bmp|tga|tiff?)$/i.test(rel);
+    // 图片素材：直接拖真实文件（PS / 聊天框 / 浏览器上传区都能接）——F-013
+    if (isImage && a.type === 'texture') {
+      const picks = selIds.includes(a.id) && selIds.length > 1 ? selIds : [a.id];
+      const files = picks
+        .map(id => (id === a.id ? a : assets.find(x => x.id === id)))
+        .filter(Boolean)
+        .map(x => String((x as any).drag_rel || ''))
+        .filter(p => /\.(png|jpe?g|webp|bmp|tga|tiff?)$/i.test(p))
+        .map(p => root + '\\' + p.split('/').join('\\'));
+      am.startDrag({ files: files.length ? files : [absPath], assetId: a.id });
+      return;
+    }
+    // 模型/材质：优先拖「描述文件」，Max 会执行 .ms（材质母版菜单 / 摆放 / 环境贴图）
     const script = dropFileCache.current.get(a.id) || '';
-    // 先告诉服务端「正在拖这个素材」，Max 的 #postImport 也能据此认出素材
     try {
       const payload = JSON.stringify({ assetId: a.id, target: 'max' });
       if (navigator.sendBeacon) navigator.sendBeacon('/api/bridge/dragging', new Blob([payload], { type: 'application/json' }));
@@ -1197,7 +1220,8 @@ export default function App() {
 
   async function refreshDetail() {
     if (!sel) return;
-    const d = await api(`/api/asset/${sel.id}`);
+    const d = await api(`/api/asset/${sel.id}`).catch(() => ({ error: 'not found' }));
+    if (!d || (d as any).error) { setSel(null); setSelIds([]); setFileSel(null); return; }
     setSel(d);
   }
 
@@ -1889,7 +1913,7 @@ export default function App() {
                 </div>
                 <div className="rp-row star-set">
                   {[1, 2, 3, 4, 5].map(v => (
-                    <button key={v} className={ratingFilter === v ? 'on' : ''}
+                    <button key={v} className={ratingFilter >= v ? 'on' : ''}
                       onClick={() => { setRatingFilter(v); setRatingOpen(false); }}>{'★'}</button>
                   ))}
                   <span className="hint" style={{ marginLeft: 6 }}>{ratingFilter || 0} 星</span>
@@ -1975,8 +1999,15 @@ export default function App() {
           {!issuesOnly && viewMode === 'assets' && rowsPerPage > 0 && total > rowsPerPage * cols && (
             <div className="pager">
               <button className="btn tiny" disabled={page <= 1} onClick={() => setPage(p => Math.max(1, p - 1))}>← 上一页</button>
-              <span className="pinfo">第 {page} / {Math.max(1, Math.ceil(total / (rowsPerPage * cols)))} 页 · 共 {total}</span>
-              <button className="btn tiny" disabled={page >= Math.ceil(total / (rowsPerPage * cols))} onClick={() => setPage(p => p + 1)}>下一页 →</button>
+              <span className="pinfo">
+                第 <input className="numin" style={{ width: 52, height: 24, textAlign: 'center' }}
+                  value={pageDraft}
+                  onChange={e => setPageDraft(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') jumpPage(); }}
+                  onBlur={jumpPage} /> / {pageCount} 页 · 共 {total}
+              </span>
+              <button className="btn tiny" onClick={jumpPage}>跳转</button>
+              <button className="btn tiny" disabled={page >= pageCount} onClick={() => setPage(p => p + 1)}>下一页 →</button>
             </div>
           )}
         </main>
@@ -2470,6 +2501,26 @@ export default function App() {
               }}>打开基本体文件夹</button>
               <span className="hint">放入 sphere / box / cylinder / plane 命名的 .glb/.gltf/.obj/.fbx 可替换默认基本体</span>
             </div>
+            <div className="hint">MCP（AI 客户端接入）</div>
+            {mcpInfo ? (
+              <>
+                <div className="uvrow">
+                  <label className="vp-check" onClick={() => setMcp({ enabled: !mcpInfo.enabled })}>
+                    <span className={'box' + (mcpInfo.enabled ? ' on' : '')}>{mcpInfo.enabled ? '✓' : ''}</span>启用 MCP
+                  </label>
+                  <label className="vp-check" onClick={() => setMcp({ allowWrite: !mcpInfo.allowWrite })}>
+                    <span className={'box' + (mcpInfo.allowWrite ? ' on' : '')}>{mcpInfo.allowWrite ? '✓' : ''}</span>允许 AI 修改
+                  </label>
+                </div>
+                <div className="hint" style={{ fontSize: 11 }}>
+                  HTTP：{mcpInfo.url}　stdio：{mcpInfo.stdio}
+                </div>
+                <div className="uvrow">
+                  <button className="btn" onClick={() => copyText(JSON.stringify({ mcpServers: { assetmanager: { command: 'node', args: [mcpInfo.stdio] } } }, null, 2))}>复制 Claude 配置</button>
+                  <button className="btn" onClick={() => copyText(JSON.stringify({ mcpServers: { assetmanager: { url: mcpInfo.url } } }, null, 2))}>复制 Cursor 配置</button>
+                </div>
+              </>
+            ) : <div className="hint">读取 MCP 状态…</div>}
             <div className="hint">关闭按钮行为</div>
             <div className="uvrow">
               <select className="sortsel" value={closeAction}
@@ -2826,17 +2877,6 @@ export default function App() {
               : <img src={zoom.src} alt="" />}
           </div>
           <div className="zoomhint">滚轮缩放 · 点击空白关闭 · {Math.round(zoom.scale * 100)}%</div>
-        </div>
-      )}
-
-      {dropActive && (
-        <div className="dropzone">
-          <div className="dropbox">
-            <div className="droptitle">松开导入到「{libs.find(l => l.id === lib)?.name || '当前库'}」</div>
-            <div className="drophint">
-              按类型自动归入 02_Materials / 05_Models / 04_HDRI / 01_Texture / 07_CAD，随后可用「整理」规范化命名。
-            </div>
-          </div>
         </div>
       )}
 
