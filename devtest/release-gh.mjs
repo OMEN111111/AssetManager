@@ -27,8 +27,8 @@ if (!syncOnly && !version) {
   process.exit(1);
 }
 
-/** 不上传的本地记录（仓库只放代码与插件） */
-const EXCLUDE = ['Logs/', 'docs/', ...String(process.env.GH_EXCLUDE || '').split(',').map(s => s.trim()).filter(Boolean)];
+/** 不上传的本地记录（仓库只放代码与插件；技术栈/功能/运行环境/代码地图都在 README 里） */
+const EXCLUDE = ['Logs/', 'docs/', 'AGENTS.md', ...String(process.env.GH_EXCLUDE || '').split(',').map(s => s.trim()).filter(Boolean)];
 const isExcluded = p => EXCLUDE.some(x => (x.endsWith('/') ? p.startsWith(x) : p === x));
 
 
