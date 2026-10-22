@@ -11,7 +11,9 @@ import {
   bridgeStatus, sendJob, nextJob, finishJob, heartbeat, touchClient, recentJobs, jobById,
   installForMax, installInfo, maxStartupDirs, bridgeScriptPath, writeLocator,
   installForBlender, blenderSeries, blenderUserDirs,
+  installForSu, suSeries as suPluginSeries, suUserDirs, suInstallInfo,
   resolvePath, assetInfo, writeDropScript,
+  suConvertCheck,
   BRIDGE_PROTOCOL, BRIDGE_SCRIPT_VERSION
 } from '../core/bridge.ts';
 import type { DB } from '../core/db.ts';
@@ -108,6 +110,26 @@ function body(req: http.IncomingMessage): Promise<any> {
     let s = '';
     req.on('data', c => s += c);
     req.on('end', () => { try { resolve(s ? JSON.parse(s) : {}); } catch { resolve({}); } });
+  });
+}
+
+/** 请求体按流写文件（渲染端导出的 GLB 上传用）；超上限直接掐断 */
+function saveRequestBody(req: http.IncomingMessage, file: string, limitBytes = 300 * 1024 * 1024): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const ws = fs.createWriteStream(file);
+    req.on('data', (c: Buffer) => {
+      size += c.length;
+      if (size > limitBytes) {
+        req.destroy();
+        ws.destroy();
+        reject(new Error('文件超过 300MB'));
+      }
+    });
+    req.on('error', (e) => { ws.destroy(); reject(e); });
+    req.pipe(ws);
+    ws.on('finish', () => resolve(size));
+    ws.on('error', (e) => reject(e));
   });
 }
 
@@ -798,6 +820,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
         try { fs.unlinkSync(path.join(dir, name)); removedFiles++; } catch { /* ignore */ }
       }
     } catch { /* 目录不存在 */ }
+    // 一并删除软件为 SketchUp 导出的临时 GLB
+    try {
+      const dir = path.join(DATA_DIR, 'converted');
+      for (const name of fs.readdirSync(dir)) {
+        if (!/\.glb$/i.test(name)) continue;
+        try { fs.unlinkSync(path.join(dir, name)); removedFiles++; } catch { /* ignore */ }
+      }
+    } catch { /* 目录不存在 */ }
     return json(res, 200, { ok: true, deleted: Number(del.changes || 0), removedFiles });
   }
 
@@ -813,11 +843,62 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const assetId = Number(b.assetId);
     const mode = String(b.mode || 'import');
     const target = String(b.target || 'max');
+    const modelPath = String(b.modelPath || '');
+    const convertedFrom = String(b.convertedFrom || '').replace(/[^.\w]/g, '').slice(0, 8);
     if (!assetId) return json(res, 400, { error: 'assetId required' });
-    if (!['import', 'material', 'texture'].includes(mode)) return json(res, 400, { error: '未知的发送模式' });
-    const r = sendJob(db, assetId, target, mode);
+    if (!['import', 'material', 'texture', 'hdri'].includes(mode)) return json(res, 400, { error: '未知的发送模式' });
+
+    // SketchUp 读不了的模型格式（FBX/OBJ/PLY）：先让渲染端用 three 转成 GLB 再发
+    if (target === 'su' && mode === 'import' && !modelPath) {
+      const conv = suConvertCheck(db, assetId);
+      if (conv && conv.convertible) return json(res, 200, { needsConvert: true, ...conv });
+      if (conv && !conv.convertible) {
+        return json(res, 400, {
+          error: `SketchUp 读不了 ${conv.ext}，软件也只能把 FBX/OBJ/PLY 转成 GLB`
+        });
+      }
+    }
+
+    // 覆盖模型只接受软件自己导出的临时文件（不碰素材目录）
+    let override = '';
+    if (modelPath) {
+      const dir = path.resolve(DATA_DIR, 'converted');
+      const abs = path.resolve(modelPath);
+      if (!abs.toLowerCase().startsWith(dir.toLowerCase()) || !fs.existsSync(abs)) {
+        return json(res, 400, { error: 'modelPath 只接受软件导出的临时 GLB' });
+      }
+      override = abs;
+    }
+
+    const r = override
+      ? sendJob(db, assetId, target, mode, {
+          modelPath: override,
+          titleSuffix: convertedFrom ? `（${convertedFrom.replace('.', '').toUpperCase()}→GLB）` : '（→GLB）'
+        })
+      : sendJob(db, assetId, target, mode);
     if ('error' in r) return json(res, 400, r);
     return json(res, 200, r);
+  }
+
+  // 渲染端把导出的 GLB 传上来：临时文件，只给 DCC 导入用，素材文件一个字节都不动
+  if (p === '/api/bridge/convert' && req.method === 'POST') {
+    const assetId = Number(url.searchParams.get('assetId') || 0);
+    const raw = String(url.searchParams.get('name') || 'model');
+    const safe = raw.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 60) || 'model';
+    const dir = path.join(DATA_DIR, 'converted');
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+    const file = path.join(dir, `${assetId || 'x'}-${safe}.glb`);
+    try {
+      const size = await saveRequestBody(req, file);
+      if (!size) {
+        try { fs.unlinkSync(file); } catch { /* ignore */ }
+        return json(res, 400, { ok: false, error: '空文件' });
+      }
+      return json(res, 200, { ok: true, path: file, size });
+    } catch (e: any) {
+      try { fs.unlinkSync(file); } catch { /* ignore */ }
+      return json(res, 500, { ok: false, error: String(e?.message || e) });
+    }
   }
 
   if (p === '/api/bridge/install' && req.method === 'POST') {
@@ -832,6 +913,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   // 只查不装：包里的系列 + 本机 Blender 用户目录
   if (p === '/api/bridge/blender-where' && req.method === 'GET') {
     return json(res, 200, { series: blenderSeries(APP_ROOT), dirs: blenderUserDirs() });
+  }
+
+  // 一键把 SketchUp 插件装进本机所有 SketchUp 用户目录（按各版本挑对应系列）
+  if (p === '/api/bridge/install-su' && req.method === 'POST') {
+    return json(res, 200, installForSu(APP_ROOT));
+  }
+
+  // 只查不装：包里的 SketchUp 系列 + 本机 SketchUp 用户目录 + 已装版本
+  if (p === '/api/bridge/su-where' && req.method === 'GET') {
+    return json(res, 200, { ...suInstallInfo(APP_ROOT), series: suPluginSeries(APP_ROOT), dirs: suUserDirs() });
   }
 
   if (p === '/api/bridge/test' && req.method === 'POST') {
@@ -861,6 +952,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
       const outDir = path.join(DATA_DIR, 'plugins', 'blender');
       try {
         copyTree(path.join(APP_ROOT, 'bridge', 'blender'), outDir, new Set(['tools', '__pycache__']));
+      } catch { /* ignore */ }
+      dir = outDir;
+    } else if (which === 'su') {
+      // SketchUp 插件同样按版本分目录（2026/ 2025/ …），整份复制便于手动安装
+      const outDir = path.join(DATA_DIR, 'plugins', 'sketchup');
+      try {
+        copyTree(path.join(APP_ROOT, 'bridge', 'su'), outDir, new Set(['tools', '__pycache__']));
       } catch { /* ignore */ }
       dir = outDir;
     } else if (which === 'geometry') {
@@ -1614,4 +1712,13 @@ http.createServer((req, res) => {
   })();
   const locator = writeLocator(PORT, APP_ROOT, version);
   console.log(`AssetManager API on http://127.0.0.1:${PORT}  db=${DB_FILE}  bridge=${locator || '(locator failed)'}`);
+  // 清理上一轮给 SketchUp 导出的临时 GLB（超过 24 小时的）
+  try {
+    const dir = path.join(DATA_DIR, 'converted');
+    const keepMs = 24 * 3600 * 1000;
+    for (const name of fs.readdirSync(dir)) {
+      const f = path.join(dir, name);
+      try { if (Date.now() - fs.statSync(f).mtimeMs > keepMs) fs.unlinkSync(f); } catch { /* ignore */ }
+    }
+  } catch { /* 目录不存在 */ }
 });

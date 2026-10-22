@@ -3,6 +3,7 @@ import type { Asset, AssetDetail, Library, ScanState, TagNode, TreeNode } from '
 import Viewer from './Viewer';
 import Assembler from './Assembler';
 import { renderThumb } from './thumbnailer';
+import { exportGlbForSketchUp } from './glbconvert';
 import SmartImage, { isSpecialImage } from './SmartImage';
 import { history } from './history';
 
@@ -890,14 +891,15 @@ export default function App() {
 
   async function loadBridge() {
     try {
-      const [st, info, maxJobs, blJobs] = await Promise.all([
+      const [st, info, maxJobs, blJobs, suJobs] = await Promise.all([
         api('/api/bridge/status'), api('/api/bridge/info'),
-        api('/api/bridge/jobs?target=max&limit=8'), api('/api/bridge/jobs?target=blender&limit=8')
+        api('/api/bridge/jobs?target=max&limit=8'), api('/api/bridge/jobs?target=blender&limit=8'),
+        api('/api/bridge/jobs?target=su&limit=8')
       ]);
       setBridge(st);
       setBridgeInfo(info);
-      // Max 与 Blender 的任务合并显示，新的在前
-      const merged = [...(maxJobs?.jobs || []), ...(blJobs?.jobs || [])]
+      // Max / Blender / SketchUp 的任务合并显示，新的在前
+      const merged = [...(maxJobs?.jobs || []), ...(blJobs?.jobs || []), ...(suJobs?.jobs || [])]
         .sort((a: any, b: any) => (b.id || 0) - (a.id || 0))
         .slice(0, 8);
       setBridgeJobs(merged);
@@ -905,26 +907,30 @@ export default function App() {
   }
 
   /** 素材适合哪种发送方式 */
-  function sendModeFor(a: Asset): 'import' | 'material' | 'texture' | null {
+  function sendModeFor(a: Asset): 'import' | 'material' | 'texture' | 'hdri' | null {
     if (a.type === 'model' || a.type === 'scene') return 'import';
     if (a.type === 'material') return 'material';
     if (a.type === 'texture') return 'texture';
+    if (a.type === 'hdri') return 'hdri';
     return null;
   }
 
   /** 可发送的软件（顺序=菜单顺序） */
-  const SEND_TARGETS: { key: 'max' | 'blender'; label: string }[] = [
+  const SEND_TARGETS: { key: 'max' | 'blender' | 'su'; label: string }[] = [
     { key: 'max', label: '3ds Max' },
-    { key: 'blender', label: 'Blender' }
+    { key: 'blender', label: 'Blender' },
+    { key: 'su', label: 'SketchUp' }
   ];
 
   const maxConnected = !!bridge?.targets?.max?.connected;
   const blenderTarget = bridge?.targets?.blender;
   const blenderConnected = !!blenderTarget?.connected;
+  const suTarget = bridge?.targets?.su;
+  const suConnected = !!suTarget?.connected;
 
   /** 打开「发送到…」菜单（锚在按钮下方或右键位置） */
   function openSendMenu(a: Asset, at: { x: number; y: number }) {
-    if (!sendModeFor(a)) { showToast('这类素材不支持发送到 DCC（模型/材质/贴图才有）', 'err'); return; }
+    if (!sendModeFor(a)) { showToast('这类素材不支持发送到 DCC（模型/材质/贴图/HDRI 才有）', 'err'); return; }
     const w = 236, h = 40 + SEND_TARGETS.length * 34;
     setSendMenu({
       asset: a,
@@ -939,18 +945,41 @@ export default function App() {
     openSendMenu(a, { x: r.left, y: r.bottom + 4 });
   }
 
-  async function sendToTarget(a: Asset, target: 'max' | 'blender', mode?: 'import' | 'material' | 'texture') {
-    const tName = target === 'blender' ? 'Blender' : '3ds Max';
+  async function sendToTarget(a: Asset, target: 'max' | 'blender' | 'su', mode?: 'import' | 'material' | 'texture' | 'hdri') {
+    const tName = target === 'blender' ? 'Blender' : target === 'su' ? 'SketchUp' : '3ds Max';
     const online = !!bridge?.targets?.[target]?.connected;
     const m = mode || sendModeFor(a);
     if (!m) { showToast(`这类素材不支持发送到 ${tName}`, 'err'); return; }
-    const label = m === 'import' ? '导入模型' : m === 'material' ? '创建材质' : '发送贴图';
+    if (m === 'hdri' && target !== 'su') {
+      showToast('HDRI 只能发给支持环境光的软件（目前是 SketchUp）', 'err');
+      return;
+    }
+    const label = m === 'import' ? '导入模型' : m === 'material' ? '创建材质' : m === 'hdri' ? '应用 HDRI' : '发送贴图';
     setBridgeBusy(true);
     try {
-      const r = await api('/api/bridge/send', {
+      const send = (extra: Record<string, unknown> = {}) => api('/api/bridge/send', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ assetId: a.id, mode: m, target })
+        body: JSON.stringify({ assetId: a.id, mode: m, target, ...extra })
       });
+      let r = await send();
+
+      // SketchUp 读不了这个模型格式（FBX/OBJ/PLY）：软件先临时导出一份 GLB，再让插件导入它
+      if (r?.needsConvert) {
+        showToast(`SketchUp 读不了 ${r.ext}：正在临时导出 GLB…（素材文件不改）`);
+        const detail = await api(`/api/asset/${a.id}`);
+        const { blob, stats } = await exportGlbForSketchUp(detail);
+        const upRes = await fetch(
+          `/api/bridge/convert?assetId=${a.id}&name=${encodeURIComponent(a.name)}`,
+          { method: 'POST', body: blob }
+        );
+        const up = await upRes.json().catch(() => null);
+        if (!up?.ok) { showToast(`导出 GLB 失败：${up?.error || upRes.status}`, 'err'); return; }
+        const mb = (stats.glbBytes / 1048576).toFixed(1);
+        const dim = stats.sizeM.map(v => v.toFixed(2)).join(' × ');
+        showToast(`已导出 GLB（${mb}MB · ${dim} m${stats.note ? ' · ' + stats.note : ''}），正在发送…`);
+        r = await send({ modelPath: up.path, convertedFrom: stats.ext });
+      }
+
       if (!r?.id) { showToast(`发送失败：${r?.error || '服务端未响应'}`, 'err'); return; }
       showToast(online
         ? `已发给 ${tName}（${label}），等待处理…`
@@ -996,6 +1025,22 @@ export default function App() {
       if (!r?.ok) { showToast('安装失败：' + (r?.error || '未知原因'), 'err'); return; }
       const list = (r.installed || []).map((x: any) => `Blender ${x.blender} → v${x.version}（${x.series} 系列）`);
       showToast(`已装到 ${list.length} 个 Blender：${list.join('；')}。到「偏好设置 → 插件」勾选一次即可`, 'ok');
+      await loadBridge();
+    } catch (e: any) {
+      showToast('安装失败：' + String(e?.message || e), 'err');
+    } finally { setBridgeBusy(false); }
+  }
+
+  /** 一键装 SketchUp 插件：后端按各 SketchUp 版本挑对应系列，写进它的 Plugins 目录 */
+  async function installSuPlugin() {
+    setBridgeBusy(true);
+    try {
+      const r = await api('/api/bridge/install-su', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
+      });
+      if (!r?.ok) { showToast('安装失败：' + (r?.error || '未知原因'), 'err'); return; }
+      const list = (r.installed || []).map((x: any) => `SketchUp ${x.sketchup} → v${x.version}（${x.series} 系列）`);
+      showToast(`已装到 ${list.length} 个 SketchUp：${list.join('；')}。重启 SketchUp 生效`, 'ok');
       await loadBridge();
     } catch (e: any) {
       showToast('安装失败：' + String(e?.message || e), 'err');
@@ -2063,6 +2108,12 @@ export default function App() {
             : 'Blender 未连接（点开插件面板）'}>
           <span className={'mxdot' + (blenderConnected ? ' on' : '')} />Blender
         </button>
+        <button className={'bridgechip' + (suConnected ? ' on' : '')} onClick={() => setPluginsOpen(true)}
+          title={suConnected
+            ? `SketchUp 已连接${bridge?.targets?.su?.version ? ' · 插件 v' + bridge.targets.su.version : ''}`
+            : 'SketchUp 未连接（点开插件面板）'}>
+          <span className={'mxdot' + (suConnected ? ' on' : '')} />SketchUp
+        </button>
         <div className="status-right">
           <span className="cap">主题</span>
           {THEMES.map(t => (
@@ -2094,13 +2145,13 @@ export default function App() {
 
       {sendMenu && (() => {
         const m = sendModeFor(sendMenu.asset);
-        const mLabel = m === 'import' ? '导入模型' : m === 'material' ? '创建材质' : '发送贴图';
+        const mLabel = m === 'import' ? '导入模型' : m === 'material' ? '创建材质' : m === 'hdri' ? '应用 HDRI' : '发送贴图';
         return (
           <>
             <div className="menu-mask" onMouseDown={() => setSendMenu(null)} />
             <div className="ctxmenu sendsel" style={{ left: sendMenu.x, top: sendMenu.y }}>
               <div className="send-h">发送到… · {mLabel}</div>
-              {SEND_TARGETS.map(t => {
+              {SEND_TARGETS.filter(t => !(m === 'hdri' && t.key !== 'su')).map(t => {
                 const st = bridge?.targets?.[t.key];
                 const online = !!st?.connected;
                 return (
@@ -2140,7 +2191,7 @@ export default function App() {
               <button onClick={() => { setCtx(null); openViewer(ctx.asset); }}>打开预览</button>
               {sendModeFor(ctx.asset) && (
                 <button onClick={() => { const a = ctx.asset; setCtx(null); openSendMenu(a, { x: ctx.x, y: ctx.y }); }} disabled={bridgeBusy}>
-                  发送到…（3ds Max / Blender）
+                  发送到…（3ds Max / Blender / SketchUp）
                 </button>
               )}
               <button onClick={() => { setCtx(null); reveal(ctx.asset); }}>在资源管理器中显示</button>
@@ -2298,7 +2349,46 @@ export default function App() {
                   装完到 偏好设置 → 插件 里勾选一次即可。
                 </div>
               </div>
-              {['SketchUp', 'Houdini', 'Unreal Engine'].map(n => (
+              <div className={'maxcard' + (suConnected ? ' on' : '')}>
+                <div className="mxhead">
+                  <span className="mxname">SketchUp</span>
+                  <span className={'mxdot' + (suConnected ? ' on' : '')} />
+                  <span className={suConnected ? 'plug-on' : 'plug-off'}>{suConnected ? '已连接' : '未连接'}</span>
+                  {!!suTarget?.version && <span className="mxver">插件 v{suTarget.version}</span>}
+                </div>
+                <div className="mxmeta">
+                  队列 {suTarget?.queued ?? 0} · 运行 {suTarget?.running ?? 0}
+                  {suTarget?.lastSeen ? ` · 最近心跳 ${new Date(suTarget.lastSeen).toLocaleTimeString()}` : ''}
+                </div>
+                {suTarget?.lastJob && (
+                  <div className="mxmeta mxlast" title={`${suTarget.lastJob.title} — ${suTarget.lastJob.message || ''}`}>
+                    最近任务：{suTarget.lastJob.status === 'done' ? '✔' : suTarget.lastJob.status === 'failed' ? '✘' : '…'}
+                    {' '}{suTarget.lastJob.title}
+                    {suTarget.lastJob.message ? ` — ${suTarget.lastJob.message}` : ''}
+                  </div>
+                )}
+                <div className="uvrow" style={{ marginTop: 8 }}>
+                  <button className="btn primary" disabled={bridgeBusy} onClick={installSuPlugin}>
+                    安装/更新插件到 SketchUp
+                  </button>
+                  <button className="btn" onClick={async () => {
+                    const r = await api('/api/bridge/open-folder', {
+                      method: 'POST', headers: { 'content-type': 'application/json' },
+                      body: JSON.stringify({ which: 'su' })
+                    });
+                    if (!r?.ok) showToast(r?.error || '打开失败', 'err');
+                  }}>打开 SketchUp 插件文件夹</button>
+                </div>
+                <div className="hint">
+                  插件按 SketchUp 版本分目录：SketchUp 2026 用 <b>2026/</b>（assetmanager_su.rb + assetmanager_su/main.rb）。
+                  「安装/更新插件到 SketchUp」会按各版本自动挑系列写进它的 Plugins 目录，<b>重启 SketchUp 生效</b>，
+                  之后在 扩展程序 → AssetManager 打开状态面板。
+                  模型导入支持 SketchUp 自带格式（SKP/DAE/GLB/STL/3DS/DWG/IFC…）；
+                  <b>FBX/OBJ/PLY 会先由软件临时导出成 GLB 再发</b>（素材文件不改，临时文件在数据目录 converted\，
+                  清除任务记录时一并删除）。
+                </div>
+              </div>
+              {['Houdini', 'Unreal Engine'].map(n => (
                 <div className="plug-row" key={n}>
                   <span className="plug-name">{n}</span>
                   <span className="plug-desc">素材直接发送 / 一键替换</span>
@@ -2318,7 +2408,7 @@ export default function App() {
                     <div className="mxjob" key={j.id}>
                       <span className={'mxst ' + j.status}>{j.status === 'done' ? '✔' : j.status === 'failed' ? '✘' : '…'}</span>
                       <span className="mxtitle" title={j.message || ''}>
-                        {j.target === 'blender' ? 'Blender · ' : ''}{j.title}
+                        {j.target === 'blender' ? 'Blender · ' : j.target === 'su' ? 'SketchUp · ' : ''}{j.title}
                       </span>
                       <span className="mxmsg" title={j.message || ''}>{j.message || (j.status === 'pending' ? '排队中' : j.status)}</span>
                     </div>
@@ -2326,7 +2416,7 @@ export default function App() {
                 </div>
               </div>
             )}
-            <div className="hint">插件来源：应用目录下的 bridge/max/AssetManagerBridge.ms（安装时复制到 3ds Max 的 scripts\startup）；Blender 插件在 bridge/blender/&lt;Blender 版本&gt;/ 下。</div>
+            <div className="hint">插件来源：应用目录下的 bridge/max/AssetManagerBridge.ms（安装时复制到 3ds Max 的 scripts\startup）；Blender 插件在 bridge/blender/&lt;Blender 版本&gt;/ 下；SketchUp 插件在 bridge/su/&lt;SketchUp 版本&gt;/ 下。</div>
             <div className="modal-b">
               <button className="btn" onClick={() => setPluginsOpen(false)}>关闭</button>
             </div>

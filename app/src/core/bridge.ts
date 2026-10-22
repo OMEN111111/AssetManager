@@ -32,7 +32,8 @@ export const TARGET_LABEL: Record<string, string> = {
 export const MODE_LABEL: Record<string, string> = {
   import: '导入模型',
   material: '创建材质',
-  texture: '发送贴图'
+  texture: '发送贴图',
+  hdri: '应用 HDRI'
 };
 
 // 表结构在 core/db.ts 的 SCHEMA 中（随数据库打开自动创建）
@@ -181,8 +182,8 @@ function modelFile(bundle: AssetBundle): FileRow | null {
   return models.find(f => f.slot === '01') || models[0];
 }
 
-/** 素材 → 任务载荷 */
-export function buildPayload(db: DB, assetId: number, mode: string) {
+/** 素材 → 任务载荷（modelOverride：软件临时导出的 GLB 等替代模型文件） */
+export function buildPayload(db: DB, assetId: number, mode: string, modelOverride?: string) {
   const bundle = loadBundle(db, assetId);
   if (!bundle) return { error: 'asset not found' as const };
   const a = bundle.asset;
@@ -209,16 +210,20 @@ export function buildPayload(db: DB, assetId: number, mode: string) {
 
   if (mode === 'import') {
     const m = modelFile(bundle);
-    if (!m) return { error: '该素材没有可导入的模型文件' as const };
+    const override = modelOverride && fs.existsSync(modelOverride) ? modelOverride : '';
+    if (!m && !override) return { error: '该素材没有可导入的模型文件' as const };
+    // 软件临时导出的 GLB（FBX/OBJ 等 SketchUp 读不了的格式）直接用它
+    const path2 = override || abs(bundle.root, m!.rel_path);
     return {
       payload: {
         assetId,
         name: String(a.name),
         sourceDir,
-        modelPath: abs(bundle.root, m.rel_path),
-        ext: path.extname(m.rel_path).toLowerCase(),
+        modelPath: path2,
+        ext: path.extname(path2).toLowerCase(),
         material: spec,
-        maps: mapsBySlot(spec)
+        maps: mapsBySlot(spec),
+        converted: !!override
       }
     };
   }
@@ -242,7 +247,55 @@ export function buildPayload(db: DB, assetId: number, mode: string) {
     };
   }
 
+  // HDRI：只有 SketchUp 这类原生支持「环境/天空」的 DCC 用得到（.hdr/.exr）
+  if (mode === 'hdri') {
+    const envs = bundle.files.filter(f => /\.(hdr|exr)$/i.test(f.rel_path));
+    if (!envs.length) return { error: '该素材里没有 .hdr / .exr 文件' as const };
+    return {
+      payload: {
+        assetId,
+        name: String(a.name),
+        sourceDir,
+        files: envs.map(f => abs(bundle.root, f.rel_path)),
+        paths: envs.map(f => ({ path: abs(bundle.root, f.rel_path), role: f.role }))
+      }
+    };
+  }
+
   return { error: '未知模式' as const };
+}
+
+// ---------------------------------------------------------------- SketchUp 格式判断
+
+/**
+ * SketchUp 2026 自带导入器能直接吃的格式（与插件 main.rb 的 SUPPORTED_IMPORT 保持一致）。
+ * FBX / OBJ 不在其中 —— 这类要先在软件里临时转成 GLB。
+ */
+export const SU_IMPORT_EXT = [
+  '.skp', '.dae', '.dwg', '.dxf', '.3ds', '.glb', '.gltf', '.stl', '.ifc', '.kmz', '.usdz', '.trb'
+];
+/** 软件能临时转成 GLB 的格式（渲染端 three 的 loader 支持） */
+export const SU_CONVERTIBLE_EXT = ['.fbx', '.obj', '.ply'];
+
+/**
+ * 发给 SketchUp 导入前要不要先转 GLB：
+ *   null                       → 不用转（SketchUp 自己能读）
+ *   { convertible: false }     → 转不了（比如 .blend/.max），得给用户说清楚
+ *   { convertible: true }      → 软件侧转 GLB 后再发
+ */
+export function suConvertCheck(db: DB, assetId: number) {
+  const bundle = loadBundle(db, assetId);
+  if (!bundle) return null;
+  const m = modelFile(bundle);
+  if (!m || !m.rel_path) return null;
+  const ext = path.extname(m.rel_path).toLowerCase();
+  if (SU_IMPORT_EXT.includes(ext)) return null;
+  return {
+    ext,
+    convertible: SU_CONVERTIBLE_EXT.includes(ext),
+    name: String(bundle.asset.name),
+    modelPath: abs(bundle.root, m.rel_path)
+  };
 }
 
 // ---------------------------------------------------------------- 路径反查
@@ -379,8 +432,11 @@ function parsePayload(row: any) {
   return { id: row.id, target: row.target, mode: row.mode, title: row.title, payload };
 }
 
-export function sendJob(db: DB, assetId: number, target: string, mode: string) {
-  const b = buildPayload(db, assetId, mode);
+export function sendJob(
+  db: DB, assetId: number, target: string, mode: string,
+  opts?: { modelPath?: string; titleSuffix?: string }
+) {
+  const b = buildPayload(db, assetId, mode, opts?.modelPath);
   if ('error' in b) return b;
   const now = Date.now();
 
@@ -391,7 +447,7 @@ export function sendJob(db: DB, assetId: number, target: string, mode: string) {
   if (dup) return { id: dup.id, reused: true, status: dup.status };
 
   const asset = db.prepare('SELECT name FROM assets WHERE id=?').get(assetId) as any;
-  const title = `${asset?.name || '素材'} · ${MODE_LABEL[mode] || mode}`;
+  const title = `${asset?.name || '素材'} · ${MODE_LABEL[mode] || mode}${opts?.titleSuffix || ''}`;
   const info = db.prepare(`INSERT INTO bridge_jobs(target,asset_id,mode,title,payload,status,created_at)
     VALUES(?,?,?,?,?,'pending',?)`).run(target, assetId, mode, title, JSON.stringify(b.payload), now);
   return { id: Number(info.lastInsertRowid), title };
@@ -584,6 +640,114 @@ export function installForBlender(appRoot: string) {
     }
   }
   return { ok: installed.length > 0, installed, failed, series, dirs: dirs.map(d => d.addons) };
+}
+
+// ---------------------------------------------------------------- SketchUp 安装
+
+/** SketchUp 插件的两个文件：加载器 + 同名实现文件夹（Plugins 下就是这个结构） */
+const SU_LOADER = 'assetmanager_su.rb';
+const SU_DIR = 'assetmanager_su';
+
+/** 安装包里有哪些 SketchUp 系列目录（2026 / 2025 …） */
+export function suSeries(appRoot: string): string[] {
+  const dir = path.join(appRoot, 'bridge', 'su');
+  let ents: fs.Dirent[] = [];
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  return ents.filter(e => e.isDirectory() && /^\d{4}$/.test(e.name))
+    .map(e => e.name)
+    .sort((a, b) => Number(a) - Number(b));
+}
+
+/** 本机 SketchUp 的 Plugins 目录（%APPDATA%\SketchUp\SketchUp 2026\SketchUp\Plugins） */
+export function suUserDirs(): { version: string; plugins: string }[] {
+  const appdata = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  const base = path.join(appdata, 'SketchUp');
+  let versions: fs.Dirent[] = [];
+  try { versions = fs.readdirSync(base, { withFileTypes: true }); } catch { return []; }
+  const out: { version: string; plugins: string }[] = [];
+  for (const v of versions) {
+    if (!v.isDirectory()) continue;
+    const m = v.name.match(/^SketchUp\s+(\d{4})$/i);
+    if (!m) continue;
+    const inner = path.join(base, v.name, 'SketchUp');
+    // 只认真正用过的版本目录（里面会有 Plugins 或 SharedPreferences.json）
+    const used = fs.existsSync(path.join(inner, 'Plugins')) || fs.existsSync(path.join(inner, 'SharedPreferences.json'));
+    if (!used) continue;
+    out.push({ version: m[1], plugins: path.join(inner, 'Plugins') });
+  }
+  return out;
+}
+
+/** 给某个 SketchUp 版本挑系列：优先同版本，其次不超过它的最高系列 */
+export function pickSuSeries(series: string[], suVersion: string): string | null {
+  if (!series.length) return null;
+  if (series.includes(suVersion)) return suVersion;
+  const le = series.filter(s => Number(s) <= Number(suVersion));
+  if (le.length) return le[le.length - 1];
+  return series[0];
+}
+
+function suPluginVersionOf(loader: string): string {
+  try {
+    const m = fs.readFileSync(loader, 'utf8').match(/AM_PLUGIN_VERSION\s*=\s*'([^']+)'/);
+    return m ? m[1] : '';
+  } catch { return ''; }
+}
+
+/** 一键把 SketchUp 插件装进本机所有 SketchUp 用户目录（按各版本挑对应系列） */
+export function installForSu(appRoot: string) {
+  const series = suSeries(appRoot);
+  if (!series.length) {
+    return { ok: false, error: '安装包缺少 bridge/su/<SketchUp 版本>/ 目录（重新打包）' };
+  }
+  const dirs = suUserDirs();
+  if (!dirs.length) {
+    return {
+      ok: false,
+      error: '没找到 SketchUp 用户目录（%APPDATA%\\SketchUp\\SketchUp 20XX\\SketchUp\\Plugins）：先启动一次 SketchUp 再装',
+      series
+    };
+  }
+
+  const installed: { sketchup: string; series: string; version: string; dir: string }[] = [];
+  const failed: { sketchup: string; error: string }[] = [];
+  for (const d of dirs) {
+    const pick = pickSuSeries(series, d.version);
+    if (!pick) continue;
+    const srcLoader = path.join(appRoot, 'bridge', 'su', pick, SU_LOADER);
+    const srcDir = path.join(appRoot, 'bridge', 'su', pick, SU_DIR);
+    if (!fs.existsSync(srcLoader) || !fs.existsSync(srcDir)) {
+      failed.push({ sketchup: d.version, error: `缺少 ${pick}/${SU_LOADER} 或 ${pick}/${SU_DIR}/` });
+      continue;
+    }
+    try {
+      fs.mkdirSync(path.join(d.plugins, SU_DIR), { recursive: true });
+      const dstLoader = path.join(d.plugins, SU_LOADER);
+      fs.copyFileSync(srcLoader, dstLoader);
+      fs.copyFileSync(path.join(srcDir, 'main.rb'), path.join(d.plugins, SU_DIR, 'main.rb'));
+      installed.push({ sketchup: d.version, series: pick, version: suPluginVersionOf(dstLoader), dir: dstLoader });
+    } catch (e: any) {
+      failed.push({ sketchup: d.version, error: String(e?.message || e) });
+    }
+  }
+  return { ok: installed.length > 0, installed, failed, series, dirs: dirs.map(d => d.plugins) };
+}
+
+/** 面板用：装到哪些 SketchUp、版本是否与安装包一致 */
+export function suInstallInfo(appRoot: string) {
+  const series = suSeries(appRoot);
+  const dirs = suUserDirs();
+  const installedAt: string[] = [];
+  for (const d of dirs) {
+    const dst = path.join(d.plugins, SU_LOADER);
+    if (!fs.existsSync(dst)) continue;
+    const pick = pickSuSeries(series, d.version);
+    const src = pick ? path.join(appRoot, 'bridge', 'su', pick, SU_LOADER) : '';
+    let same = false;
+    try { same = !!src && fs.readFileSync(src, 'utf8') === fs.readFileSync(dst, 'utf8'); } catch { /* ignore */ }
+    installedAt.push(dst + (same ? '' : ' (版本不同)'));
+  }
+  return { series, dirs: dirs.map(d => d.plugins), installedAt, installed: installedAt.length > 0 };
 }
 
 // ---------------------------------------------------------------- 3ds Max 安装

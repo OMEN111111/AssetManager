@@ -3,6 +3,56 @@
 > 版本规则：三位版本号，开发版本只在**第三位**递增（0.1.1 → 0.1.2 → 0.1.3…）。
 > **插件版本独立编号**：Blender 插件的版本与软件版本解耦，第一版 `0.1.0`，之后只递增第三位（0.1.1、0.1.2…）；
 > 只改插件、软件本体不动时**不改软件版本号**，把插件打包进软件测试时打包产物版本号也保持不变。
+> **SketchUp 插件同样独立编号**（首版 `0.1.0`，只递增第三位），按 SketchUp 版本分目录（`bridge/su/2026/`…）。
+
+## v0.3.3 — 2026-10-21（FBX/OBJ 自动转 GLB 再进 SketchUp · 插件 0.1.1）
+
+SketchUp 没有 FBX/OBJ 导入器，而库里 90% 的模型是 FBX。这一版让**软件先把模型临时导出成 GLB**，
+再交给 SketchUp 插件导入 —— 用户只需要照常点「发送到… → SketchUp」。
+
+### 转换（渲染端，用 three.js）
+- 新增 `src/renderer/glbconvert.ts`：FBX / OBJ / PLY 用 three 的 loader 读进来，`GLTFExporter` 导成 GLB
+- **单位自动折算**：按 FBX 的 `UnitScaleFactor`（1 文件单位 = N 厘米）换成米，
+  实测 Man 1.88m / Door（厘米场景）2.42m / Gate 2.93m 全部对得上，SketchUp 里量出来的尺寸与源一致
+- 贴图随 GLB 一起嵌入（最长边 2048）；导出前等贴图解码完成，缺图的贴图会被跳过而不会整份失败
+- 没有贴图的网格自动套用素材材质（与预览一致），模型自带材质的保持原样
+- 导出**只写数据目录的 `converted\`**，素材文件一个字节都不动；「清除任务记录」或超过 24 小时自动删除
+
+### 发送流程
+- `/api/bridge/send` 遇到 SketchUp 读不了的格式会返回 `needsConvert`，界面自动走「导出 GLB → 上传 → 再发送」
+- 任务标题标注来源：`Gate_001 · 导入模型（FBX→GLB）`
+- `.blend` / `.max` 这类 three 也读不了的格式，直接给出明确提示而不是排队失败
+
+### 插件 0.1.1
+- 导入改为**提交后再统计对象数**（SketchUp 的 glTF 导入有时要回到事件循环才落地，原来的即时统计会报「0 个对象」）
+- 大批量导入时对象数与兜底贴图交给一次性 timer 收尾，最多等 10 秒再回传结果
+
+## v0.3.2 — 2026-10-21（SketchUp 桥接首版 · 插件 0.1.0）
+
+首个带 **SketchUp 桥接**的版本。SketchUp 插件独立编号，首版 `0.1.0`，先做本机已装的 **SketchUp 2026**。
+
+### SketchUp 桥接（插件 0.1.0）
+- 插件按 SketchUp 版本分目录：`bridge/su/2026/`（`assetmanager_su.rb` 加载器 + `assetmanager_su/main.rb` 实现）
+- 面板：**扩展程序 → AssetManager**（HtmlDialog 状态面板：连接状态 / 端口 / 队列 / 最近事件 / 重连 / 暂停）+ 工具栏
+- 任务：
+  - **模型导入**：SketchUp 自带导入器（SKP/DAE/GLB/GLTF/STL/3DS/DWG/DXF/IFC/KMZ/USDZ），
+    整段一个撤销点；导入后没有材质的面自动套用素材基础色贴图
+  - **材质重建**：SketchUp **原生 PBR 材质** —— 基础色贴图、粗糙度 / 金属度 / AO（打包图自动抽通道成灰度）
+    、法线（GL/DX 自动设 `normal_style`）、UV 平铺；同名材质原地重建不堆 `.001`，用户同名材质不覆盖
+  - **发送贴图**：每张贴图建一个同名材质并设为当前材质
+  - **应用 HDRI**：用 SketchUp 2026 的「环境」做天空盒 + 反射（只认 .hdr/.exr）
+- 端口自动发现 + 跟随（`%LOCALAPPDATA%\AssetManager\bridge.json`，失败回退扫 8787–8805），空闲降频
+- 明确不支持 FBX/OBJ 导入（SketchUp 本身没有这两个导入器），会给出中文提示
+
+### 界面
+- 状态栏新增 **SketchUp 指示灯**
+- 插件面板新增 **SketchUp 卡片**：连接状态、插件版本、队列、「安装/更新插件到 SketchUp」、打开插件文件夹
+- 「发送到…」菜单新增 SketchUp；HDRI 素材只列支持环境光的 SketchUp
+- 右键菜单文案更新为「发送到…（3ds Max / Blender / SketchUp）」
+
+### 协议
+- 新增发送模式 `hdri`（载荷为素材里的 .hdr/.exr 文件）
+- 新增接口 `POST /api/bridge/install-su`、`GET /api/bridge/su-where`
 
 ## v0.3.1 — 2026-10-21
 
