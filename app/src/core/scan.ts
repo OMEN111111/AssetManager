@@ -8,7 +8,7 @@ const SKIP_DIRS = new Set(['_meta', '99_Temp', '99_Trash', '99_Unsorted', '.git'
 const MODEL_EXT = new Set(['.fbx', '.obj', '.glb', '.gltf', '.blend', '.max', '.usdz', '.stl', '.3ds', '.abc']);
 const DRAW_EXT = new Set(['.dwg', '.dxf']);
 const IMG_EXT = new Set(['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.webp', '.tga', '.psd']);
-const IES_EXT = new Set(['.ies']);
+const IES_EXT = new Set(['.ies', '.ldt']);
 const MAP_DIRS = new Set(['maps', 'map', 'textures', 'texture', 'tex']);
 
 interface FileInfo { name: string; ext: string; size: number; mtime: number }
@@ -98,7 +98,7 @@ function detect(absDir: string, relDir: string, files: FileInfo[], mapFiles: { n
   }
 
   if (models.length) {
-    const type: AssetType = relDir.startsWith('06_Scene') ? 'scene' : 'model';
+    const type: AssetType = 'model'; // 场景也按模型（筛选只看文件后缀，不看库目录）
     const spec = base(models, 'model', type, models[0].ext, dirName, findPreview(files, dirName));
     // variants get slots
     let i = 1;

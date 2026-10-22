@@ -122,6 +122,8 @@ export function openDb(file: string): DB {
       db.exec('ALTER TABLE material_overrides ADD COLUMN swizzle TEXT');
     }
   } catch { /* ignore */ }
+  try { db.exec("UPDATE assets SET type='model' WHERE type='scene'"); } catch { /* ignore */ }
+  try { db.exec("UPDATE material_overrides SET swizzle='rgb' WHERE swizzle IS NULL"); } catch { /* ignore */ }
   return db;
 }
 

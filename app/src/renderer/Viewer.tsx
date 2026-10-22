@@ -16,100 +16,194 @@ import { makeGeometry } from './geometries';
 import type { AssetDetail, AssetFile } from './types';
 
 type Preset = 'maya' | 'max' | 'blender';
-type Channel = 'beauty' | 'albedo' | 'clay' | 'normal' | 'rough' | 'metallic' | 'ao' | 'emissive' | 'checker';
-type GeoKind = 'sphere' | 'box' | 'cylinder' | 'plane';
 
-const lc = (f: AssetFile) => f.rel_path.toLowerCase();
-const apiJson = (p: string) => fetch(p).then(r => r.json());
+/** 解析 IESNA 文本，取垂直配光曲线（平均水平角），用于推导光束角与光斑衰减 */
+function kelvinToColor(k: number): THREE.Color {
+  const t = Math.max(1000, Math.min(40000, k)) / 100;
+  let r: number, g: number, b: number;
+  if (t <= 66) {
+    r = 255;
+    g = 99.4708025861 * Math.log(t) - 161.1195681661;
+    b = t <= 19 ? 0 : 138.5177312231 * Math.log(t - 10) - 305.0447927307;
+  } else {
+    r = 329.698727446 * Math.pow(t - 60, -0.1332047592);
+    g = 288.1221695283 * Math.pow(t - 60, -0.0755148492);
+    b = 255;
+  }
+  return new THREE.Color(r / 255, g / 255, b / 255);
+}
 
 function findFile(files: AssetFile[], ...keys: string[]) {
   for (const k of keys) {
-    const hit = files.find(f => lc(f).includes(k));
+    const hit = files.find(f => String(f.rel_path).toLowerCase().includes(k));
     if (hit) return hit;
   }
   return undefined;
 }
 
-const CHANNEL_META: { key: Channel; label: string }[] = [
-  { key: 'beauty', label: '材质' },
-  { key: 'albedo', label: '颜色' },
-  { key: 'clay', label: '白膜' },
-  { key: 'normal', label: '法线' },
-  { key: 'rough', label: '粗糙度' },
-  { key: 'metallic', label: '金属度' },
-  { key: 'ao', label: 'AO' },
-  { key: 'emissive', label: '自发光' },
-  { key: 'checker', label: 'UV 棋盘' }
-];
+interface IesFull { hor: number[]; ver: number[]; cd: number[][]; peak: number; maxPhi: number; maxTheta: number }
 
-let checkerTex: THREE.Texture | null = null;
-function makeChecker() {
-  if (checkerTex) return checkerTex;
-  const c = document.createElement('canvas');
-  c.width = c.height = 1024;
-  const g = c.getContext('2d')!;
-  const n = 8, s = 1024 / n;
-  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
-    g.fillStyle = (x + y) % 2 ? '#202020' : '#e6e6e6';
-    g.fillRect(x * s, y * s, s, s);
+/** 解析 IESNA：保留完整 水平角 × 垂直角 candela 网格（不做任何平均） */
+export function parseIesFull(text: string): IesFull | null {
+  try {
+    const clean = text.replace(/\r/g, '');
+    const tiltIdx = clean.indexOf('TILT=');
+    let body = clean;
+    if (tiltIdx >= 0) {
+      const nl = clean.indexOf('\n', tiltIdx);
+      body = clean.slice(nl + 1);
+      if (/TILT=INCLUDE/i.test(clean.slice(tiltIdx, nl))) {
+        // TILT=INCLUDE: lamp count / tilt angle count / angles / factors —— 粗跳过 4 行
+        body = body.split('\n').slice(4).join('\n');
+      }
+    }
+    const nums = (body.match(/-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g) || []).map(Number);
+    if (nums.length < 12) return null;
+    let i = 0;
+    i += 1; // num lamps
+    i += 1; // lumens per lamp
+    const multi = nums[i++] || 1;
+    const nVer = nums[i++];
+    const nHor = nums[i++];
+    i += 8; // photometric type / units / width / length / height + ballast / future / watts
+    if (!nVer || !nHor || nums.length < i + nVer + nHor + nVer * nHor) return null;
+    const ver = nums.slice(i, i + nVer); i += nVer;
+    const hor = nums.slice(i, i + nHor); i += nHor;
+    const flat = nums.slice(i, i + nVer * nHor);
+    const cd: number[][] = [];
+    let peak = 0;
+    for (let v = 0; v < nVer; v++) {
+      const row: number[] = [];
+      for (let h = 0; h < nHor; h++) {
+        const val = (flat[v * nHor + h] || 0) * multi;
+        row.push(val);
+        if (val > peak) peak = val;
+      }
+      cd.push(row);
+    }
+    const maxPhi = (ver[ver.length - 1] || 90) * Math.PI / 180;
+    const maxTheta = Math.max(1e-4, (hor[hor.length - 1] || 90)) * Math.PI / 180;
+    return { hor, ver, cd, peak: Math.max(1e-6, peak), maxPhi, maxTheta };
+  } catch {
+    return null;
   }
-  g.strokeStyle = '#ff3b6b';
-  g.lineWidth = 3;
-  g.strokeRect(1.5, 1.5, 1021, 1021);
-  checkerTex = new THREE.CanvasTexture(c);
-  checkerTex.wrapS = checkerTex.wrapT = THREE.RepeatWrapping;
-  checkerTex.colorSpace = THREE.SRGBColorSpace;
-  checkerTex.anisotropy = 8;
-  return checkerTex;
 }
 
-function channelMaterial(mode: Channel, base: THREE.MeshPhysicalMaterial): THREE.Material {
-  if (mode === 'albedo') {
-    return new THREE.MeshBasicMaterial({
-      map: base.map || null,
-      color: base.map ? 0xffffff : (base.color?.clone?.() || new THREE.Color(0xcccccc))
-    });
+/** 完整 2D IES 贴图：宽度=水平角，高度=垂直角（浮点红通道） */
+function iesDataTexture(ies: IesFull): THREE.DataTexture {
+  const w = ies.hor.length;
+  const h = ies.ver.length;
+  const data = new Uint8Array(w * h);
+  for (let v = 0; v < h; v++) {
+    for (let u = 0; u < w; u++) data[v * w + u] = Math.max(0, Math.min(255, Math.round((ies.cd[v][u] / ies.peak) * 255)));
   }
-  if (mode === 'clay') return new THREE.MeshStandardMaterial({ color: 0xdadada, roughness: 0.55, metalness: 0 });
-  if (mode === 'checker') return new THREE.MeshStandardMaterial({ map: makeChecker(), roughness: 0.6, metalness: 0 });
-  if (mode === 'normal') return new THREE.MeshNormalMaterial();
-  if (mode === 'emissive') {
-    return new THREE.MeshBasicMaterial({ map: base.emissiveMap || null, color: 0xffffff });
-  }
-  const map = mode === 'rough' ? base.roughnessMap : mode === 'metallic' ? base.metalnessMap : base.aoMap;
-  const comp = mode === 'rough' ? 1 : mode === 'metallic' ? 2 : 0;
-  if (!map) return new THREE.MeshStandardMaterial({ color: 0x6f747c, roughness: 1, metalness: 0 });
-  return new THREE.ShaderMaterial({
-    uniforms: { map: { value: map }, comp: { value: comp } },
-    vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
-    fragmentShader: `uniform sampler2D map; uniform int comp; varying vec2 vUv;
-      void main(){
-        vec4 c = texture2D(map, vUv);
-        float v = comp == 0 ? c.r : (comp == 1 ? c.g : c.b);
-        gl_FragColor = vec4(vec3(v), 1.0);
-      }`
-  });
+  const tex = new THREE.DataTexture(data, w, h, THREE.RedFormat, THREE.UnsignedByteType);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
 }
 
-function LightBall({ az, el, onChange }: { az: number; el: number; onChange: (a: number, e: number) => void }) {
-  const drag = useRef(false);
-  const ref = useRef<HTMLDivElement>(null);
-  const update = (e: any) => {
-    const b = ref.current!.getBoundingClientRect();
-    let x = ((e.clientX - b.left) / b.width) * 2 - 1;
-    let y = ((e.clientY - b.top) / b.height) * 2 - 1;
-    const len = Math.hypot(x, y);
-    if (len > 1) { x /= len; y /= len; }
-    onChange(Math.round(x * 90), Math.round(-y * 90));
+/** 把 IES 烘成 360°×N 的极坐标贴图：按文件水平角范围做对称展开，避免象限折叠出四叶草 */
+export function ies360Texture(ies: IesFull): THREE.DataTexture {
+  const W = 360;
+  const H = ies.ver.length;
+  const data = new Uint8Array(W * H);
+  const h0 = ies.hor[0] ?? 0;
+  const h1 = ies.hor[ies.hor.length - 1] ?? 0;
+  const span = Math.abs(h1 - h0);
+  const sample = (row: number[], deg: number) => {
+    const hor = ies.hor;
+    if (!hor.length) return row[0] || 0;
+    if (deg <= hor[0]) return row[0] || 0;
+    if (deg >= hor[hor.length - 1]) return row[hor.length - 1] || 0;
+    for (let k = 0; k < hor.length - 1; k++) {
+      if (deg >= hor[k] && deg <= hor[k + 1]) {
+        const t = (deg - hor[k]) / Math.max(1e-6, hor[k + 1] - hor[k]);
+        return row[k] * (1 - t) + row[k + 1] * t;
+      }
+    }
+    return row[row.length - 1] || 0;
   };
-  return (
-    <div className="lightball" ref={ref}
-      onPointerDown={e => { drag.current = true; (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); update(e); }}
-      onPointerMove={e => { if (drag.current) update(e); }}
-      onPointerUp={() => { drag.current = false; }}>
-      <span className="lb-dot" style={{ left: `${50 + az / 1.8}%`, top: `${50 - el / 1.8}%` }} />
-    </div>
-  );
+  for (let d = 0; d < W; d++) {
+    let t: number;
+    if (span >= 359) {
+      // 0..360 完整分布
+      t = (d - h0 + 720) % 360;
+    } else if (h0 <= 0.001 && h1 >= 179 && h1 <= 181) {
+      // 0..180：两侧对称
+      t = d <= 180 ? d : 360 - d;
+    } else if (h0 <= 0.001 && h1 <= 91) {
+      // 0..90：四象限对称
+      const m = d % 180;
+      t = m <= 90 ? m : 180 - m;
+    } else {
+      // -X..X 或其它：按绝对值镜像
+      const signed = d <= 180 ? d : d - 360;
+      t = Math.abs(signed);
+      if (t > h1) t = h1;
+      if (t < h0) t = h0;
+    }
+    for (let v = 0; v < H; v++) {
+      const val = sample(ies.cd[v], t);
+      data[v * W + d] = Math.max(0, Math.min(255, Math.round((val / ies.peak) * 255)));
+    }
+  }
+  const tex = new THREE.DataTexture(data, W, H, THREE.RedFormat, THREE.UnsignedByteType);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/** 把 IES 逐像素采样注入标准材质（真实配光，不是投影贴图） */
+export function iesMaterial(params: any, uni: any): THREE.MeshStandardMaterial {
+  const mat = new THREE.MeshStandardMaterial(params);
+  mat.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, uni);
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vIesWPos; varying vec3 vIesN;')
+      .replace('#include <beginnormal_vertex>', '#include <beginnormal_vertex>\nvIesN = normalize(mat3(modelMatrix) * objectNormal);')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvIesWPos = (modelMatrix * vec4(transformed,1.0)).xyz;');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', `#include <common>
+        varying vec3 vIesWPos; varying vec3 vIesN;
+        uniform sampler2D uIesTex; uniform vec3 uLightPos; uniform vec3 uIesColor;
+        uniform float uIesIntensity; uniform float uMaxPhi; uniform float uMaxTheta;
+        uniform float uInnerRad; uniform float uOuterRad; uniform float uIesPeak;
+        uniform vec3 uAxis; uniform float uBoth; uniform float uAzOffset;`)
+      .replace('#include <opaque_fragment>', `
+        {
+          vec3 toL = uLightPos - vIesWPos;
+          float d2 = max(0.0001, dot(toL, toL));
+          vec3 L = normalize(toL);
+          for (int k = 0; k < 2; k++) {
+            if (k == 1 && uBoth < 0.5) break;
+            vec3 axis = normalize(uAxis) * (k == 0 ? 1.0 : -1.0);
+            float phi = acos(clamp(dot(-L, axis), -1.0, 1.0));
+            float cut = 1.0 - smoothstep(uInnerRad, uOuterRad, phi);
+            if (phi <= uMaxPhi && cut > 0.0) {
+              vec3 refv = abs(axis.y) > 0.99 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+              vec3 right = normalize(cross(refv, axis));
+              vec3 fwd = normalize(cross(axis, right));
+              float th = atan(dot(L, fwd), dot(L, right));
+              float u = fract((th + 3.14159265) / 6.2831853 + uAzOffset + (k == 1 ? 0.5 : 0.0));
+              float v = clamp(phi / uMaxPhi, 0.0, 1.0);
+              float cd = texture2D(uIesTex, vec2(u, v)).r;
+              float ndl = max(0.0, dot(normalize(vIesN), L));
+              outgoingLight += diffuseColor.rgb * uIesColor * uIesIntensity * cd * ndl * cut / d2;
+            }
+          }
+        }
+        #include <opaque_fragment>`);
+  };
+  mat.userData.iesUni = uni;
+  mat.customProgramCacheKey = () => 'ies-v1';
+  return mat;
 }
 
 export default function Viewer({ asset, onClose, variants, onVariant }:
@@ -120,6 +214,20 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
 
   const [channel, setChannel] = useState<Channel>('beauty');
   const [wire, setWire] = useState(0); // 0 关 / 1 黑 / 2 白
+  const [iesFog, setIesFog] = useState(0.03);
+  const [iesScene, setIesScene] = useState<'studio' | 'wash' | 'cove'>('studio');
+  const [iesDist, setIesDist] = useState(0.25);
+  const [iesInner, setIesInner] = useState(10);
+  const [iesOuter, setIesOuter] = useState(30);
+  const [iesHue, setIesHue] = useState(40);
+  const [iesSat, setIesSat] = useState(0.12);
+  const [iesLight, setIesLight] = useState(0.85);
+  const [iesAim, setIesAim] = useState<'down' | 'up' | 'both'>('down');
+  const [useCct, setUseCct] = useState(true);
+  const [cct, setCct] = useState(6500);
+  const [iesRot, setIesRot] = useState(0);
+  const iesUiRef = useRef({ scene: iesScene, dist: iesDist, inner: iesInner, outer: iesOuter, hue: iesHue, sat: iesSat, light: iesLight, aim: iesAim, useCct, cct, rot: iesRot });
+  iesUiRef.current = { scene: iesScene, dist: iesDist, inner: iesInner, outer: iesOuter, hue: iesHue, sat: iesSat, light: iesLight, aim: iesAim, useCct, cct, rot: iesRot };
   const [uvMode, setUvMode] = useState(false);
   const [split, setSplit] = useState(50);
   const [uvSet, setUvSet] = useState('uv');
@@ -139,6 +247,8 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
   const [exposure, setExposure] = useState(1);
   const [envI, setEnvI] = useState(1);
   const [keyI, setKeyI] = useState(1.5);
+  const keyIRef = useRef(keyI);
+  keyIRef.current = keyI;
   const [az, setAz] = useState(-35);
   const [el, setEl] = useState(25);
   const [hdris, setHdris] = useState<any[]>([]);
@@ -164,6 +274,208 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
   const isModel = asset.type === 'model' || asset.type === 'scene';
   const isHdri = asset.type === 'hdri';
   const isIes = asset.type === 'ies';
+
+  const iesFogRef = useRef(iesFog);
+  iesFogRef.current = iesFog;
+
+  function buildIesWorld() {
+    const a: any = api.current;
+    if (!a?.scene) return;
+    const sc: THREE.Scene = a.scene;
+    const U = iesUiRef.current;
+    if (a.iesWorld) sc.remove(a.iesWorld);
+    if (a.iesTaken) for (const o of a.iesTaken) sc.remove(o);
+
+    const world = new THREE.Group();
+    const taken: THREE.Object3D[] = [];
+    const ies: any = a.iesFull;
+    const outer = Math.min(90, Math.max(0.5, U.outer));
+    const inner = Math.min(outer, Math.max(0, U.inner));
+    const iesUni = {
+      uIesTex: { value: a.iesTex2D },
+      uLightPos: { value: new THREE.Vector3(0, 2.3, 0) },
+      uIesColor: { value: new THREE.Color().setHSL(U.hue / 360, U.sat, U.light ?? 0.85) },
+      uIesIntensity: { value: 0.0025 },
+      uMaxPhi: { value: ies ? ies.maxPhi : Math.PI / 2 },
+      uMaxTheta: { value: ies ? ies.maxTheta : Math.PI / 2 },
+      uIesPeak: { value: ies ? ies.peak : 1 },
+      uIesGain: { value: 2.2 },
+      uAxis: { value: new THREE.Vector3(0, -1, 0) },
+      uBoth: { value: 0 },
+      uAzOffset: { value: 0 },
+      uInnerRad: { value: (inner / 2) * Math.PI / 180 },
+      uOuterRad: { value: (outer / 2) * Math.PI / 180 }
+    };
+    const surfMat = iesMaterial({ color: 0xcccccc, roughness: 0.94, metalness: 0, side: THREE.DoubleSide }, iesUni);
+    const floorMat = surfMat;
+    const wallMat = surfMat;
+    const y = 2.3;
+    const wallZ = 1.2;
+    const coveR = 0.6;
+
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(12, 12), floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    world.add(floor);
+
+    if (U.scene === 'wash' || U.scene === 'cove') {
+      const ceilingY = 3.0;
+      const ceil = new THREE.Mesh(new THREE.PlaneGeometry(12, 12), floorMat);
+      ceil.rotation.x = Math.PI / 2;
+      ceil.position.y = ceilingY;
+      ceil.receiveShadow = true;
+      world.add(ceil);
+      const wallBottom = U.scene === 'cove' ? coveR : 0;
+      const wallH = (ceilingY - (U.scene === 'cove' ? coveR : 0)) - wallBottom;
+      const wall = new THREE.Mesh(new THREE.PlaneGeometry(6, wallH), wallMat);
+      wall.position.set(0, wallBottom + wallH / 2, wallZ);
+      wall.rotation.y = Math.PI; // 墙面朝向房间（-z）
+      wall.receiveShadow = true;
+      world.add(wall);
+      if (U.scene === 'cove') {
+        const segU = 24, segX = 2, xw = 6;
+        const pos: number[] = [];
+        const idx: number[] = [];
+        for (let iu = 0; iu <= segU; iu++) {
+          const ang = (iu / segU) * Math.PI / 2;
+          const py = coveR - coveR * Math.cos(ang);
+          const pz = wallZ - coveR + coveR * Math.sin(ang);
+          for (let ix = 0; ix <= segX; ix++) {
+            pos.push(-xw / 2 + (xw * ix) / segX, py, pz);
+          }
+        }
+        for (let iu = 0; iu < segU; iu++) {
+          for (let ix = 0; ix < segX; ix++) {
+            const a0 = iu * (segX + 1) + ix;
+            const b0 = (iu + 1) * (segX + 1) + ix;
+            idx.push(a0, b0, a0 + 1, a0 + 1, b0, b0 + 1);
+          }
+        }
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+        g.setIndex(idx);
+        g.computeVertexNormals();
+        const cove = new THREE.Mesh(g, wallMat);
+        cove.receiveShadow = true;
+        world.add(cove);
+        // 天花板与墙的圆弧（与地面同半径）
+        const pos2: number[] = [];
+        const idx2: number[] = [];
+        for (let iu = 0; iu <= segU; iu++) {
+          const ang = (iu / segU) * Math.PI / 2;
+          const py = ceilingY - coveR + coveR * Math.sin(ang);
+          const pz = wallZ - coveR + coveR * Math.cos(ang);
+          for (let ix = 0; ix <= segX; ix++) {
+            pos2.push(-xw / 2 + (xw * ix) / segX, py, pz);
+          }
+        }
+        for (let iu = 0; iu < segU; iu++) {
+          for (let ix = 0; ix < segX; ix++) {
+            const a0 = iu * (segX + 1) + ix;
+            const b0 = (iu + 1) * (segX + 1) + ix;
+            idx2.push(a0, b0, a0 + 1, a0 + 1, b0, b0 + 1);
+          }
+        }
+        const g2 = new THREE.BufferGeometry();
+        g2.setAttribute('position', new THREE.Float32BufferAttribute(pos2, 3));
+        g2.setIndex(idx2);
+        g2.computeVertexNormals();
+        const cove2 = new THREE.Mesh(g2, wallMat);
+        cove2.receiveShadow = true;
+        world.add(cove2);
+      }
+    }
+
+    const lightZ = (U.scene === 'wash' || U.scene === 'cove') ? wallZ - Math.max(0.05, U.dist) : 0;
+    const fixtureY = (U.scene === 'wash' || U.scene === 'cove') ? 1.5 : y;
+    const housing = new THREE.MeshStandardMaterial({ color: 0x33373f, roughness: 0.35, metalness: 0.85 });
+    const bulbMat = new THREE.MeshBasicMaterial({ color: 0xfff7e8 });
+    const fixture = new THREE.Group();
+    fixture.position.set(0, fixtureY, lightZ);
+    // 灯具：筒身 + 压圈 + 发光面（可朝上/朝下/双向）
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.15, 0.22, 24), housing);
+    body.castShadow = true; fixture.add(body);
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.135, 0.022, 10, 28), housing);
+    ring.rotation.x = Math.PI / 2; fixture.add(ring);
+    const lensDown = new THREE.Mesh(new THREE.CircleGeometry(0.115, 24), bulbMat);
+    lensDown.rotation.x = -Math.PI / 2; lensDown.position.y = -0.115; fixture.add(lensDown);
+    if (U.aim === 'up' || U.aim === 'both') {
+      const lensUp = new THREE.Mesh(new THREE.CircleGeometry(0.115, 24), bulbMat);
+      lensUp.rotation.x = Math.PI / 2; lensUp.position.y = 0.115; fixture.add(lensUp);
+    }
+    if (U.aim === 'up') {
+      body.rotation.x = Math.PI; ring.rotation.x = -Math.PI / 2;
+      lensDown.rotation.x = Math.PI / 2; lensDown.position.y = 0.115;
+    }
+
+    // 光源位置（IES 逐像素计算用）
+    iesUni.uLightPos.value.set(0, fixtureY, lightZ);
+    const peakRef = ies ? ies.peak : 10000;
+    iesUni.uIesGain.value = 3.4 * Math.min(2.5, Math.max(0.6, Math.sqrt(peakRef / 10000)));
+    a.iesGain = iesUni.uIesGain.value;
+    iesUni.uIesIntensity.value = iesUni.uIesGain.value * Math.max(0.001, keyIRef.current);
+    a.iesUni = iesUni;
+    const color = U.useCct ? kelvinToColor(U.cct) : new THREE.Color().setHSL(U.hue / 360, U.sat, U.light ?? 0.85);
+    iesUni.uIesColor.value.copy(color);
+    // IES 若已覆盖 0..180（上下都有数据），不要再翻转轴向，否则左右会互换
+    // 朝向翻转轴时，方位角整体旋转 180°，光瓣保持在墙的同一侧
+    iesUni.uAxis.value.set(0, U.aim === 'up' ? 1 : -1, 0);
+    iesUni.uBoth.value = U.aim === 'both' ? 1 : 0;
+    iesUni.uAzOffset.value = (U.aim === 'up' ? 0.5 : 0) + (U.rot || 0) / 360;
+    fixture.rotation.y = ((U.rot || 0) * Math.PI) / 180;
+
+    const angle = Math.min(Math.PI / 2, outer * Math.PI / 360);
+    const h = U.aim === 'up' ? 1.2 : Math.max(0.25, fixtureY - 0.12);
+    const rad = Math.tan(angle) * h;
+    const volMat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+      uniforms: { uColor: { value: color.clone() }, uDensity: { value: 0.05 }, uR: { value: Math.max(0.001, rad) }, uH: { value: h / 2 } },
+      vertexShader: 'varying vec3 vL; void main(){ vL = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+      fragmentShader: `
+        uniform vec3 uColor; uniform float uDensity; uniform float uR; uniform float uH; varying vec3 vL;
+        void main(){
+          float t = clamp((vL.y + uH) / (2.0 * uH), 0.0, 1.0);
+          float r = length(vL.xz) / max(0.001, uR * mix(0.12, 1.0, t));
+          float edge = 1.0 - smoothstep(0.25, 1.05, r);
+          float top = smoothstep(0.0, 0.12, t);
+          float falloff = mix(1.0, 0.25, t); // 越靠近地面越淡，避免硬边
+          float a = uDensity * pow(edge, 1.6) * top * falloff;
+          gl_FragColor = vec4(uColor, a);
+        }`
+    });
+    const cone = new THREE.Mesh(new THREE.ConeGeometry(Math.max(0.02, rad), h, 32, 1, true), volMat);
+    if (U.aim === 'up') { cone.rotation.x = Math.PI; cone.position.set(0, h / 2, 0); }
+    else cone.position.set(0, -h / 2, 0);
+    fixture.add(cone);
+
+    world.add(fixture);
+    sc.add(world);
+    floorMat.needsUpdate = true;
+    wallMat.needsUpdate = true;
+    a.iesAmbBase = (U.scene === 'studio') ? 0.1 : 0.55;
+    a.iesScale = (U.scene === 'studio') ? 200 : 60;
+    if (a.iesAmbient) a.iesAmbient.intensity = a.iesAmbBase;
+    a.iesWorld = world;
+    a.iesTaken = taken;
+    a.iesLights = [];
+    a.iesVolMat = volMat;
+    a.iesSpot = null;
+
+    const cam: any = a.camera;
+    const sceneChanged = a.iesShownScene !== U.scene;
+    a.iesShownScene = U.scene;
+    if (cam && sceneChanged) {
+      const c: any = a.ctrl;
+      if (U.scene === 'studio') {
+        cam.position.set(3.0, 2.1, 3.8); cam.lookAt(0, 0.9, 0);
+        if (c) { c.target.set(0, 0.9, 0); c.dist = 4.8; c.yaw = 0.55; c.pitch = 0.22; }
+      } else {
+        // 房间在 -z 一侧，正对墙面
+        cam.position.set(0, 1.2, -2.8); cam.lookAt(0, 1.2, 1.2);
+        if (c) { c.target.set(0, 1.2, 1.2); c.dist = 4.0; c.yaw = Math.PI; c.pitch = 0; }
+      }
+    }
+  }
 
   // ---- scene setup ----
   useEffect(() => {
@@ -204,10 +516,18 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     let raf = 0;
     const loop = () => {
       if (disposed) return;
-      if (api.current.iesSpot) {
+      if (api.current.iesTex || api.current.iesSpot) {
         renderer.toneMappingExposure = ui.current.exposure;
-        api.current.iesSpot.intensity = ui.current.keyI * 200;
-        api.current.iesAmbient.intensity = ui.current.envI * 0.1;
+        try { key.intensity = 0; rim.intensity = 0; } catch { /* ignore */ }
+        const lights = api.current.iesLights || [];
+        for (const l of lights) { if (l && l.isLight) l.intensity = 0; }
+        api.current.iesAmbient.intensity = ui.current.envI * (api.current.iesAmbBase || 0.1);
+        if (scene.fog) (scene.fog as any).density = Math.max(0.0002, iesFogRef.current) * 0.35;
+        if (api.current.iesUni && api.current.iesGain) {
+          api.current.iesUni.uIesIntensity.value = api.current.iesGain * Math.max(0.001, ui.current.keyI);
+        }
+        const vm = api.current.iesVolMat;
+        if (vm?.uniforms?.uDensity) vm.uniforms.uDensity.value = Math.min(0.35, Math.max(0.001, iesFogRef.current) * 2.0);
       } else if (ui.current.hdriId) {
         renderer.toneMappingExposure = 1;
         key.intensity = 0;
@@ -436,38 +756,50 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       }
 
       if (asset.type === 'ies') {
-        const iesFile = findFile(files, '.ies');
-        if (!iesFile) { setError('没有 .ies 文件'); setStatus(''); return; }
+        const iesFile = findFile(files, '.ies', '.ldt');
+        if (!iesFile) { setError('没有 .ies / .ldt 灯光文件'); setStatus(''); return; }
         setStatus('解析 IES…');
-        const iesTex = await new IESLoader().loadAsync(`/api/file/${iesFile.id}`);
+        let full: any = null;
+        try {
+          const txt = await (await fetch(`/api/file/${iesFile.id}`)).text();
+          full = parseIesFull(txt);
+        } catch { /* ignore */ }
+        if (!full) {
+          setError(String(iesFile.rel_path).toLowerCase().endsWith('.ldt')
+            ? '暂时不支持 .ldt 预览（EULUMDAT 解析未实现），请用 .ies 文件'
+            : 'IES 解析失败（文件可能不是 IESNA 格式）');
+          setStatus('');
+          return;
+        }
         renderer.shadowMap.enabled = true;
         renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-        const ground = new THREE.Mesh(
-          new THREE.PlaneGeometry(7, 7),
-          new THREE.MeshStandardMaterial({ color: 0xf4f4f4, roughness: 0.85, metalness: 0 })
-        );
-        ground.rotation.x = -Math.PI / 2;
-        ground.receiveShadow = true;
-        scene.add(ground);
         scene.environment = null;
-        const ambient = new THREE.AmbientLight(0xffffff, 0.06);
+        const ambient = new THREE.AmbientLight(0xffffff, 0.32);
         scene.add(ambient);
-        const spot = new THREE.SpotLight(0xffffff, 200, 0, Math.PI / 8, 0.5, 2);
-        spot.position.set(0, 3.4, 0);
-        spot.target.position.set(0, 0, 0);
-        spot.map = iesTex;
-        spot.castShadow = true;
-        spot.shadow.mapSize.set(1024, 1024);
-        scene.add(spot);
-        scene.add(spot.target);
-        api.current.iesSpot = spot;
         api.current.iesAmbient = ambient;
-        api.current.meshes = [{ mesh: ground, matName: '地面' }];
-        setMatGroups([{ name: '地面', count: 1 }]);
-        camera.position.set(3.4, 2.6, 4.6);
-        camera.lookAt(0, 0.4, 0);
-        ctrl.target.set(0, 0.3, 0);
-        ctrl.dist = 5.4;
+        api.current.iesFull = full;
+        api.current.iesTex2D = ies360Texture(full);
+        api.current.iesTex = api.current.iesTex2D;
+        // 用 IES 实际配光推默认锥角（半角×2 = 全角）
+        let half = full.ver[full.ver.length - 1] || 30;
+        for (let k = 1; k < full.cd.length; k++) {
+          if ((full.cd[k][0] || 0) <= full.peak * 0.1) { half = full.ver[k]; break; }
+        }
+        const defOuter = Math.max(2, Math.min(90, Math.round(half * 2)));
+        const defInner = Math.max(0, Math.min(90, Math.round(half)));
+        setIesOuter(defOuter);
+        setIesInner(defInner);
+        api.current.iesDefInner = defInner;
+        api.current.iesDefOuter = defOuter;
+        try { key.intensity = 0; rim.intensity = 0; } catch { /* ignore */ }
+        scene.fog = new THREE.FogExp2(0x0d0f13, Math.max(0.001, iesFogRef.current));
+        buildIesWorld();
+        api.current.meshes = [];
+        setMatGroups([]);
+        camera.position.set(3.0, 2.1, 3.8);
+        camera.lookAt(0, 1.1, 0);
+        ctrl.target.set(0, 0.9, 0);
+        ctrl.dist = 4.8;
         setStatus('');
         return;
       }
@@ -827,6 +1159,16 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
   // geometry
   useEffect(() => { api.current.setGeom?.(geom); }, [geom, asset.id]);
 
+  useEffect(() => {
+    const sc: any = api.current.scene;
+    if (sc?.fog) sc.fog.density = Math.max(0.001, iesFog);
+  }, [iesFog]);
+
+  useEffect(() => {
+    if (api.current.iesTex) buildIesWorld();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [iesScene, iesDist, iesInner, iesOuter, iesHue, iesSat, iesLight, iesAim, useCct, cct, iesRot]);
+
   // wireframe overlay
   useEffect(() => {
     const meshes = api.current.meshes || [];
@@ -1079,7 +1421,46 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
 
         <aside className={'vx-panel' + (isHdri ? ' minimal' : '')}>
           <div className={'vp-sec' + (hdriId ? ' off' : '')}>
-            <div className="vp-t">光照 {hdriId ? '（HDRI 接管）' : isIes ? '（IES 射灯）' : ''}</div>
+            <div className="vp-t">{isIes ? '场景' : '光照'} {hdriId ? '（HDRI 接管）' : ''}</div>
+            {isIes && (
+              <div className="vp-row" style={{ flexWrap: 'wrap', height: 'auto' }}>
+                <span>类型</span>
+                {([['studio', '地面'], ['wash', '洗墙'], ['cove', '无影墙']] as const).map(([k, label]) => (
+                  <button key={k} className={'btn tiny' + (iesScene === k ? ' primary' : '')} onClick={() => {
+                    setIesScene(k);
+                    // 进入洗墙/无影墙：正面平视、无雾、射灯参数回默认
+                    setIesFog(k === 'studio' ? 0.03 : 0);
+                    setIesDist(0.25);
+                    setIesInner(api.current.iesDefInner ?? 10);
+                    setIesOuter(api.current.iesDefOuter ?? 30);
+                    setKeyI(1.5);
+                    setIesHue(40);
+                    setIesSat(0.12);
+                    setIesLight(0.85);
+                  }}>{label}</button>
+                ))}
+              </div>
+            )}
+            {isIes && (
+              <div className="vp-row" style={{ flexWrap: 'wrap', height: 'auto' }}>
+                <span>朝向</span>
+                {([['down', '向下'], ['up', '向上'], ['both', '双向']] as const).map(([k, label]) => (
+                  <button key={k} className={'btn tiny' + (iesAim === k ? ' primary' : '')} onClick={() => setIesAim(k)}>{label}</button>
+                ))}
+              </div>
+            )}
+            {isIes && (
+              <div className="vp-row"><span>旋转</span>
+                <input type="range" min={0} max={360} step={1} value={iesRot} onChange={e => setIesRot(Number(e.target.value))} />
+                <NumField value={iesRot} step={1} min={0} max={360} digits={0} width={54} reset={0} onChange={setIesRot} />
+              </div>
+            )}
+            {isIes && iesScene !== 'studio' && (
+              <div className="vp-row"><span>灯距墙</span>
+                <input type="range" min={0.02} max={1} step={0.01} value={iesDist} onChange={e => setIesDist(Number(e.target.value))} />
+                <NumField value={iesDist} step={0.01} min={0} max={5} digits={2} width={54} reset={0.25} onChange={setIesDist} />
+              </div>
+            )}
             <div className="vp-row"><span>曝光</span>
               <input type="range" min={0.2} max={2.5} step={0.05} value={exposure} onChange={e => setExposure(Number(e.target.value))} />
               <NumField value={exposure} step={0.05} min={0.1} max={4} width={54} reset={1} onChange={setExposure} />
@@ -1088,19 +1469,73 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               <input type="range" min={0} max={2} step={0.05} value={envI} onChange={e => setEnvI(Number(e.target.value))} />
               <NumField value={envI} step={0.05} min={0} max={3} width={54} reset={1} onChange={setEnvI} />
             </div>
-            <div className="vp-row"><span>{isIes ? '强度' : '主光'}</span>
+            {!isIes && (<div className="vp-row"><span>主光</span>
               <input type="range" min={0} max={4} step={0.05} value={keyI} onChange={e => setKeyI(Number(e.target.value))} />
               <NumField value={keyI} step={0.05} min={0} max={8} width={54} reset={1.5} onChange={setKeyI} />
-            </div>
-            <div className="vp-lightrow">
+            </div>)}
+            {isIes && (
+              <div className="vp-row"><span>雾气</span>
+                <input type="range" min={0} max={0.2} step={0.002} value={iesFog} onChange={e => setIesFog(Number(e.target.value))} />
+                <NumField value={iesFog} step={0.002} min={0} max={1} digits={3} width={54} reset={0.03} onChange={setIesFog} />
+              </div>
+            )}
+            {!isIes && (<div className="vp-lightrow">
               <LightBall az={az} el={el} onChange={(a, e) => { setAz(a); setEl(e); }} />
               <div className="vp-lightnum">
                 <div>水平 <b>{az}°</b></div>
                 <div>俯仰 <b>{el}°</b></div>
                 <div className="hint">拖动球面调整主光方向</div>
               </div>
-            </div>
+            </div>)}
           </div>
+
+          {isIes && (<div className="vp-sec">
+            <div className="vp-t">射灯</div>
+            <div className="vp-row"><span>强度</span>
+              <input type="range" min={0} max={4} step={0.05} value={keyI} onChange={e => setKeyI(Number(e.target.value))} />
+              <NumField value={keyI} step={0.05} min={0} max={1000000} width={54} reset={1.5} onChange={setKeyI} />
+            </div>
+            <div className="vp-row"><span>外锥角</span>
+              <input type="range" min={1} max={90} step={0.5} value={iesOuter}
+                onChange={e => { const v = Math.min(90, Number(e.target.value)); setIesOuter(v); setIesInner(i => Math.min(i, v)); }} />
+              <NumField value={iesOuter} step={1} min={0} max={90} digits={0} width={54} reset={30}
+                onChange={v => { const x = Math.min(90, Math.max(0, v)); setIesOuter(x); setIesInner(i => Math.min(i, x)); }} />
+            </div>
+            <div className="vp-row"><span>内锥角</span>
+              <input type="range" min={0} max={Math.min(90, iesOuter)} step={0.5} value={iesInner}
+                onChange={e => setIesInner(Math.min(iesOuter, Math.max(0, Number(e.target.value))))} />
+              <NumField value={iesInner} step={1} min={0} max={90} digits={0} width={54} reset={10}
+                onChange={v => setIesInner(Math.min(iesOuter, Math.max(0, v)))} />
+            </div>
+            <div className="vp-row">
+              <label className="vp-check" onClick={() => setUseCct(v => !v)}>
+                <span className={'box' + (useCct ? ' on' : '')}>{useCct ? '✓' : ''}</span>使用色温
+              </label>
+            </div>
+            {useCct ? (
+              <div className="vp-row"><span>色温 K</span>
+                <input type="range" min={2000} max={12000} step={100} value={cct} onChange={e => setCct(Number(e.target.value))} />
+                <NumField value={cct} step={100} min={1000} max={40000} digits={0} width={64} reset={6500} onChange={setCct} />
+              </div>
+            ) : (<>
+            <div className="vp-row"><span>色相</span>
+              <input type="range" min={0} max={360} step={1} value={iesHue} onChange={e => setIesHue(Number(e.target.value))} />
+              <NumField value={iesHue} step={1} min={0} max={360} digits={0} width={54} reset={40} onChange={setIesHue} />
+            </div>
+            <div className="vp-row"><span>饱和度</span>
+              <input type="range" min={0} max={100} step={1} value={Math.round(iesSat * 100)} onChange={e => setIesSat(Number(e.target.value) / 100)} />
+              <NumField value={Math.round(iesSat * 100)} step={1} min={0} max={100} digits={0} width={54} reset={12} onChange={v => setIesSat(Math.min(1, Math.max(0, v / 100)))} />
+            </div>
+            <div className="vp-row"><span>明度</span>
+              <input type="range" min={0} max={100} step={1} value={Math.round(iesLight * 100)} onChange={e => setIesLight(Number(e.target.value) / 100)} />
+              <NumField value={Math.round(iesLight * 100)} step={1} min={0} max={100} digits={0} width={54} reset={85} onChange={v => setIesLight(Math.min(1, Math.max(0, v / 100)))} />
+            </div>
+            <div className="vp-row"><span>色块</span>
+              <span style={{ width: 46, height: 18, borderRadius: 4, border: '1px solid var(--line)', background: `hsl(${iesHue} ${Math.round(iesSat * 100)}% ${Math.round(iesLight * 100)}%)` }} />
+            </div>
+            </>)}
+          </div>
+          )}
 
           {!isIes && (<div className="vp-sec">
             <div className="vp-t">HDRI 照明</div>
@@ -1167,7 +1602,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
             ))}
             {shownTex.length === 0 && <div className="hint">没有识别到贴图</div>}
           </div>)}
-          <div className="vp-sec">
+          {!isIes && (<div className="vp-sec">
             <div className="vp-t">显示</div>
             <div className="vp-row"><span>线框</span>
               <button className="btn tiny" onClick={() => setWire(w => (w + 1) % 3)}>
@@ -1177,7 +1612,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
             <div className="vp-row"><span>视图</span>
               <button className={'btn tiny' + (uvMode ? ' primary' : '')} onClick={() => setUvMode(v => !v)}>UV 分屏</button>
             </div>
-          </div>
+          </div>)}
         </aside>
       </div>
 

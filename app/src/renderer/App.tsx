@@ -14,8 +14,7 @@ const TYPES = [
   { key: 'texture', label: '贴图' },
   { key: 'drawing', label: '图纸' },
   { key: 'hdri', label: 'HDRI' },
-  { key: 'ies', label: 'IES' },
-  { key: 'scene', label: '场景' }
+  { key: 'ies', label: 'IES' }
 ];
 
 const THEMES = ['dark', 'light'];
@@ -48,11 +47,12 @@ function Stars({ value, onChange }: { value: number; onChange?: (v: number) => v
 
 const isImgPath = (p: string) => /\.(png|jpe?g|webp|gif|bmp|tiff?|tga)$/i.test(p);
 
-function FileCard({ f, active, onOpen, onCtx, onZoom }: { f: any; active?: boolean; onOpen: () => void; onCtx?: (e: any) => void; onZoom?: () => void }) {
+function FileCard({ f, active, onOpen, onCtx, onZoom, onDragStart }: { f: any; active?: boolean; onOpen: () => void; onCtx?: (e: any) => void; onZoom?: () => void; onDragStart?: (e: any) => void }) {
   const name = String(f.rel_path).split('/').pop() || '';
   const ext = (name.split('.').pop() || '').toUpperCase();
   return (
-    <article className={'card filecard' + (active ? ' on' : '')} onClick={onOpen} onContextMenu={onCtx} onDoubleClick={onZoom} title={f.rel_path}>
+    <article className={'card filecard' + (active ? ' on' : '')} onClick={onOpen} onContextMenu={onCtx} onDoubleClick={onZoom}
+      draggable={!!onDragStart} onDragStart={onDragStart} title={f.rel_path}>
       <div className="thumb" style={{ background: '#1b1f26' }}>
         {isImgPath(f.rel_path)
           ? (isSpecialImage(f.rel_path)
@@ -75,8 +75,6 @@ function Card({ a, active, thumbVer, onSelect, onOpen, onCtx, onZoom, issue, chi
       <div className="thumb" style={{ background: PLACEHOLDER[a.type] || PLACEHOLDER.other }}>
         {(a as any).img_file_id && isSpecialImage(a.ext || '') ? (
           <SmartImage fileId={(a as any).img_file_id} path={a.ext || ''} />
-        ) : (a.type === 'hdri' || /\.(hdr|exr)$/i.test(a.ext || '')) ? (
-          <div className="fextbig">{(a.ext || 'hdr').replace('.', '').toUpperCase()}</div>
         ) : ((a as any).has_image || a.preview_rel) && !broken ? (
           <img src={`/api/thumb/${a.id}?v=${encodeURIComponent((a as any).preview_rel || (a as any).thumb_file || '')}&r=${thumbVer || 0}`} loading="lazy" alt=""
             onDoubleClick={e => { e.stopPropagation(); onZoom?.(`/api/thumb/${a.id}?v=${encodeURIComponent((a as any).preview_rel || (a as any).thumb_file || '')}&r=${thumbVer || 0}`); }}
@@ -200,6 +198,11 @@ export default function App() {
   const lastMeta = useRef('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [mcpInfo, setMcpInfo] = useState<any>(null);
+  const [wsInfo, setWsInfo] = useState<any>(null);
+  const [hdriAsk, setHdriAsk] = useState<{ asset: Asset } | null>(null);
+  const [hdriEnv, setHdriEnv] = useState(true);
+  const [hdriVp, setHdriVp] = useState(true);
+  const [wsPrompt, setWsPrompt] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<any>(null);
   const [updateStatus, setUpdateStatus] = useState('');
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -263,6 +266,7 @@ export default function App() {
   const [orgRows, setOrgRows] = useState<any[]>([]);
   const [orgBusy, setOrgBusy] = useState(false);
   const [orgLog, setOrgLog] = useState<string[]>([]);
+  const [orgShrinkBusy, setOrgShrinkBusy] = useState(false);
   const [dropActive, setDropActive] = useState(false);
   const [importing, setImporting] = useState(false);
   const [importLog, setImportLog] = useState<string[]>([]);
@@ -486,6 +490,24 @@ export default function App() {
   useEffect(() => {
     if (settingsOpen) api('/api/mcp/status').then(setMcpInfo).catch(() => {});
   }, [settingsOpen]);
+
+  useEffect(() => {
+    api('/api/workspace').then(r => { setWsInfo(r); if (!r.isSet) setWsPrompt(true); }).catch(() => {});
+  }, []);
+
+  async function chooseWorkspace() {
+    const wapi = (window as any).amApi;
+    const dir = wapi?.pickFolder ? await wapi.pickFolder() : '';
+    if (!dir) return;
+    const r = await api('/api/workspace', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: dir })
+    });
+    if (r?.error) { showToast('设置工作区失败：' + r.error, 'err'); return; }
+    setWsInfo({ ...r, isSet: true });
+    setWsPrompt(false);
+    showToast('工作区已设为 ' + r.path + '（旧文件已迁移）', 'ok');
+  }
 
   async function setMcp(patch: any) {
     const r = await api('/api/mcp/settings', {
@@ -832,9 +854,79 @@ export default function App() {
   async function openOrganize() {
     if (!lib) return;
     setOrgOpen(true); setOrgRows([]); setOrgLog([]); setOrgBusy(true);
-    const r = await api(`/api/organize/plan?lib=${lib}`);
+    const r = await api(`/api/organize/plan?lib=${lib}&dir=${encodeURIComponent(dir)}`);
     setOrgRows(r.rows || []);
     setOrgBusy(false);
+  }
+
+  function loadImg(src: string) {
+    return new Promise<HTMLImageElement>((res, rej) => {
+      const im = new Image();
+      im.onload = () => res(im);
+      im.onerror = rej;
+      im.src = src;
+    });
+  }
+
+  /** 压缩当前目录（含子目录）的过大预览图（≤1024），并生成 512 网格缩略图（解决 HDRI 列表卡顿） */
+  async function shrinkPreviews() {
+    if (!lib) return [] as string[];
+    setOrgShrinkBusy(true);
+    try {
+      const r = await api(`/api/previews?lib=${lib}&dir=${encodeURIComponent(dir)}`).catch(() => ({ previews: [] }));
+      const list: any[] = r.previews || [];
+      const logs: string[] = [];
+      const toPng = (cv: HTMLCanvasElement) => new Promise<Blob>(res => cv.toBlob(b => res(b!), 'image/png', 0.92));
+      for (const p of list) {
+        try {
+          const im = await loadImg(`/api/file/${p.fid}?v=${Date.now()}`);
+          const mx = Math.max(im.naturalWidth, im.naturalHeight);
+          let base: HTMLCanvasElement | null = null;
+          let sized = `${im.naturalWidth}×${im.naturalHeight}`;
+          if (mx > 1024) {
+            const k = 1024 / mx;
+            base = document.createElement('canvas');
+            base.width = Math.max(1, Math.round(im.naturalWidth * k));
+            base.height = Math.max(1, Math.round(im.naturalHeight * k));
+            base.getContext('2d')!.drawImage(im, 0, 0, base.width, base.height);
+            const isPng = /\.png$/i.test(String(p.preview_rel));
+            const blob: Blob = await new Promise(r2 => base!.toBlob(b => r2(b!), isPng ? 'image/png' : 'image/jpeg', 0.9));
+            const w = await fetch(`/api/preview/write/${p.fid}`, { method: 'POST', headers: { 'content-type': blob.type }, body: blob });
+            if (!w.ok) throw new Error('写入失败');
+            sized += ` → ${base.width}×${base.height}`;
+          }
+          // 512 网格缩略图（懒加载用，避免 8K/1024 图逐张解码卡顿）
+          if (mx > 512) {
+            const src = base || im;
+            const sw = base ? base.width : im.naturalWidth;
+            const sh = base ? base.height : im.naturalHeight;
+            const k2 = 512 / Math.max(sw, sh);
+            const cv = document.createElement('canvas');
+            cv.width = Math.max(1, Math.round(sw * k2));
+            cv.height = Math.max(1, Math.round(sh * k2));
+            cv.getContext('2d')!.drawImage(src as any, 0, 0, cv.width, cv.height);
+            const blob = await toPng(cv);
+            const dataUrl = await new Promise<string>(res => {
+              const fr = new FileReader();
+              fr.onload = () => res(String(fr.result));
+              fr.readAsDataURL(blob);
+            });
+            await fetch(`/api/thumb/${p.aid}`, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ dataUrl })
+            });
+            sized += '（已生成 512 缩略图）';
+          }
+          logs.push(`✔ ${p.name}：${sized}`);
+        } catch (e: any) {
+          logs.push(`✘ ${p.name}：${String(e?.message || e)}`);
+        }
+      }
+      if (!logs.length) logs.push('当前目录没有预览图。');
+      return logs;
+    } finally {
+      setOrgShrinkBusy(false);
+    }
   }
 
   async function applyOrganize() {
@@ -844,10 +936,11 @@ export default function App() {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ lib, rows: orgRows })
     });
-    setOrgLog([
+    const moveLogs = [
       ...(r.applied || []).map((x: any) => `✔ ${x.from}  →  ${x.to}`),
       ...(r.failed || []).map((x: any) => `✘ ${x.from}：${x.error}`)
-    ]);
+    ];
+    setOrgLog(moveLogs);
     setOrgRows([]);
     setOrgBusy(false);
     loadAssets(lib); loadMeta(lib);
@@ -924,7 +1017,7 @@ export default function App() {
 
   /** 素材适合哪种发送方式 */
   function sendModeFor(a: Asset): 'import' | 'material' | 'texture' | 'hdri' | null {
-    if (a.type === 'model' || a.type === 'scene') return 'import';
+    if (a.type === 'model') return 'import';
     if (a.type === 'material') return 'material';
     if (a.type === 'texture') return 'texture';
     if (a.type === 'hdri') return 'hdri';
@@ -961,21 +1054,17 @@ export default function App() {
     openSendMenu(a, { x: r.left, y: r.bottom + 4 });
   }
 
-  async function sendToTarget(a: Asset, target: 'max' | 'blender' | 'su', mode?: 'import' | 'material' | 'texture' | 'hdri') {
+  async function sendToTarget(a: Asset, target: 'max' | 'blender' | 'su', mode?: 'import' | 'material' | 'texture' | 'hdri', opts?: { options?: any }) {
     const tName = target === 'blender' ? 'Blender' : target === 'su' ? 'SketchUp' : '3ds Max';
     const online = !!bridge?.targets?.[target]?.connected;
     const m = mode || sendModeFor(a);
     if (!m) { showToast(`这类素材不支持发送到 ${tName}`, 'err'); return; }
-    if (m === 'hdri' && target !== 'su') {
-      showToast('HDRI 只能发给支持环境光的软件（目前是 SketchUp）', 'err');
-      return;
-    }
     const label = m === 'import' ? '导入模型' : m === 'material' ? '创建材质' : m === 'hdri' ? '应用 HDRI' : '发送贴图';
     setBridgeBusy(true);
     try {
       const send = (extra: Record<string, unknown> = {}) => api('/api/bridge/send', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ assetId: a.id, mode: m, target, ...extra })
+        body: JSON.stringify({ assetId: a.id, mode: m, target, ...(opts?.options ? { options: opts.options } : {}), ...extra })
       });
       let r = await send();
 
@@ -1134,8 +1223,8 @@ export default function App() {
     e.preventDefault();
     const absPath = root + '\\' + String(rel).split('/').join('\\');
     const isImage = /\.(png|jpe?g|webp|bmp|tga|tiff?)$/i.test(rel);
-    // 图片素材：直接拖真实文件（PS / 聊天框 / 浏览器上传区都能接）——F-013
-    if (isImage && a.type === 'texture') {
+    // 任何图片都直接拖真实文件（PS / 聊天框 / 浏览器上传区都能接）；模型仍走 .ms；按 Alt 强制 .ms
+    if (isImage && a.type !== 'model' && !e.altKey) {
       const picks = selIds.includes(a.id) && selIds.length > 1 ? selIds : [a.id];
       const files = picks
         .map(id => (id === a.id ? a : assets.find(x => x.id === id)))
@@ -1952,6 +2041,15 @@ export default function App() {
                   onZoom={() => setZoom(isSpecialImage(f.rel_path)
                     ? { fileId: f.id, path: f.rel_path, scale: 1 }
                     : { src: `/api/file/${f.id}`, scale: 1 })}
+                  onDragStart={(e) => {
+                    const am = (window as any).amApi;
+                    if (!am?.startDrag) return;
+                    if (!/\.(png|jpe?g|webp|bmp|tga|tiff?)$/i.test(f.rel_path)) return;
+                    e.preventDefault();
+                    const root = libs.find(l => l.id === lib)?.root || '';
+                    if (!root) return;
+                    am.startDrag({ files: [root + '\\' + String(f.rel_path).split('/').join('\\')] });
+                  }}
                   onCtx={(e) => { e.preventDefault(); setCtx({ kind: 'file', x: e.clientX, y: e.clientY, file: f }); }} />
               ))}
               {files.length === 0 && <div className="empty" style={{ gridColumn: '1 / -1' }}>该目录没有文件</div>}
@@ -2194,12 +2292,17 @@ export default function App() {
             <div className="menu-mask" onMouseDown={() => setSendMenu(null)} />
             <div className="ctxmenu sendsel" style={{ left: sendMenu.x, top: sendMenu.y }}>
               <div className="send-h">发送到… · {mLabel}</div>
-              {SEND_TARGETS.filter(t => !(m === 'hdri' && t.key !== 'su')).map(t => {
+              {SEND_TARGETS.map(t => {
                 const st = bridge?.targets?.[t.key];
                 const online = !!st?.connected;
                 return (
                   <button key={t.key} disabled={bridgeBusy}
-                    onClick={() => { const a = sendMenu.asset; setSendMenu(null); sendToTarget(a, t.key); }}
+                    onClick={() => {
+                      const a = sendMenu.asset;
+                      setSendMenu(null);
+                      if (sendModeFor(a) === 'hdri' && t.key === 'max') { setHdriAsk({ asset: a }); return; }
+                      sendToTarget(a, t.key);
+                    }}
                     title={online
                       ? `${t.label} 已连接${st?.version ? `（插件 v${st.version}）` : ''}`
                       : `${t.label} 未检测到：任务会排队，软件启动后自动执行`}>
@@ -2501,6 +2604,13 @@ export default function App() {
               }}>打开基本体文件夹</button>
               <span className="hint">放入 sphere / box / cylinder / plane 命名的 .glb/.gltf/.obj/.fbx 可替换默认基本体</span>
             </div>
+            <div className="hint">工作区（软件产生的文件都放这里）</div>
+            <div className="uvrow">
+              <span className="hint" style={{ flex: 1, fontSize: 11, wordBreak: 'break-all' }}>
+                {wsInfo?.isSet ? wsInfo.path : '未设置（暂用数据目录）'}
+              </span>
+              <button className="btn" onClick={chooseWorkspace}>选择 / 更改…</button>
+            </div>
             <div className="hint">MCP（AI 客户端接入）</div>
             {mcpInfo ? (
               <>
@@ -2775,7 +2885,8 @@ export default function App() {
           <div className="modal wide" onMouseDown={e => e.stopPropagation()}>
             <div className="modal-t">整理计划 {orgBusy ? '· 处理中…' : `· ${orgRows.length} 项`}</div>
             <div className="hint">
-              规范为「类型根 / 分类 / 规范名」，只移动整个素材目录；目录内含多个素材、或目标已存在时自动跳过。
+              只对当前选择的文件夹（含子文件夹）生效：规范为「类型根 / 分类 / 规范名」，只移动整个素材目录；
+              目录内含多个素材、或目标已存在时自动跳过。
             </div>
             <div className="issues">
               {orgRows.map((r, i) => (
@@ -2797,6 +2908,14 @@ export default function App() {
             {orgLog.length > 0 && <div className="fixlog">{orgLog.map((l, i) => <div key={i}>{l}</div>)}</div>}
             <div className="modal-b">
               <button className="btn" onClick={() => setOrgOpen(false)}>关闭</button>
+              <button className="btn" disabled={orgShrinkBusy} onClick={async () => {
+                setOrgBusy(true);
+                const lines = await shrinkPreviews();
+                setOrgLog(lines);
+                setOrgBusy(false);
+                loadAssets(lib);
+                setThumbVer(v => v + 1);
+              }}>{orgShrinkBusy ? '压缩中…' : '压缩预览图'}</button>
               <button className="btn" disabled={orgBusy} onClick={undoOrganize}>撤销上次</button>
               <button className="btn primary" disabled={orgBusy || !orgRows.some(r => !r.conflict && !r.skip)} onClick={applyOrganize}>
                 执行整理（{orgRows.filter(r => !r.conflict && !r.skip).length}）
@@ -2860,6 +2979,48 @@ export default function App() {
             <div className="modal-b">
               <button className="btn" onClick={() => submitAsk(null)}>取消</button>
               <button className="btn primary" onClick={() => submitAsk(askRef.current?.value ?? '')}>确定</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {hdriAsk && (
+        <div className="modal-mask" onMouseDown={() => setHdriAsk(null)}>
+          <div className="modal" onMouseDown={e => e.stopPropagation()}>
+            <div className="modal-t">位图视口放置 · {hdriAsk.asset.name}</div>
+            <div className="hint">位图文件被放到视口上。将该文件用作</div>
+            <div className="uvrow">
+              <label className="vp-check" onClick={() => setHdriEnv(v => !v)}>
+                <span className={'box' + (hdriEnv ? ' on' : '')}>{hdriEnv ? '✓' : ''}</span>环境贴图
+              </label>
+            </div>
+            <div className="uvrow">
+              <label className="vp-check" onClick={() => setHdriVp(v => !v)}>
+                <span className={'box' + (hdriVp ? ' on' : '')}>{hdriVp ? '✓' : ''}</span>视口背景
+              </label>
+            </div>
+            <div className="modal-b">
+              <button className="btn" onClick={() => setHdriAsk(null)}>取消</button>
+              <button className="btn primary" disabled={!hdriEnv && !hdriVp}
+                onClick={() => { const a = hdriAsk.asset; setHdriAsk(null); sendToTarget(a, 'max', 'hdri', { options: { env: hdriEnv, viewport: hdriVp } }); }}>
+                确定
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {wsPrompt && (
+        <div className="modal-mask">
+          <div className="modal" onMouseDown={e => e.stopPropagation()}>
+            <div className="modal-t">先设定一个工作区</div>
+            <div className="hint">
+              软件运行产生的文件（拖放描述、Su 转换的 GLB、插件副本、自定义基本体等）都会放进工作区，
+              不再往 C 盘临时目录塞。建议放在素材盘（例如 D:\AssetManagerWorkspace）。
+            </div>
+            <div className="modal-b">
+              <button className="btn" onClick={() => setWsPrompt(false)}>稍后（暂用数据目录）</button>
+              <button className="btn primary" onClick={chooseWorkspace}>选择文件夹…</button>
             </div>
           </div>
         </div>

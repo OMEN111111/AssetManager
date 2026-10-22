@@ -690,3 +690,10 @@ input,textarea,select,pre,code,.path,.dpath,.dvalue,.selectable{user-select:text
 .modal.wide{max-height:calc(100vh - 72px);overflow-y:auto;overscroll-behavior:contain}
 .modal.wide::-webkit-scrollbar{width:10px}
 .modal.wide::-webkit-scrollbar-thumb{background:rgba(255,255,255,.16);border-radius:6px}
+/* 灯光颜色色环 */
+.huewrap { display: flex; align-items: center; gap: 10px; }
+.huewheel { position: relative; width: 64px; height: 64px; border-radius: 50%;
+  background: conic-gradient(from 0deg, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);
+  border: 1px solid var(--line); cursor: crosshair; }
+.huedot { position: absolute; width: 10px; height: 10px; border-radius: 50%;
+  border: 2px solid #fff; transform: translate(-50%, -50%); box-shadow: 0 0 0 1px #0006; pointer-events: none; }

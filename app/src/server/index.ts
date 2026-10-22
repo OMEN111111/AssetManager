@@ -65,6 +65,21 @@ function saveMcpCfg(patch: any) {
   fs.writeFileSync(MCP_CFG_FILE, JSON.stringify(next, null, 2), 'utf8');
   return next;
 }
+// ---------------------------------------------------------------- 工作区（F-012）
+const WS_FILE = path.join(DATA_DIR, 'workspace.json');
+function wsCfg(): { path: string } {
+  try { return { path: String((JSON.parse(fs.readFileSync(WS_FILE, 'utf8')) || {}).path || '') }; }
+  catch { return { path: '' }; }
+}
+function wsBase() { return wsCfg().path || DATA_DIR; }
+function wsPath(...parts: string[]) { return path.join(wsBase(), ...parts); }
+function setWsPath(p: string) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(WS_FILE, JSON.stringify({ path: p }, null, 2), 'utf8');
+  process.env.AM_WORKSPACE = wsBase();
+}
+process.env.AM_WORKSPACE = wsBase();
+
 const MCP_STDIO_SRC = `#!/usr/bin/env node
 // AssetManager MCP stdio 代理：把 stdio 的 JSON-RPC 转发到本地 HTTP /mcp
 const url = process.env.AM_MCP_URL || 'http://127.0.0.1:${process.env.PORT || 8787}/mcp';
@@ -466,11 +481,12 @@ function sanitizeName(n: string) {
     .slice(0, 80) || 'Asset';
 }
 
-function organizePlan(lib: number) {
+function organizePlan(lib: number, dir = '') {
   const libRow = db.prepare('SELECT root FROM libraries WHERE id=?').get(lib) as any;
   if (!libRow) return { rows: [] };
   const root = libRow.root;
-  const assets = db.prepare('SELECT id,name,type,rel_dir FROM assets WHERE library_id=?').all(lib) as any[];
+  const assets = (db.prepare('SELECT id,name,type,rel_dir FROM assets WHERE library_id=?').all(lib) as any[])
+    .filter(a => !dir || a.rel_dir === dir || String(a.rel_dir).startsWith(dir + '/'));
   const dirCount = new Map<string, number>();
   for (const a of assets) dirCount.set(a.rel_dir, (dirCount.get(a.rel_dir) || 0) + 1);
 
@@ -649,7 +665,7 @@ function assetQuery(url: URL) {  const lib = Number(url.searchParams.get('lib') 
   }
   if (url.searchParams.get('fav') === '1') where.push('favorite = 1');
   if (url.searchParams.get('missingThumb') === '1') {
-    where.push("type IN ('material','model','scene') AND preview_rel IS NULL AND thumb_file IS NULL");
+    where.push("type IN ('material','model') AND preview_rel IS NULL AND thumb_file IS NULL");
   }
   const tag = Number(url.searchParams.get('tag') || 0);
   if (tag) {
@@ -765,6 +781,43 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   // ---------------- DCC 桥接（3ds Max 优先） ----------------
   if (p === '/api/bridge/status') {
     return json(res, 200, { ...bridgeStatus(db), port: PORT });
+  }
+
+  if (p === '/api/workspace') {
+    const c = wsCfg();
+    if (req.method === 'GET') return json(res, 200, { path: c.path, isSet: !!c.path, base: wsBase() });
+    const b = await body(req);
+    const want = String(b.path || '').trim();
+    if (!want) return json(res, 400, { error: '路径为空' });
+    if (!path.isAbsolute(want)) return json(res, 400, { error: '需要绝对路径' });
+    const oldBase = wsBase();
+    const oldLibs = (db.prepare('SELECT root FROM libraries').all() as any[]).map(r => String(r.root).toLowerCase());
+    if (oldLibs.some(r => want.toLowerCase().startsWith(r))) return json(res, 400, { error: '工作区不能放在素材库目录内' });
+    try {
+      fs.mkdirSync(want, { recursive: true });
+      // 迁移旧目录（仅迁移本软件生成的分类目录，不碰其它文件）
+      const subs = [['cache', 'converted'], ['plugins'], ['geometry']];
+      for (const parts of subs) {
+        const from = path.join(oldBase, ...parts);
+        const to = path.join(want, ...parts);
+        if (!fs.existsSync(from) || from === to) continue;
+        try {
+          fs.mkdirSync(path.dirname(to), { recursive: true });
+          fs.cpSync(from, to, { recursive: true, force: true });
+          fs.rmSync(from, { recursive: true, force: true });
+        } catch { /* 迁移失败就保留旧文件 */ }
+      }
+      setWsPath(want);
+      for (const parts of subs) { try { fs.mkdirSync(path.join(want, ...parts), { recursive: true }); } catch { /* ignore */ } }
+      return json(res, 200, { ok: true, path: want, base: want });
+    } catch (e: any) {
+      return json(res, 500, { error: String(e?.message || e) });
+    }
+  }
+  if (p === '/api/workspace/open' && req.method === 'POST') {
+    const base = wsBase();
+    try { fs.mkdirSync(base, { recursive: true }); } catch { /* ignore */ }
+    return json(res, 200, { ok: true, path: base });
   }
 
   if (p === '/api/mcp/status') {
@@ -897,7 +950,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     } catch { /* 目录不存在 */ }
     // 一并删除软件为 SketchUp 导出的临时 GLB
     try {
-      const dir = path.join(DATA_DIR, 'converted');
+      const dir = wsPath('cache', 'converted');
       for (const name of fs.readdirSync(dir)) {
         if (!/\.glb$/i.test(name)) continue;
         try { fs.unlinkSync(path.join(dir, name)); removedFiles++; } catch { /* ignore */ }
@@ -920,6 +973,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const target = String(b.target || 'max');
     const modelPath = String(b.modelPath || '');
     const convertedFrom = String(b.convertedFrom || '').replace(/[^.\w]/g, '').slice(0, 8);
+  const options = b.options && typeof b.options === 'object' ? b.options : undefined;
     if (!assetId) return json(res, 400, { error: 'assetId required' });
     if (!['import', 'material', 'texture', 'hdri'].includes(mode)) return json(res, 400, { error: '未知的发送模式' });
 
@@ -937,7 +991,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     // 覆盖模型只接受软件自己导出的临时文件（不碰素材目录）
     let override = '';
     if (modelPath) {
-      const dir = path.resolve(DATA_DIR, 'converted');
+      const dir = path.resolve(wsBase(), 'cache', 'converted');
       const abs = path.resolve(modelPath);
       if (!abs.toLowerCase().startsWith(dir.toLowerCase()) || !fs.existsSync(abs)) {
         return json(res, 400, { error: 'modelPath 只接受软件导出的临时 GLB' });
@@ -947,10 +1001,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
 
     const r = override
       ? sendJob(db, assetId, target, mode, {
+          options,
           modelPath: override,
           titleSuffix: convertedFrom ? `（${convertedFrom.replace('.', '').toUpperCase()}→GLB）` : '（→GLB）'
         })
-      : sendJob(db, assetId, target, mode);
+      : sendJob(db, assetId, target, mode, { options });
     if ('error' in r) return json(res, 400, r);
     return json(res, 200, r);
   }
@@ -960,7 +1015,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const assetId = Number(url.searchParams.get('assetId') || 0);
     const raw = String(url.searchParams.get('name') || 'model');
     const safe = raw.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 60) || 'model';
-    const dir = path.join(DATA_DIR, 'converted');
+    const dir = wsPath('cache', 'converted');
     try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
     const file = path.join(dir, `${assetId || 'x'}-${safe}.glb`);
     try {
@@ -1037,7 +1092,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
       } catch { /* ignore */ }
       dir = outDir;
     } else if (which === 'geometry') {
-      const outDir = path.join(DATA_DIR, 'geometry');
+      const outDir = wsPath('geometry');
       try { fs.mkdirSync(outDir, { recursive: true }); } catch { /* ignore */ }
       dir = outDir;
     } else {
@@ -1394,8 +1449,41 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     return json(res, 200, { ok: true, affected: ids.length });
   }
 
+  if (p === '/api/previews') {
+    const lib = Number(url.searchParams.get('lib') || 0);
+    const dir = String(url.searchParams.get('dir') || '');
+    const libRow = db.prepare('SELECT root FROM libraries WHERE id=?').get(lib) as any;
+    if (!libRow) return json(res, 404, { error: 'library not found' });
+    const rows = db.prepare(`SELECT a.id aid, a.name, a.preview_rel, f.id fid, f.size
+      FROM assets a JOIN files f ON f.asset_id=a.id AND f.rel_path=a.preview_rel
+      WHERE a.library_id=?`).all(lib) as any[];
+    const out = rows.filter(r => !dir || r.preview_rel === dir || String(r.preview_rel).startsWith(dir + '/'))
+      .filter(r => /\.(jpe?g|png|webp)$/i.test(String(r.preview_rel)));
+    return json(res, 200, { previews: out });
+  }
+  const mW = p.match(/^\/api\/preview\/write\/(\d+)$/);
+  if (mW && req.method === 'POST') {
+    const fid = Number(mW[1]);
+    const row = db.prepare('SELECT f.rel_path, l.root FROM files f JOIN assets a ON a.id=f.asset_id JOIN libraries l ON l.id=a.library_id WHERE f.id=?').get(fid) as any;
+    if (!row) return json(res, 404, { error: 'file not found' });
+    if (!/\.(jpe?g|png|webp)$/i.test(row.rel_path)) return json(res, 400, { error: 'only image files' });
+    const chunks: Buffer[] = [];
+    let total = 0;
+    await new Promise<void>((resolve, reject) => {
+      req.on('data', (c: Buffer) => { total += c.length; if (total > 40 * 1024 * 1024) { reject(new Error('too large')); req.destroy(); } else chunks.push(c); });
+      req.on('end', () => resolve());
+      req.on('error', reject);
+    });
+    try {
+      fs.writeFileSync(path.join(row.root, row.rel_path), Buffer.concat(chunks));
+      return json(res, 200, { ok: true, bytes: total });
+    } catch (e: any) {
+      return json(res, 500, { error: String(e?.message || e) });
+    }
+  }
+
   if (p === '/api/organize/plan') {
-    return json(res, 200, organizePlan(Number(url.searchParams.get('lib') || 0)));
+    return json(res, 200, organizePlan(Number(url.searchParams.get('lib') || 0), String(url.searchParams.get('dir') || '')));
   }
 
   if (p === '/api/organize/apply' && req.method === 'POST') {
@@ -1510,7 +1598,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   }
 
   if (p === '/api/geometry/list' && req.method === 'GET') {
-    const dir = path.join(DATA_DIR, 'geometry');
+    const dir = wsPath('geometry');
     fs.mkdirSync(dir, { recursive: true });
     const kinds = ['sphere', 'box', 'cylinder', 'plane'];
     const out: any[] = [];
@@ -1529,7 +1617,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   if (p === '/api/geometry/file') {
     const kind = String(url.searchParams.get('kind') || '').toLowerCase();
     if (!['sphere', 'box', 'cylinder', 'plane'].includes(kind)) return json(res, 400, { error: 'bad kind' });
-    const dir = path.join(DATA_DIR, 'geometry');
+    const dir = wsPath('geometry');
     const order = ['.glb', '.gltf', '.obj', '.fbx'];
     let hit = '';
     for (const ext of order) {
@@ -1809,7 +1897,7 @@ http.createServer((req, res) => {
   console.log(`AssetManager API on http://127.0.0.1:${PORT}  db=${DB_FILE}  bridge=${locator || '(locator failed)'}`);
   // 清理上一轮给 SketchUp 导出的临时 GLB（超过 24 小时的）
   try {
-    const dir = path.join(DATA_DIR, 'converted');
+    const dir = wsPath('cache', 'converted');
     const keepMs = 24 * 3600 * 1000;
     for (const name of fs.readdirSync(dir)) {
       const f = path.join(dir, name);

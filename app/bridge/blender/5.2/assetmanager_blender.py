@@ -23,7 +23,7 @@ bl_info = {
     "category": "Import-Export",
 }
 
-BL_VERSION = "0.1.4"
+BL_VERSION = "0.1.5"
 BL_SERIES = "5.2"
 
 # >>> AM_BODY >>> 下面所有 Blender 系列共用；改完用 tools/sync-blender-bridge.mjs 同步到其他系列
@@ -686,6 +686,31 @@ def _import_model(payload):
     return msg
 
 
+def _apply_hdri(payload):
+    files = payload.get("files") or []
+    path = files[0] if files else ""
+    if not path or not os.path.exists(path):
+        raise RuntimeError("HDRI 文件不存在")
+    scene = bpy.context.scene
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new("AssetManager_World")
+    world = scene.world
+    world.use_nodes = True
+    nt = world.node_tree
+    nt.nodes.clear()
+    env = nt.nodes.new("ShaderNodeTexEnvironment")
+    env.image = bpy.data.images.load(path, check_existing=True)
+    bg = nt.nodes.new("ShaderNodeBackground")
+    out = nt.nodes.new("ShaderNodeOutputWorld")
+    try:
+        bg.inputs["Strength"].default_value = float(payload.get("strength", 1.0))
+    except Exception:
+        pass
+    nt.links.new(env.outputs["Color"], bg.inputs["Color"])
+    nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
+    return {"ok": True, "path": path}
+
+
 def _apply_material(payload):
     name = payload.get("assetName") or payload.get("name") or "AssetManager"
     mat, applied = build_material(payload, name)
@@ -773,10 +798,12 @@ def _execute(job):
         return _import_model(payload)
     if mode == "material":
         return _apply_material(payload)
+    if mode == "hdri":
+        return _apply_hdri(payload)
     if mode == "texture":
         return _receive_textures(payload)
     # 本插件只做「从 AssetManager 导入」，回库（pack）与拖放都还没做
-    raise RuntimeError("不支持的任务类型：%s（本插件只支持 import / material / texture）" % mode)
+    raise RuntimeError("不支持的任务类型：%s（本插件只支持 import / material / texture / hdri）" % mode)
 
 
 # ----------------------------------------------------------------- 轮询线程（后台）

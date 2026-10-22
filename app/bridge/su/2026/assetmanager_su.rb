@@ -17,7 +17,7 @@ require 'extensions.rb'
 
 module AssetManager
   # 插件版本（唯一的版本号出处在加载器里，安装器也读这一行）
-  AM_PLUGIN_VERSION = '0.1.1'
+  AM_PLUGIN_VERSION = '0.1.2'
   AM_SERIES = '2026'
 
   AM_ROOT = File.join(File.dirname(__FILE__), 'assetmanager_su') unless defined?(AM_ROOT)

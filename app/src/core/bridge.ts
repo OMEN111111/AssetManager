@@ -13,7 +13,7 @@ import type { DB } from './db.ts';
 /** 插件协议版本（服务端 + .ms 一起改） */
 export const BRIDGE_PROTOCOL = 1;
 /** 插件脚本版本（面板显示；与应用版本保持一致，第三位递增） */
-export const BRIDGE_SCRIPT_VERSION = '0.1.12';
+export const BRIDGE_SCRIPT_VERSION = '0.1.14';
 
 const LEASE_MS = 90_000;
 const CONNECTED_MS = 6000;
@@ -183,7 +183,7 @@ function modelFile(bundle: AssetBundle): FileRow | null {
 }
 
 /** 素材 → 任务载荷（modelOverride：软件临时导出的 GLB 等替代模型文件） */
-export function buildPayload(db: DB, assetId: number, mode: string, modelOverride?: string) {
+export function buildPayload(db: DB, assetId: number, mode: string, modelOverride?: string, options?: any) {
   const bundle = loadBundle(db, assetId);
   if (!bundle) return { error: 'asset not found' as const };
   const a = bundle.asset;
@@ -259,7 +259,11 @@ export function buildPayload(db: DB, assetId: number, mode: string, modelOverrid
         name: String(a.name),
         sourceDir,
         files: envs.map(f => abs(bundle.root, f.rel_path)),
-        paths: envs.map(f => ({ path: abs(bundle.root, f.rel_path), role: f.role }))
+        paths: envs.map(f => ({ path: abs(bundle.root, f.rel_path), role: f.role })),
+        hdriApply: {
+          env: options?.env !== false,
+          viewport: options?.viewport !== false
+        }
       }
     };
   }
@@ -383,7 +387,9 @@ export function writeDropScript(db: DB, assetId: number, appRoot: string) {
   const sourceDir = path.join(bundle.root, String(a.rel_dir));
   const modelPath = m ? abs(bundle.root, m.rel_path) : '';
 
-  const dir = path.join(os.tmpdir(), 'AssetManager', 'drops');
+  const dir = process.env.AM_WORKSPACE
+    ? path.join(process.env.AM_WORKSPACE, 'cache', 'drops')
+    : path.join(os.tmpdir(), 'AssetManager', 'drops');
   let file = path.join(dir, `am-drop-${assetId}.ms`);
   const verbatim = (p: string) => '@"' + String(p).replace(/"/g, '""') + '"';
   const body = [
@@ -436,9 +442,9 @@ function parsePayload(row: any) {
 
 export function sendJob(
   db: DB, assetId: number, target: string, mode: string,
-  opts?: { modelPath?: string; titleSuffix?: string }
+  opts?: { modelPath?: string; titleSuffix?: string; options?: any }
 ) {
-  const b = buildPayload(db, assetId, mode, opts?.modelPath);
+  const b = buildPayload(db, assetId, mode, opts?.modelPath, opts?.options);
   if ('error' in b) return b;
   const now = Date.now();
 

@@ -34,7 +34,7 @@
 */
 
 
-global AMB_SCRIPT_VERSION = "0.1.12"
+global AMB_SCRIPT_VERSION = "0.1.14"
 global AMB_PROTOCOL = 1
 global AMB_LOADED = undefined
 global AMB_PORT = 0
@@ -707,13 +707,59 @@ fn amb_do_material payload = (
   #(true, msg, detail)
 )
 
+
+fn amb_do_hdri payload = (
+  local files = amb_jget payload "files"
+  if files == undefined or files.count == 0 do return #(false, "载荷里没有 HDRI 文件", undefined)
+  local path = files[1] as string
+  if not (doesFileExist path) do return #(false, "HDRI 文件不存在：" + path, undefined)
+  local apply = amb_jget payload "hdriApply"
+  local useEnv = true
+  local useVp = true
+  if apply != undefined do (
+    local e = amb_jget apply "env"
+    local v = amb_jget apply "viewport"
+    if e != undefined do useEnv = (e == true or e == 1 or e == "true")
+    if v != undefined do useVp = (v == true or v == 1 or v == "true")
+  )
+  local msgs = ""
+  local okAny = false
+  -- 3ds Max 2026 没有 sceneEnvironment，环境贴图是全局 environmentMap / useEnvironmentMap
+  if useEnv do (
+    try (
+      local bm = Bitmaptexture()
+      bm.filename = path
+      bm.name = filenameFromPath path
+      environmentMap = bm
+      useEnvironmentMap = true
+      local ok = (environmentMap != undefined)
+      msgs += (if ok then "环境贴图已设置；" else "环境贴图未生效；")
+      okAny = ok
+    ) catch ( msgs += ("环境贴图失败：" + (getCurrentException()) + "；") )
+  )
+  if useVp do (
+    try (
+      backgroundImageFileName = path
+      -- 视口显示背景（Max 2026：DispBkgImage 而不是 viewport.setShowBackground）
+      try (DispBkgImage = true) catch ()
+      try (viewport.DispBkgImage = true) catch ()
+      completeRedraw()
+      redrawViews()
+      msgs += "视口背景已设置；"
+      okAny = true
+    ) catch ( msgs += ("视口背景失败：" + (getCurrentException()) + "；") )
+  )
+  #(okAny, msgs, undefined)
+)
+
 fn amb_exec_job job = (
   local mode = amb_jgets job "mode"
   local payload = amb_jget job "payload"
   if payload == undefined do return #(false, "任务缺少载荷", undefined)
   if mode == "import" then amb_do_import payload
   else if mode == "material" then amb_do_material payload
-  else if mode == "texture" then "贴图导入已移除（只支持模型与材质）"
+  else if mode == "texture" then "贴图导入已移除（只支持模型与材质/HDRI）"
+  else if mode == "hdri" then amb_do_hdri payload
   else #(false, "未知任务类型：" + mode, undefined)
 )
 

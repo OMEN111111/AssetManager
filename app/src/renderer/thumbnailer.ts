@@ -64,6 +64,54 @@ export async function renderThumb(detail: AssetDetail): Promise<string> {
   const scene = baseScene(detail.type === 'model' || detail.type === 'scene');
   const camera = new THREE.PerspectiveCamera(34, 1, 0.05, 100);
 
+  if (detail.type === 'ies') {
+    const f = detail.files.find(x => /\.ies$/i.test(x.rel_path));
+    if (!f) throw new Error('no ies file');
+    const txt = await (await fetch(`/api/file/${f.id}`)).text();
+    const full = parseIesFull(txt);
+    if (!full) throw new Error('ies parse failed');
+    const tex = ies360Texture(full);
+    const sc = new THREE.Scene();
+    sc.background = new THREE.Color(0x0e1013);
+    let half = full.ver[full.ver.length - 1] || 30;
+    for (let k = 1; k < full.cd.length; k++) {
+      if ((full.cd[k][0] || 0) <= full.peak * 0.1) { half = full.ver[k]; break; }
+    }
+    const uni: any = {
+      uIesTex: { value: tex },
+      uLightPos: { value: new THREE.Vector3(0, 1.5, 1.0) },
+      uIesColor: { value: new THREE.Color(0xffffff) },
+      uIesIntensity: { value: 3.0 },
+      uMaxPhi: { value: full.maxPhi },
+      uMaxTheta: { value: full.maxTheta },
+      uIesPeak: { value: full.peak },
+      uIesGain: { value: 3.0 },
+      uInnerRad: { value: (half * Math.PI) / 180 },
+      uOuterRad: { value: (half * 2 * Math.PI) / 360 },
+      uAxis: { value: new THREE.Vector3(0, -1, 0) },
+      uBoth: { value: 0 },
+      uAzOffset: { value: 0 }
+    };
+    const mat = iesMaterial({ color: 0xcccccc, roughness: 0.94, metalness: 0, side: THREE.DoubleSide }, uni);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), mat);
+    floor.rotation.x = -Math.PI / 2; sc.add(floor);
+    const wall = new THREE.Mesh(new THREE.PlaneGeometry(6, 3.2), mat);
+    wall.position.set(0, 1.6, 1.2); wall.rotation.y = Math.PI; sc.add(wall);
+    const ceil = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), mat);
+    ceil.rotation.x = Math.PI / 2; ceil.position.y = 3.2; sc.add(ceil);
+    const fixture = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.14, 0.2, 20), new THREE.MeshStandardMaterial({ color: 0x33373f, metalness: 0.8, roughness: 0.4 }));
+    fixture.add(body);
+    const lens = new THREE.Mesh(new THREE.CircleGeometry(0.1, 20), new THREE.MeshBasicMaterial({ color: 0xfff7e8 }));
+    lens.rotation.x = -Math.PI / 2; lens.position.y = -0.105; fixture.add(lens);
+    fixture.position.set(0, 1.5, 1.0); sc.add(fixture);
+    sc.add(new THREE.AmbientLight(0xffffff, 0.35));
+    const cam = new THREE.PerspectiveCamera(40, 1, 0.05, 100);
+    cam.position.set(0, 1.5, -2.8); cam.lookAt(0, 1.5, 1.2);
+    r.render(sc, cam);
+    return r.domElement.toDataURL('image/png');
+  }
+
   if (detail.type === 'model' || detail.type === 'scene') {
     const f = detail.files.find(x => /\.(fbx|obj|glb|gltf)$/i.test(x.rel_path));
     if (!f) throw new Error('no model file');
