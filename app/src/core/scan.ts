@@ -165,17 +165,21 @@ export function scanLibrary(db: DB, libraryId: number, root: string): ScanResult
   scanState.finishedAt = null;
   scanState.error = null;
 
-  const keep = new Map<string, { rating: number; favorite: number; status: string }>();
-  for (const r of db.prepare('SELECT rel_dir,name,rating,favorite,status FROM assets WHERE library_id=?').all(libraryId) as any[]) {
-    keep.set(`${r.rel_dir}|${r.name}`, { rating: r.rating, favorite: r.favorite, status: r.status });
+  const existing = new Map<string, any>();
+  for (const r of db.prepare('SELECT id,rel_dir,name FROM assets WHERE library_id=?').all(libraryId) as any[]) {
+    existing.set(`${r.rel_dir}|${r.name}`, r);
   }
-
-  db.prepare('DELETE FROM assets WHERE library_id=?').run(libraryId);
 
   const insAsset = db.prepare(`INSERT INTO assets(library_id,rel_dir,name,type,ext,category,size,rating,favorite,preview_rel,status,updated_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const updAsset = db.prepare(`UPDATE assets SET type=?,ext=?,category=?,size=?,preview_rel=?,updated_at=? WHERE id=?`);
   const insFile = db.prepare('INSERT INTO files(asset_id,rel_path,role,slot,size,mtime) VALUES(?,?,?,?,?,?)');
+  const updFile = db.prepare('UPDATE files SET role=?,slot=?,size=?,mtime=? WHERE id=?');
+  const delFile = db.prepare('DELETE FROM files WHERE id=?');
+  const delAsset = db.prepare('DELETE FROM assets WHERE id=?');
+  const selFiles = db.prepare('SELECT id,rel_path FROM files WHERE asset_id=?');
 
+  const seen = new Set<number>();
   let assetCount = 0, fileCount = 0, dirs = 0;
 
   const walk = (absDir: string, relDir: string) => {
@@ -197,11 +201,29 @@ export function scanLibrary(db: DB, libraryId: number, root: string): ScanResult
         for (const s of sets) {
           if (!s.name) continue;
           const k = `${relDir}|${s.name}`;
-          const old = keep.get(k);
-          const info = insAsset.run(libraryId, relDir, s.name, s.type, s.ext, relDir.split('/')[0] ?? null,
-            s.size, old?.rating ?? 0, old?.favorite ?? 0, s.previewRel, old?.status ?? 'ok', Date.now());
-          const assetId = Number(info.lastInsertRowid);
-          for (const f of s.files) insFile.run(assetId, f.rel, f.role, f.slot, f.size, f.mtime);
+          const old = existing.get(k);
+          let assetId: number;
+          if (old) {
+            assetId = Number(old.id);
+            updAsset.run(s.type, s.ext, relDir.split('/')[0] ?? null, s.size, s.previewRel, Date.now(), assetId);
+          } else {
+            const info = insAsset.run(libraryId, relDir, s.name, s.type, s.ext, relDir.split('/')[0] ?? null,
+              s.size, 0, 0, s.previewRel, 'ok', Date.now());
+            assetId = Number(info.lastInsertRowid);
+          }
+          seen.add(assetId);
+
+          // 文件按 rel_path 复用旧 id：重扫不再复用/串到别的素材
+          const oldFiles = new Map<string, number>();
+          for (const r of selFiles.all(assetId) as any[]) oldFiles.set(String(r.rel_path), Number(r.id));
+          const keepPaths = new Set<string>();
+          for (const f of s.files) {
+            keepPaths.add(f.rel);
+            const fid = oldFiles.get(f.rel);
+            if (fid) updFile.run(f.role, f.slot, f.size, f.mtime, fid);
+            else insFile.run(assetId, f.rel, f.role, f.slot, f.size, f.mtime);
+          }
+          for (const [rel, fid] of oldFiles) if (!keepPaths.has(rel)) delFile.run(fid);
           assetCount++;
           fileCount += s.files.length;
         }
@@ -224,6 +246,12 @@ export function scanLibrary(db: DB, libraryId: number, root: string): ScanResult
 
   try {
     walk(root, '');
+
+    // 删除本次扫描中已不存在的素材（含其文件）
+    for (const r of db.prepare('SELECT id FROM assets WHERE library_id=?').all(libraryId) as any[]) {
+      if (!seen.has(Number(r.id))) delAsset.run(Number(r.id));
+    }
+
     const ms = Date.now() - t0;
     db.prepare('UPDATE libraries SET last_scan_at=?, scan_ms=?, asset_count=? WHERE id=?')
       .run(Date.now(), ms, assetCount, libraryId);

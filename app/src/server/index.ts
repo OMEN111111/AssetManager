@@ -255,30 +255,6 @@ function checkLibrary(lib: number) {
       }
     }
 
-    if (a.type === 'model' || a.type === 'scene') {
-      const fbx = (() => {
-        try { return fs.readdirSync(dir).find(n => n.toLowerCase().endsWith('.fbx')); } catch { return undefined; }
-      })();
-      if (fbx) {
-        const st = fs.statSync(path.join(dir, fbx));
-        if (st.size > 24 * 1024 * 1024) { skipped++; }
-        else {
-          const refs = readFbxRefs(path.join(dir, fbx));
-          const here = new Set(listImageFiles(dir).map(n => n.toLowerCase()));
-          const mapsDir = path.join(dir, 'maps');
-          const inMaps = new Set(listImageFiles(mapsDir).map(n => n.toLowerCase()));
-          const missingHere = refs.filter(r => !here.has(r.toLowerCase()) && inMaps.has(r.toLowerCase()));
-          if (missingHere.length) {
-            issues.push({
-              assetId: a.id, name: a.name, type: a.type, kind: 'copy-maps',
-              detail: `${missingHere.length} 张贴图在 maps/ 里，FBX 按同级目录查找`,
-              fix: 'copy-maps', payload: { files: missingHere }
-            });
-          }
-        }
-      }
-    }
-
     if (!a.preview_rel && !a.thumb_file && ['material', 'model', 'scene'].includes(a.type)) {
       issues.push({ assetId: a.id, name: a.name, type: a.type, kind: 'missing-preview', detail: '没有预览图', fix: null });
     }
@@ -1117,7 +1093,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     res.writeHead(200, {
       'content-type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
       'content-length': stat.size,
-      'cache-control': 'public, max-age=3600'
+      'cache-control': 'no-store'
     });
     return fs.createReadStream(file).pipe(res);
   }
@@ -1149,11 +1125,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     if (!a) return json(res, 404, { error: 'not found' });
     const key = `${a.rel_dir}|${a.name}|${a.type}`;
     if (req.method === 'GET') {
-      const rows = db.prepare('SELECT material, channel, file_rel FROM material_overrides WHERE asset_key=?').all(key) as any[];
-      const out: Record<string, Record<string, string>> = {};
+      const rows = db.prepare('SELECT material, channel, file_rel, swizzle FROM material_overrides WHERE asset_key=?').all(key) as any[];
+      const out: Record<string, Record<string, any>> = {};
       for (const r of rows) {
         out[r.material] = out[r.material] || {};
-        out[r.material][r.channel] = r.file_rel;
+        out[r.material][r.channel] = { rel: r.file_rel, swizzle: r.swizzle || 'rgb' };
       }
       return json(res, 200, { overrides: out });
     }
@@ -1162,14 +1138,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
       const material = String(b.material || '').trim();
       const channel = String(b.channel || '').trim();
       const fileRel = b.fileRel ? String(b.fileRel) : '';
+      const swizzle = ['rgb', 'r', 'g', 'b', 'a'].includes(String(b.swizzle || '')) ? String(b.swizzle) : 'rgb';
       if (!material || !channel) return json(res, 400, { error: 'bad request' });
       if (!fileRel) {
         db.prepare('DELETE FROM material_overrides WHERE asset_key=? AND material=? AND channel=?').run(key, material, channel);
       } else {
-        db.prepare(`INSERT INTO material_overrides(asset_key, material, channel, file_rel, updated_at)
-          VALUES(?,?,?,?,?)
-          ON CONFLICT(asset_key, material, channel) DO UPDATE SET file_rel=excluded.file_rel, updated_at=excluded.updated_at`)
-          .run(key, material, channel, fileRel, Date.now());
+        db.prepare(`INSERT INTO material_overrides(asset_key, material, channel, file_rel, swizzle, updated_at)
+          VALUES(?,?,?,?,?,?)
+          ON CONFLICT(asset_key, material, channel) DO UPDATE SET file_rel=excluded.file_rel, swizzle=excluded.swizzle, updated_at=excluded.updated_at`)
+          .run(key, material, channel, fileRel, swizzle, Date.now());
       }
       return json(res, 200, { ok: true });
     }
@@ -1207,6 +1184,22 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     return json(res, 200, { ok: true, file });
   }
 
+  const mHead = p.match(/^\/api\/file-head\/(\d+)$/);
+  if (mHead) {
+    const f = db.prepare('SELECT f.rel_path, l.root FROM files f JOIN assets a ON a.id=f.asset_id JOIN libraries l ON l.id=a.library_id WHERE f.id=?').get(Number(mHead[1])) as any;
+    if (!f) return json(res, 404, { error: 'not found' });
+    const full = path.join(f.root, f.rel_path);
+    try {
+      const fd = fs.openSync(full, 'r');
+      const buf = Buffer.alloc(32);
+      const n = fs.readSync(fd, buf, 0, 32, 0);
+      fs.closeSync(fd);
+      return json(res, 200, { head: buf.slice(0, n).toString('latin1') });
+    } catch {
+      return json(res, 404, { error: 'missing' });
+    }
+  }
+
   const mThumb = p.match(/^\/api\/thumb\/(\d+)$/);
   if (mThumb) {
     const id = Number(mThumb[1]);
@@ -1216,7 +1209,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
       const tf = path.isAbsolute(a.thumb_file) ? a.thumb_file : path.join(DATA_DIR, a.thumb_file);
       if (fs.existsSync(tf)) {
         const st = fs.statSync(tf);
-        res.writeHead(200, { 'content-type': 'image/png', 'content-length': st.size, 'cache-control': 'public, max-age=86400' });
+        res.writeHead(200, { 'content-type': 'image/png', 'content-length': st.size, 'cache-control': 'no-store' });
         return fs.createReadStream(tf).pipe(res);
       }
     }

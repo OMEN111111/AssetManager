@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
+import { assertBinaryFbx } from './fbxcheck';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
@@ -131,6 +132,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
   const [ovOpen, setOvOpen] = useState(false);
   const [ovMatSel, setOvMatSel] = useState('');
   const [ovChSel, setOvChSel] = useState('baseColor');
+  const [ovSwz, setOvSwz] = useState<'rgb' | 'r' | 'g' | 'b' | 'a'>('rgb');
   const [ovFileSel, setOvFileSel] = useState('');
 
   const [exposure, setExposure] = useState(1);
@@ -500,6 +502,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         setStatus('解析模型…');
         let obj: any;
         if (mext === '.fbx') {
+          await assertBinaryFbx(modelFile.id, modelFile.rel_path);
           obj = await new Promise<THREE.Group>((res, rej) => new FBXLoader(manager).load(`/api/file/${modelFile.id}`, res, undefined, rej));
         } else if (mext === '.obj') {
           const mtl = files.find(f => /\.mtl$/i.test(f.rel_path));
@@ -627,13 +630,41 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           if (m) m.needsUpdate = true;
         }
         // F-007：应用手动指定的贴图覆盖（按材质名 + 通道）
-        let ovMap: Record<string, Record<string, string>> = {};
+        let ovMap: Record<string, Record<string, { rel: string; swizzle?: string }>> = {};
         try {
           const r = await fetch(`/api/model/${asset.id}/overrides`).then(x => x.json());
-          ovMap = r?.overrides || {};
+          const raw = r?.overrides || {};
+          for (const [m, chans] of Object.entries<any>(raw)) {
+            ovMap[m] = {};
+            for (const [ch, v] of Object.entries<any>(chans)) {
+              ovMap[m][ch] = typeof v === 'string' ? { rel: v, swizzle: 'rgb' } : v;
+            }
+          }
         } catch { /* ignore */ }
         if (Object.keys(ovMap).length) {
-          const loadOv = (rel: string, srgb: boolean) => new Promise<THREE.Texture>((res, rej) => {
+          const bake = (tex: THREE.Texture, comp: string): THREE.Texture => {
+            const img: any = tex.image;
+            const w = img?.naturalWidth || img?.width || 0;
+            const h = img?.naturalHeight || img?.height || 0;
+            if (!w || !h) return tex;
+            const cv = document.createElement('canvas');
+            cv.width = w; cv.height = h;
+            const c = cv.getContext('2d')!;
+            c.drawImage(img, 0, 0);
+            const d = c.getImageData(0, 0, w, h);
+            const idx = comp === 'r' ? 0 : comp === 'g' ? 1 : comp === 'b' ? 2 : 3;
+            for (let i = 0; i < d.data.length; i += 4) {
+              const v = d.data[i + idx];
+              d.data[i] = v; d.data[i + 1] = v; d.data[i + 2] = v; d.data[i + 3] = 255;
+            }
+            c.putImageData(d, 0, 0);
+            const t = new THREE.CanvasTexture(cv);
+            t.colorSpace = THREE.NoColorSpace;
+            t.wrapS = t.wrapT = THREE.RepeatWrapping;
+            t.anisotropy = 8;
+            return t;
+          };
+          const loadOv = (rel: string, srgb: boolean, swz = 'rgb') => new Promise<THREE.Texture>((res, rej) => {
             const f = files.find(x => String(x.rel_path) === rel);
             const url = f ? `/api/file/${f.id}` : `/api/override-file?assetId=${asset.id}&rel=${encodeURIComponent(rel)}`;
             new THREE.TextureLoader().load(url, t => {
@@ -641,7 +672,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               t.wrapS = THREE.RepeatWrapping;
               t.wrapT = THREE.RepeatWrapping;
               t.anisotropy = 8;
-              res(t);
+              res(swz && swz !== 'rgb' ? bake(t, swz) : t);
             }, undefined, rej);
           });
           for (const c of collected) {
@@ -650,16 +681,18 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
             const baseMat: any = Array.isArray(c.mesh.material) ? c.mesh.material[0] : c.mesh.material;
             if (!baseMat) continue;
             const cl: any = baseMat.clone();
-            for (const [ch, rel] of Object.entries(ov)) {
+            for (const [ch, ent] of Object.entries(ov)) {
               try {
-                if (ch === 'baseColor') cl.map = await loadOv(rel, true);
-                else if (ch === 'normal') cl.normalMap = await loadOv(rel, false);
-                else if (ch === 'roughness') { cl.roughnessMap = await loadOv(rel, false); cl.roughness = 1; }
-                else if (ch === 'metallic') { cl.metalnessMap = await loadOv(rel, false); cl.metalness = 1; }
-                else if (ch === 'ao') cl.aoMap = await loadOv(rel, false);
-                else if (ch === 'emissive') { cl.emissiveMap = await loadOv(rel, true); cl.emissive = new THREE.Color(0xffffff); }
-                else if (ch === 'height') { cl.displacementMap = await loadOv(rel, false); cl.displacementScale = 0.02; }
-                else if (ch === 'opacity') { cl.alphaMap = await loadOv(rel, false); cl.transparent = true; }
+                const rel = ent.rel;
+                const swz = ent.swizzle || 'rgb';
+                if (ch === 'baseColor') cl.map = await loadOv(rel, true, swz);
+                else if (ch === 'normal') cl.normalMap = await loadOv(rel, false, swz);
+                else if (ch === 'roughness') { cl.roughnessMap = await loadOv(rel, false, swz); cl.roughness = 1; }
+                else if (ch === 'metallic') { cl.metalnessMap = await loadOv(rel, false, swz); cl.metalness = 1; }
+                else if (ch === 'ao') cl.aoMap = await loadOv(rel, false, swz);
+                else if (ch === 'emissive') { cl.emissiveMap = await loadOv(rel, true, swz); cl.emissive = new THREE.Color(0xffffff); }
+                else if (ch === 'height') { cl.displacementMap = await loadOv(rel, false, swz); cl.displacementScale = 0.02; }
+                else if (ch === 'opacity') { cl.alphaMap = await loadOv(rel, false, swz); cl.transparent = true; }
               } catch { /* keep original channel */ }
             }
             cl.needsUpdate = true;
@@ -975,7 +1008,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     if (!ovMatSel) return;
     await fetch(`/api/model/${asset.id}/overrides`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ material: ovMatSel, channel: ovChSel, fileRel: ovFileSel })
+      body: JSON.stringify({ material: ovMatSel, channel: ovChSel, fileRel: ovFileSel, swizzle: ovSwz })
     });
     setOvOpen(false);
     setOvVersion(v => v + 1);
@@ -1163,6 +1196,16 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               <select className="sortsel" value={ovChSel} onChange={e => setOvChSel(e.target.value)}>
                 {['baseColor', 'normal', 'roughness', 'metallic', 'ao', 'height', 'emissive', 'opacity'].map(c =>
                   <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div className="uvrow">
+              <label>取通道</label>
+              <select className="sortsel" value={ovSwz} onChange={e => setOvSwz(e.target.value as any)}>
+                <option value="rgb">RGB（彩色原图）</option>
+                <option value="r">R 通道（灰度）</option>
+                <option value="g">G 通道（灰度）</option>
+                <option value="b">B 通道（灰度）</option>
+                <option value="a">A 通道（灰度）</option>
               </select>
             </div>
             <div className="uvrow">

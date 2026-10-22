@@ -6,6 +6,7 @@ import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { buildMaterial, detectConfig } from './matlib';
 import type { AssetDetail } from './types';
+import { assertBinaryFbx } from './fbxcheck';
 
 let renderer: THREE.WebGLRenderer | null = null;
 let envTex: THREE.Texture | null = null;
@@ -24,9 +25,9 @@ function setup() {
   envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 }
 
-function baseScene() {
+function baseScene(white: boolean) {
   const scene = new THREE.Scene();
-  scene.background = null;
+  scene.background = white ? new THREE.Color(0xffffff) : null;
   if (envTex) scene.environment = envTex;
   scene.add(new THREE.AmbientLight(0xffffff, 0.85));
   const key = new THREE.DirectionalLight(0xffffff, 1.5);
@@ -60,7 +61,7 @@ function frameObject(camera: THREE.PerspectiveCamera, obj: THREE.Object3D) {
 export async function renderThumb(detail: AssetDetail): Promise<string> {
   setup();
   const r = renderer!;
-  const scene = baseScene();
+  const scene = baseScene(detail.type === 'model' || detail.type === 'scene');
   const camera = new THREE.PerspectiveCamera(34, 1, 0.05, 100);
 
   if (detail.type === 'model' || detail.type === 'scene') {
@@ -82,6 +83,7 @@ export async function renderThumb(detail: AssetDetail): Promise<string> {
     });
     let obj: THREE.Object3D;
     if (ext === '.fbx') {
+      await assertBinaryFbx(f.id, f.rel_path);
       obj = await new Promise<THREE.Group>((res, rej) => new FBXLoader(manager).load(`/api/file/${f.id}`, res, undefined, rej));
     } else if (ext === '.obj') {
       const mtl = detail.files.find(x => /\.mtl$/i.test(x.rel_path));

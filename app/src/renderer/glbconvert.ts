@@ -11,6 +11,7 @@
  *   Door_001_01   usf=1   raw 242.4 → 2.42 m（门，厘米场景）
  */
 import * as THREE from 'three';
+import { assertBinaryFbx } from './fbxcheck';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
@@ -182,6 +183,8 @@ export async function exportGlbForSketchUp(detail: DetailLike): Promise<GlbExpor
 
   let root: THREE.Object3D;
   if (ext === '.fbx') {
+    const mf = files.find(f => extOf(f.rel_path) === '.fbx');
+    if (mf) await assertBinaryFbx(mf.id, mf.rel_path);
     root = await new Promise<THREE.Group>((res, rej) => new FBXLoader(manager).load(url, res, undefined, rej));
   } else if (ext === '.obj') {
     const mtl = files.find(f => extOf(f.rel_path) === '.mtl');

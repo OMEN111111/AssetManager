@@ -192,13 +192,15 @@ export function buildPayload(db: DB, assetId: number, mode: string, modelOverrid
   // F-007：模型/材质里手动指定的贴图覆盖，优先于自动匹配
   try {
     const key = `${a.rel_dir}|${a.name}|${a.type}`;
-    const ovs = db.prepare('SELECT material, channel, file_rel FROM material_overrides WHERE asset_key=?').all(key) as any[];
+    const ovs = db.prepare('SELECT material, channel, file_rel, swizzle FROM material_overrides WHERE asset_key=?').all(key) as any[];
     for (const r of ovs) {
       if (r.material !== spec.name && r.material !== a.name) continue;
       const ch = String(r.channel);
       const entry: MapEntry = {
         path: abs(bundle.root, r.file_rel),
-        channel: (ch === 'baseColor' || ch === 'emissive' || ch === 'normal') ? 'rgb' : 'r',
+        channel: ['r', 'g', 'b'].includes(String(r.swizzle || ''))
+          ? String(r.swizzle)
+          : ((ch === 'baseColor' || ch === 'emissive' || ch === 'normal') ? 'rgb' : 'r'),
         intensity: ch === 'height' ? 0.04 : 1
       };
       if (ch === 'normal') entry.normalSpace = 'gl';

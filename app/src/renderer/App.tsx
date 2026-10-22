@@ -48,11 +48,11 @@ function Stars({ value, onChange }: { value: number; onChange?: (v: number) => v
 
 const isImgPath = (p: string) => /\.(png|jpe?g|webp|gif|bmp|tiff?|tga)$/i.test(p);
 
-function FileCard({ f, onOpen, onCtx, onZoom }: { f: any; onOpen: () => void; onCtx?: (e: any) => void; onZoom?: () => void }) {
+function FileCard({ f, active, onOpen, onCtx, onZoom }: { f: any; active?: boolean; onOpen: () => void; onCtx?: (e: any) => void; onZoom?: () => void }) {
   const name = String(f.rel_path).split('/').pop() || '';
   const ext = (name.split('.').pop() || '').toUpperCase();
   return (
-    <article className="card filecard" onClick={onOpen} onContextMenu={onCtx} onDoubleClick={onZoom} title={f.rel_path}>
+    <article className={'card filecard' + (active ? ' on' : '')} onClick={onOpen} onContextMenu={onCtx} onDoubleClick={onZoom} title={f.rel_path}>
       <div className="thumb" style={{ background: '#1b1f26' }}>
         {isImgPath(f.rel_path)
           ? (isSpecialImage(f.rel_path)
@@ -66,7 +66,7 @@ function FileCard({ f, onOpen, onCtx, onZoom }: { f: any; onOpen: () => void; on
   );
 }
 
-function Card({ a, active, onSelect, onOpen, onCtx, onZoom, issue, chips, onPick, onDrag, onPress }: { a: Asset; active: boolean; onSelect: (e: any) => void; onOpen: () => void; onCtx?: (e: any) => void; onZoom?: (src: string) => void; issue?: string; chips?: { id: number; label: string }[]; onPick?: (id: number) => void; onDrag?: (e: any) => void; onPress?: () => void }) {
+function Card({ a, active, thumbVer, onSelect, onOpen, onCtx, onZoom, issue, chips, onPick, onDrag, onPress }: { a: Asset; active: boolean; thumbVer?: number; onSelect: (e: any) => void; onOpen: () => void; onCtx?: (e: any) => void; onZoom?: (src: string) => void; issue?: string; chips?: { id: number; label: string }[]; onPick?: (id: number) => void; onDrag?: (e: any) => void; onPress?: () => void }) {
   const [broken, setBroken] = useState(false);
   const badge = (a.ext || '').replace('.', '').toUpperCase();
   return (
@@ -76,8 +76,8 @@ function Card({ a, active, onSelect, onOpen, onCtx, onZoom, issue, chips, onPick
         {(a as any).img_file_id && isSpecialImage(a.ext || '') ? (
           <SmartImage fileId={(a as any).img_file_id} path={a.ext || ''} />
         ) : ((a as any).has_image || a.preview_rel) && !broken ? (
-          <img src={`/api/thumb/${a.id}?v=${encodeURIComponent((a as any).preview_rel || (a as any).thumb_file || '')}`} loading="lazy" alt=""
-            onDoubleClick={e => { e.stopPropagation(); onZoom?.(`/api/thumb/${a.id}?v=${encodeURIComponent((a as any).preview_rel || (a as any).thumb_file || '')}`); }}
+          <img src={`/api/thumb/${a.id}?v=${encodeURIComponent((a as any).preview_rel || (a as any).thumb_file || '')}&r=${thumbVer || 0}`} loading="lazy" alt=""
+            onDoubleClick={e => { e.stopPropagation(); onZoom?.(`/api/thumb/${a.id}?v=${encodeURIComponent((a as any).preview_rel || (a as any).thumb_file || '')}&r=${thumbVer || 0}`); }}
             onError={() => setBroken(true)} />
         ) : null}
         <span className="badge">{badge}</span>
@@ -127,6 +127,7 @@ export default function App() {
   const [cols, setCols] = useState(6);
   const gridRef = useRef<HTMLDivElement>(null);
   const [fileSel, setFileSel] = useState<any | null>(null);
+  const [thumbVer, setThumbVer] = useState(0);
   const [selIds, setSelIds] = useState<number[]>([]);
   const [viewer, setViewer] = useState<AssetDetail | null>(null);
   const [assembler, setAssembler] = useState<AssetDetail | null>(null);
@@ -368,6 +369,7 @@ export default function App() {
       if (lib) {
         await loadAssets(lib);
         await loadMissing(lib);
+        setThumbVer(v => v + 1);
         if (sel && ids.includes(sel.id)) await refreshDetail();
       }
     } catch (e: any) {
@@ -399,6 +401,8 @@ export default function App() {
     }
     setGenMsg(null);
     setGenBusy(false);
+    setThumbVer(v => v + 1);
+    if (lib) await loadAssets(lib);
     showToast(`重新渲染完成：成功 ${ok}/${ids.length}${failed.length ? `，失败 ${failed.length}` : ''}`,
       failed.length ? 'info' : 'ok');
     if (lib) {
@@ -1314,6 +1318,13 @@ export default function App() {
     if (issuesOnly) await refreshIssues();
   }
 
+  async function selectAssetById(id: number) {
+    const d = await api(`/api/asset/${id}`);
+    setSel(d);
+    setSelIds([id]);
+    setFileSel(null);
+  }
+
   async function openFile(f: any) {
     const d = await api(`/api/asset/${f.aid}`);
     setSel(d);
@@ -1913,7 +1924,7 @@ export default function App() {
           {viewMode === 'files' ? (
             <div className="grid">
               {files.map(f => (
-                <FileCard key={f.id} f={f} onOpen={() => openFile(f)}
+                <FileCard key={f.id} f={f} active={fileSel?.id === f.id} onOpen={() => openFile(f)}
                   onZoom={() => setZoom(isSpecialImage(f.rel_path)
                     ? { fileId: f.id, path: f.rel_path, scale: 1 }
                     : { src: `/api/file/${f.id}`, scale: 1 })}
@@ -1926,7 +1937,8 @@ export default function App() {
               {issueAssets.map(a => (
                 <Card key={a.id} a={a} active={false}
                   issue={issueMap.get(a.id)}
-                  onSelect={() => setSelIds([a.id])} onOpen={() => openViewer(a)}
+                  active={selIds.includes(a.id)}
+                  onSelect={() => void selectAssetById(a.id)} onOpen={() => openViewer(a)}
                   onCtx={(e) => { e.preventDefault(); setCtx({ kind: 'asset', x: e.clientX, y: e.clientY, asset: a }); }} />
               ))}
               {issueAssets.length === 0 && <div className="empty" style={{ gridColumn: '1 / -1' }}>没有发现问题的素材</div>}
@@ -1949,7 +1961,7 @@ export default function App() {
                   if (aid) await assignTagTo(tid, [aid]);
                 }}>
                 {displayAssets.map(a => (
-                  <Card key={a.id} a={a} active={selIds.includes(a.id)}
+                  <Card key={a.id} a={a} active={selIds.includes(a.id)} thumbVer={thumbVer}
                     issue={issueMap.get(a.id)}
                     chips={chipsFor(a)}
                     onPick={openVariant}

@@ -116,6 +116,12 @@ export function openDb(file: string): DB {
   if (!cols.some(c => c.name === 'thumb_file')) {
     db.exec('ALTER TABLE assets ADD COLUMN thumb_file TEXT');
   }
+  try {
+    const mc = db.prepare('PRAGMA table_info(material_overrides)').all() as any[];
+    if (mc.length && !mc.some(c => c.name === 'swizzle')) {
+      db.exec('ALTER TABLE material_overrides ADD COLUMN swizzle TEXT');
+    }
+  } catch { /* ignore */ }
   return db;
 }
 
