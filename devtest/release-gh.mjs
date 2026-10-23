@@ -178,7 +178,11 @@ try {
   const list = await api(`/repos/${OWNER}/${REPO}/releases`);
   release = list.find(r => r.tag_name === tagName);
   if (!release) throw new Error('Release 已存在但取不到');
-  console.log('Release 已存在，改为上传附件');
+  await api(`/repos/${OWNER}/${REPO}/releases/${release.id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name: `AssetManager ${version}`, body })
+  });
+  console.log('Release 已存在，已更新说明并替换附件');
 }
 console.log(`Release: ${release.html_url}`);
 

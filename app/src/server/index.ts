@@ -1639,7 +1639,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
         const base = n.replace(/\.[^.]+$/, '').toLowerCase();
         const ext = path.extname(n).toLowerCase();
         if (kinds.includes(base) && ['.glb', '.gltf', '.obj', '.fbx'].includes(ext)) {
-          out.push({ kind: base, file: n, ext, size: fs.statSync(path.join(dir, n)).size });
+          const st = fs.statSync(path.join(dir, n));
+          out.push({ kind: base, file: n, ext, size: st.size, mtime: st.mtimeMs });
         }
       }
     } catch { /* ignore */ }

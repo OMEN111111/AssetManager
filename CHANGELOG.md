@@ -103,6 +103,7 @@
 - 只改了插件与发送入口，**软件版本号不变**（仍为 0.3.8）。
 - 已在 UE 5.7.4 真机跑通 54 项集成断言（`devtest/ue/run-test.ps1`）。
 
+
 ## v0.4.0 — 2026-10-23
 
 ### 新增：Unreal Engine 桥接（插件 0.1.7）
@@ -117,6 +118,9 @@
 - 修复 3D 预览器 `CHANNEL_META is not defined` 导致的预览崩溃（补齐从未 import 的通道/几何/IES 依赖）
 - 打包版从 asar 复制插件目录改用 `copyTreeSafe`（asar 的 fs 垫片不支持 cpSync/lstat）
 - MCP `send_to_dcc` 支持 `ue` 目标与 `ies` 模式
+- 修复材质组装器自定义基本体不生效：放入 `工作区/geometry/box.glb` 后仍显示默认基本体
+  - 原因：只在打开组装器时读一次，并把「文件不存在」永久缓存
+  - 现在按文件 mtime 失效、切回窗口自动重读、组装器新增 **↻ 重载基本体** 按钮；`/api/geometry/list` 返回 mtime
 
 ### 文档
 - README 重写并换用当前界面截图（网格 / 模型预览 / 材质组装器 / IES 灯光 / 插件管理）

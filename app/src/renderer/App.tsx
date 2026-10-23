@@ -2808,7 +2808,7 @@ export default function App() {
                 });
                 if (!r?.ok) showToast(r?.error || '打开失败', 'err');
               }}>打开基本体文件夹</button>
-              <span className="hint">放入 sphere / box / cylinder / plane 命名的 .glb/.gltf/.obj/.fbx 可替换默认基本体</span>
+              <span className="hint">放入 sphere / box / cylinder / plane 命名的 .glb/.gltf/.obj/.fbx 可替换默认基本体；放好后切回软件会自动重载（也可点组装器里的 ↻）</span>
             </div>
             <div className="hint">工作区（软件产生的文件都放这里）</div>
             <div className="uvrow">

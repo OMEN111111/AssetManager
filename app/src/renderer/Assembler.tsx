@@ -19,11 +19,12 @@ const short = (p: string) => p.split(/[\\/]/).pop() || p;
 const geoCache = new Map<string, THREE.BufferGeometry | null>();
 
 /** 从 data/geometry/<kind>.(glb|gltf|obj|fbx) 读取用户自定义基本体 */
-async function loadCustomGeometry(kind: string): Promise<THREE.BufferGeometry | null> {
-  if (geoCache.has(kind)) return geoCache.get(kind)!;
+async function loadCustomGeometry(kind: string, ver = 0): Promise<THREE.BufferGeometry | null> {
+  const key = `${kind}@${ver}`;
+  if (geoCache.has(key)) return geoCache.get(key)!;
   try {
-    const res = await fetch(`/api/geometry/file?kind=${kind}`);
-    if (!res.ok) { geoCache.set(kind, null); return null; }
+    const res = await fetch(`/api/geometry/file?kind=${kind}&v=${ver}`);
+    if (!res.ok) { geoCache.set(key, null); return null; }
     const ext = (res.headers.get('x-ext') || '').toLowerCase();
     const buf = await res.arrayBuffer();
     const url = URL.createObjectURL(new Blob([buf]));
@@ -39,7 +40,7 @@ async function loadCustomGeometry(kind: string): Promise<THREE.BufferGeometry | 
     URL.revokeObjectURL(url);
     let mesh: any = root?.isMesh ? root : null;
     root?.traverse?.((o: any) => { if (!mesh && o.isMesh) mesh = o; });
-    if (!mesh) { geoCache.set(kind, null); return null; }
+    if (!mesh) { geoCache.set(key, null); return null; }
     const g = mesh.geometry.clone();
     g.computeBoundingBox();
     const size = new THREE.Vector3();
@@ -61,10 +62,10 @@ async function loadCustomGeometry(kind: string): Promise<THREE.BufferGeometry | 
       g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
     }
     if (!g.attributes.uv1) g.setAttribute('uv1', g.attributes.uv);
-    geoCache.set(kind, g);
+    geoCache.set(key, g);
     return g;
   } catch {
-    geoCache.set(kind, null);
+    geoCache.set(key, null);
     return null;
   }
 }
@@ -110,6 +111,7 @@ export default function Assembler({ asset, onClose, folderPath }:
   const [planeAxis, setPlaneAxis] = useState<'v' | 'h'>('v');
   const [cylAxis, setCylAxis] = useState<'v' | 'h'>('v');
   const [customKinds, setCustomKinds] = useState<Set<string>>(new Set());
+  const [geoVer, setGeoVer] = useState<Record<string, number>>({});
   const [exposure, setExposure] = useState(1);
   const [uvLink, setUvLink] = useState(true);
   const [envI, setEnvI] = useState(1);
@@ -405,16 +407,29 @@ export default function Assembler({ asset, onClose, folderPath }:
     })();
     return () => { cancelled = true; };
   }, [hdriId, hdriVisible]);
+  // 读取自定义基本体清单；文件被替换（mtime 变化）会自动失效缓存
+  const refreshGeo = async () => {
+    try {
+      const r = await fetch('/api/geometry/list').then(x => x.json());
+      const files = (r.files || []) as any[];
+      setCustomKinds(new Set(files.map(f => f.kind)));
+      const map: Record<string, number> = {};
+      for (const f of files) map[f.kind] = f.mtime || 0;
+      setGeoVer(map);
+      geoCache.clear();
+    } catch { /* ignore */ }
+  };
   useEffect(() => {
-    fetch('/api/geometry/list').then(r => r.json())
-      .then(r => setCustomKinds(new Set(((r.files || []) as any[]).map(f => f.kind))))
-      .catch(() => {});
+    refreshGeo();
+    const onFocus = () => { refreshGeo(); };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
   }, []);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const custom = await loadCustomGeometry(geom);
+      const custom = await loadCustomGeometry(geom, geoVer[geom] || 0);
       if (cancelled) return;
       const ng = custom ? custom.clone() : makeGeometry(geom, planeAxis);
       if (geom === 'cylinder') {
@@ -437,7 +452,7 @@ export default function Assembler({ asset, onClose, folderPath }:
       mesh.geometry = ng;
     })();
     return () => { cancelled = true; };
-  }, [geom, planeAxis, cylAxis]);
+  }, [geom, planeAxis, cylAxis, geoVer[geom]]);
   function triplanar(base: THREE.MeshPhysicalMaterial): THREE.MeshPhysicalMaterial {
     const m = base.clone();
     const prev = base.onBeforeCompile;
@@ -810,6 +825,8 @@ ${nodes.join('\n')}
                   else setGeom(g);
                 }} />
             ))}
+            <button title="重载自定义基本体（往文件夹放入/替换文件后点一下）" className="ci gi-reload"
+              onClick={() => { refreshGeo(); }}>↻</button>
           </div>
           <div className="vxhint">F 聚焦 · 拖动旋转 · 滚轮缩放 · Esc 关闭</div>
         </div>
