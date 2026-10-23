@@ -13,6 +13,7 @@ import {
   installForMax, installInfo, maxStartupDirs, bridgeScriptPath, writeLocator,
   installForBlender, blenderSeries, blenderUserDirs,
   installForSu, suSeries as suPluginSeries, suUserDirs, suInstallInfo,
+  installForUe, ueSeries as uePluginSeries, ueProjects, ueInstallInfo,
   resolvePath, assetInfo, writeDropScript,
   suConvertCheck,
   BRIDGE_PROTOCOL, BRIDGE_SCRIPT_VERSION
@@ -975,7 +976,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const convertedFrom = String(b.convertedFrom || '').replace(/[^.\w]/g, '').slice(0, 8);
   const options = b.options && typeof b.options === 'object' ? b.options : undefined;
     if (!assetId) return json(res, 400, { error: 'assetId required' });
-    if (!['import', 'material', 'texture', 'hdri'].includes(mode)) return json(res, 400, { error: '未知的发送模式' });
+    if (!['import', 'material', 'texture', 'hdri', 'ies'].includes(mode)) return json(res, 400, { error: '未知的发送模式' });
+    if (!['max', 'blender', 'su', 'ue'].includes(target)) return json(res, 400, { error: '未知的发送目标' });
+    if (mode === 'ies' && target !== 'ue') {
+      return json(res, 400, { error: 'IES 配光文件目前只有 Unreal Engine 支持' });
+    }
 
     // SketchUp 读不了的模型格式（FBX/OBJ/PLY）：先让渲染端用 three 转成 GLB 再发
     if (target === 'su' && mode === 'import' && !modelPath) {
@@ -1055,6 +1060,26 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     return json(res, 200, { ...suInstallInfo(APP_ROOT), series: suPluginSeries(APP_ROOT), dirs: suUserDirs() });
   }
 
+  // 一键把 UE 插件装进**用户选中的** UE 工程（按各工程引擎版本挑对应系列）
+  // 必须显式给 projects：不再默认往本机所有最近工程里塞
+  if (p === '/api/bridge/install-ue' && req.method === 'POST') {
+    const b = await body(req);
+    const only = Array.isArray(b?.projects) ? b.projects.map((x: any) => String(x)).filter(Boolean) : [];
+    if (!only.length) {
+      return json(res, 400, { ok: false, error: '请先选择要安装的 UE 工程（projects 为空）' });
+    }
+    return json(res, 200, installForUe(APP_ROOT, only));
+  }
+
+  // 只查不装：包里的 UE 系列 + 本机 UE 工程 + 已装版本
+  if (p === '/api/bridge/ue-where' && req.method === 'GET') {
+    return json(res, 200, {
+      ...ueInstallInfo(APP_ROOT),
+      series: uePluginSeries(APP_ROOT),
+      projects: ueProjects().map(x => ({ name: x.name, file: x.file, engine: x.engine }))
+    });
+  }
+
   if (p === '/api/bridge/test' && req.method === 'POST') {
     const st = bridgeStatus(db);
     const max = (st.targets as any).max;
@@ -1089,6 +1114,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
       const outDir = path.join(DATA_DIR, 'plugins', 'sketchup');
       try {
         copyTree(path.join(APP_ROOT, 'bridge', 'su'), outDir, new Set(['tools', '__pycache__']));
+      } catch { /* ignore */ }
+      dir = outDir;
+    } else if (which === 'ue') {
+      // UE 插件按引擎版本分目录（5.7/ …），整份复制便于手动拷进工程的 Plugins
+      const outDir = path.join(DATA_DIR, 'plugins', 'unreal');
+      try {
+        copyTree(path.join(APP_ROOT, 'bridge', 'ue'), outDir, new Set(['tools', '__pycache__']));
       } catch { /* ignore */ }
       dir = outDir;
     } else if (which === 'geometry') {

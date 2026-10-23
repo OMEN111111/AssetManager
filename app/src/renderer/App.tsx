@@ -202,6 +202,12 @@ export default function App() {
   const [hdriAsk, setHdriAsk] = useState<{ asset: Asset } | null>(null);
   const [hdriEnv, setHdriEnv] = useState(true);
   const [hdriVp, setHdriVp] = useState(true);
+  /** UE 导入模型：先问要导什么（默认只静态网格体） */
+  const [ueImportAsk, setUeImportAsk] = useState<{ asset: Asset } | null>(null);
+  const [ueImpStatic, setUeImpStatic] = useState(true);
+  const [ueImpSkeletal, setUeImpSkeletal] = useState(false);
+  const [ueImpPhysics, setUeImpPhysics] = useState(false);
+  const [ueImpPlace, setUeImpPlace] = useState(false);
   const [wsPrompt, setWsPrompt] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<any>(null);
   const [updateStatus, setUpdateStatus] = useState('');
@@ -1000,15 +1006,15 @@ export default function App() {
 
   async function loadBridge() {
     try {
-      const [st, info, maxJobs, blJobs, suJobs] = await Promise.all([
+      const [st, info, maxJobs, blJobs, suJobs, ueJobs] = await Promise.all([
         api('/api/bridge/status'), api('/api/bridge/info'),
         api('/api/bridge/jobs?target=max&limit=8'), api('/api/bridge/jobs?target=blender&limit=8'),
-        api('/api/bridge/jobs?target=su&limit=8')
+        api('/api/bridge/jobs?target=su&limit=8'), api('/api/bridge/jobs?target=ue&limit=8')
       ]);
       setBridge(st);
       setBridgeInfo(info);
-      // Max / Blender / SketchUp 的任务合并显示，新的在前
-      const merged = [...(maxJobs?.jobs || []), ...(blJobs?.jobs || []), ...(suJobs?.jobs || [])]
+      // Max / Blender / SketchUp / UE 的任务合并显示，新的在前
+      const merged = [...(maxJobs?.jobs || []), ...(blJobs?.jobs || []), ...(suJobs?.jobs || []), ...(ueJobs?.jobs || [])]
         .sort((a: any, b: any) => (b.id || 0) - (a.id || 0))
         .slice(0, 8);
       setBridgeJobs(merged);
@@ -1016,31 +1022,51 @@ export default function App() {
   }
 
   /** 素材适合哪种发送方式 */
-  function sendModeFor(a: Asset): 'import' | 'material' | 'texture' | 'hdri' | null {
+  function sendModeFor(a: Asset): 'import' | 'material' | 'texture' | 'hdri' | 'ies' | null {
     if (a.type === 'model') return 'import';
     if (a.type === 'material') return 'material';
     if (a.type === 'texture') return 'texture';
     if (a.type === 'hdri') return 'hdri';
+    if (a.type === 'ies') return 'ies';
     return null;
   }
 
   /** 可发送的软件（顺序=菜单顺序） */
-  const SEND_TARGETS: { key: 'max' | 'blender' | 'su'; label: string }[] = [
+  const SEND_TARGETS: { key: 'max' | 'blender' | 'su' | 'ue'; label: string }[] = [
     { key: 'max', label: '3ds Max' },
     { key: 'blender', label: 'Blender' },
-    { key: 'su', label: 'SketchUp' }
+    { key: 'su', label: 'SketchUp' },
+    { key: 'ue', label: 'Unreal Engine' }
   ];
+
+  /** 某个模式能发给哪些软件（IES 只有 UE 原生支持） */
+  const MODE_TARGETS: Record<string, string[]> = {
+    import: ['max', 'blender', 'su', 'ue'],
+    material: ['max', 'blender', 'su', 'ue'],
+    texture: ['max', 'blender', 'su', 'ue'],
+    hdri: ['max', 'blender', 'su', 'ue'],
+    ies: ['ue']
+  };
+
+  /** 当前素材可选的发送目标 */
+  function targetsFor(a: Asset) {
+    const m = sendModeFor(a);
+    const allow = m ? (MODE_TARGETS[m] || []) : [];
+    return SEND_TARGETS.filter(t => allow.includes(t.key));
+  }
 
   const maxConnected = !!bridge?.targets?.max?.connected;
   const blenderTarget = bridge?.targets?.blender;
   const blenderConnected = !!blenderTarget?.connected;
   const suTarget = bridge?.targets?.su;
   const suConnected = !!suTarget?.connected;
+  const ueTarget = bridge?.targets?.ue;
+  const ueConnected = !!ueTarget?.connected;
 
   /** 打开「发送到…」菜单（锚在按钮下方或右键位置） */
   function openSendMenu(a: Asset, at: { x: number; y: number }) {
-    if (!sendModeFor(a)) { showToast('这类素材不支持发送到 DCC（模型/材质/贴图/HDRI 才有）', 'err'); return; }
-    const w = 236, h = 40 + SEND_TARGETS.length * 34;
+    if (!sendModeFor(a)) { showToast('这类素材不支持发送到 DCC（模型/材质/贴图/HDRI/IES 才有）', 'err'); return; }
+    const w = 236, h = 40 + targetsFor(a).length * 34;
     setSendMenu({
       asset: a,
       x: Math.max(8, Math.min(at.x, window.innerWidth - w - 8)),
@@ -1054,12 +1080,13 @@ export default function App() {
     openSendMenu(a, { x: r.left, y: r.bottom + 4 });
   }
 
-  async function sendToTarget(a: Asset, target: 'max' | 'blender' | 'su', mode?: 'import' | 'material' | 'texture' | 'hdri', opts?: { options?: any }) {
-    const tName = target === 'blender' ? 'Blender' : target === 'su' ? 'SketchUp' : '3ds Max';
+  async function sendToTarget(a: Asset, target: 'max' | 'blender' | 'su' | 'ue', mode?: 'import' | 'material' | 'texture' | 'hdri' | 'ies', opts?: { options?: any }) {
+    const tName = target === 'blender' ? 'Blender' : target === 'su' ? 'SketchUp' : target === 'ue' ? 'Unreal Engine' : '3ds Max';
     const online = !!bridge?.targets?.[target]?.connected;
     const m = mode || sendModeFor(a);
     if (!m) { showToast(`这类素材不支持发送到 ${tName}`, 'err'); return; }
-    const label = m === 'import' ? '导入模型' : m === 'material' ? '创建材质' : m === 'hdri' ? '应用 HDRI' : '发送贴图';
+    const label = m === 'import' ? '导入模型' : m === 'material' ? '创建材质'
+      : m === 'hdri' ? '应用 HDRI' : m === 'ies' ? '发送 IES' : '发送贴图';
     setBridgeBusy(true);
     try {
       const send = (extra: Record<string, unknown> = {}) => api('/api/bridge/send', {
@@ -1130,6 +1157,70 @@ export default function App() {
       if (!r?.ok) { showToast('安装失败：' + (r?.error || '未知原因'), 'err'); return; }
       const list = (r.installed || []).map((x: any) => `Blender ${x.blender} → v${x.version}（${x.series} 系列）`);
       showToast(`已装到 ${list.length} 个 Blender：${list.join('；')}。到「偏好设置 → 插件」勾选一次即可`, 'ok');
+      await loadBridge();
+    } catch (e: any) {
+      showToast('安装失败：' + String(e?.message || e), 'err');
+    } finally { setBridgeBusy(false); }
+  }
+
+  /** UE 插件安装：先让用户勾选工程，再装（不默认装到所有工程） */
+  const [uePick, setUePick] = useState<{
+    items: { name: string; file: string; engine: string; installed?: boolean; version?: string; upToDate?: boolean }[];
+    sel: string[];
+  } | null>(null);
+
+  /** 打开「安装 UE 插件」选择框：列出本机最近打开的工程 */
+  async function openUeInstall() {
+    setBridgeBusy(true);
+    try {
+      const r = await api('/api/bridge/ue-where');
+      setUePick({ items: (r?.items || []).map((x: any) => ({ ...x })), sel: [] });
+    } catch (e: any) {
+      showToast('读取 UE 工程失败：' + String(e?.message || e), 'err');
+    } finally { setBridgeBusy(false); }
+  }
+
+  /** 手动挑 .uproject（不在「最近打开」列表里的工程也能装） */
+  async function addUeProjectsManually() {
+    const am = (window as any).amApi;
+    if (!am?.pickFiles) { showToast('当前环境不支持文件选择（浏览器里打开时）', 'err'); return; }
+    const files: string[] = await am.pickFiles([{ name: 'UE 工程', extensions: ['uproject'] }]) || [];
+    if (!files.length) return;
+    setUePick(cur => {
+      if (!cur) return cur;
+      const items = [...cur.items];
+      const sel = new Set(cur.sel);
+      for (const f of files) {
+        if (!items.some(i => i.file.toLowerCase() === f.toLowerCase())) {
+          const name = (f.split(/[\\/]/).pop() || f).replace(/\.uproject$/i, '');
+          items.push({ name, file: f, engine: '' });
+        }
+        sel.add(f);
+      }
+      return { items, sel: [...sel] };
+    });
+  }
+
+  /** 把插件装进勾选的工程 */
+  async function installUeSelected() {
+    const sel = uePick?.sel || [];
+    if (!sel.length) { showToast('先勾选要安装的 UE 工程', 'err'); return; }
+    setBridgeBusy(true);
+    try {
+      const r = await api('/api/bridge/install-ue', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ projects: sel })
+      });
+      if (!r?.ok) {
+        const why = r?.error || r?.failed?.[0]?.error || '未知原因';
+        showToast('安装失败：' + why, 'err');
+        return;
+      }
+      const list = (r.installed || []).map((x: any) => `${x.project}（UE ${x.engine} · ${x.series} 系列 v${x.version}）`);
+      const bad = (r.failed || []).map((x: any) => `${x.project}：${x.error}`);
+      showToast(`已装到 ${list.length} 个工程：${list.join('；')}。重启 UE 编辑器生效${bad.length ? '；失败：' + bad.join('；') : ''}`,
+        bad.length ? 'info' : 'ok');
+      setUePick(null);
       await loadBridge();
     } catch (e: any) {
       showToast('安装失败：' + String(e?.message || e), 'err');
@@ -2255,6 +2346,12 @@ export default function App() {
             : 'SketchUp 未连接（点开插件面板）'}>
           <span className={'mxdot' + (suConnected ? ' on' : '')} />SketchUp
         </button>
+        <button className={'bridgechip' + (ueConnected ? ' on' : '')} onClick={() => setPluginsOpen(true)}
+          title={ueConnected
+            ? `Unreal Engine 已连接${bridge?.targets?.ue?.version ? ' · 插件 v' + bridge.targets.ue.version : ''}`
+            : 'Unreal Engine 未连接（点开插件面板）'}>
+          <span className={'mxdot' + (ueConnected ? ' on' : '')} />Unreal
+        </button>
         <div className="status-right">
           <span className="cap">主题</span>
           {THEMES.map(t => (
@@ -2286,13 +2383,14 @@ export default function App() {
 
       {sendMenu && (() => {
         const m = sendModeFor(sendMenu.asset);
-        const mLabel = m === 'import' ? '导入模型' : m === 'material' ? '创建材质' : m === 'hdri' ? '应用 HDRI' : '发送贴图';
+        const mLabel = m === 'import' ? '导入模型' : m === 'material' ? '创建材质'
+          : m === 'hdri' ? '应用 HDRI' : m === 'ies' ? '发送 IES' : '发送贴图';
         return (
           <>
             <div className="menu-mask" onMouseDown={() => setSendMenu(null)} />
             <div className="ctxmenu sendsel" style={{ left: sendMenu.x, top: sendMenu.y }}>
               <div className="send-h">发送到… · {mLabel}</div>
-              {SEND_TARGETS.map(t => {
+              {targetsFor(sendMenu.asset).map(t => {
                 const st = bridge?.targets?.[t.key];
                 const online = !!st?.connected;
                 return (
@@ -2301,6 +2399,24 @@ export default function App() {
                       const a = sendMenu.asset;
                       setSendMenu(null);
                       if (sendModeFor(a) === 'hdri' && t.key === 'max') { setHdriAsk({ asset: a }); return; }
+                      if (sendModeFor(a) === 'import' && t.key === 'ue') {
+                        // 每次重新给默认值：只勾静态网格体
+                        setUeImpStatic(true); setUeImpSkeletal(false); setUeImpPhysics(false); setUeImpPlace(false);
+                        setUeImportAsk({ asset: a });
+                        return;
+                      }
+                      if (sendModeFor(a) === 'material' && t.key === 'ue') {
+                        // UE 端不在模态框里选父材质（点不了内容浏览器），改成发送前问一句
+                        (async () => {
+                          const last = localStorage.getItem('am-ue-parent-mat') || '';
+                          const inp = await askText('发送材质到 Unreal：填父材质路径（如 /Game/Materials/M_Base）= 建材质实例；留空 = 独立材质', last, false);
+                          if (inp === null) return;            // 取消发送
+                          const parent = String(inp).trim();
+                          if (parent) localStorage.setItem('am-ue-parent-mat', parent);
+                          sendToTarget(a, 'ue', 'material', parent ? { options: { parentMaterial: parent } } : undefined);
+                        })();
+                        return;
+                      }
                       sendToTarget(a, t.key);
                     }}
                     title={online
@@ -2337,7 +2453,7 @@ export default function App() {
               <button onClick={() => { setCtx(null); openViewer(ctx.asset); }}>打开预览</button>
               {sendModeFor(ctx.asset) && (
                 <button onClick={() => { const a = ctx.asset; setCtx(null); openSendMenu(a, { x: ctx.x, y: ctx.y }); }} disabled={bridgeBusy}>
-                  发送到…（3ds Max / Blender / SketchUp）
+                  发送到…（3ds Max / Blender / SketchUp / Unreal）
                 </button>
               )}
               <button onClick={() => { setCtx(null); reveal(ctx.asset); }}>在资源管理器中显示</button>
@@ -2534,7 +2650,46 @@ export default function App() {
                   清除任务记录时一并删除）。
                 </div>
               </div>
-              {['Houdini', 'Unreal Engine'].map(n => (
+              <div className={'maxcard' + (ueConnected ? ' on' : '')}>
+                <div className="mxhead">
+                  <span className="mxname">Unreal Engine</span>
+                  <span className={'mxdot' + (ueConnected ? ' on' : '')} />
+                  <span className={ueConnected ? 'plug-on' : 'plug-off'}>{ueConnected ? '已连接' : '未连接'}</span>
+                  {!!ueTarget?.version && <span className="mxver">插件 v{ueTarget.version}</span>}
+                </div>
+                <div className="mxmeta">
+                  队列 {ueTarget?.queued ?? 0} · 运行 {ueTarget?.running ?? 0}
+                  {ueTarget?.lastSeen ? ` · 最近心跳 ${new Date(ueTarget.lastSeen).toLocaleTimeString()}` : ''}
+                </div>
+                {ueTarget?.lastJob && (
+                  <div className="mxmeta mxlast" title={`${ueTarget.lastJob.title} — ${ueTarget.lastJob.message || ''}`}>
+                    最近任务：{ueTarget.lastJob.status === 'done' ? '✔' : ueTarget.lastJob.status === 'failed' ? '✘' : '…'}
+                    {' '}{ueTarget.lastJob.title}
+                    {ueTarget.lastJob.message ? ` — ${ueTarget.lastJob.message}` : ''}
+                  </div>
+                )}
+                <div className="uvrow" style={{ marginTop: 8 }}>
+                  <button className="btn primary" disabled={bridgeBusy} onClick={openUeInstall}>
+                    安装/更新插件到 UE 工程…
+                  </button>
+                  <button className="btn" onClick={async () => {
+                    const r = await api('/api/bridge/open-folder', {
+                      method: 'POST', headers: { 'content-type': 'application/json' },
+                      body: JSON.stringify({ which: 'ue' })
+                    });
+                    if (!r?.ok) showToast(r?.error || '打开失败', 'err');
+                  }}>打开 UE 插件文件夹</button>
+                </div>
+                <div className="hint">
+                  插件是纯 Python 编辑器插件（<b>bridge/ue/5.7/AssetManagerBridge</b>），不用编译。
+                  点「安装/更新插件到 UE 工程…」后<b>先勾选工程</b>（或手动选 .uproject），只装你选的那些：
+                  写进工程 <b>Plugins\AssetManagerBridge</b> 并在 .uproject 里启用它和 PythonScriptPlugin，
+                  <b>重启 UE 编辑器生效</b>。装好后菜单 <b>工具 → AssetManager</b> 看连接状态。
+                  支持：模型导入（FBX/GLB/OBJ…）、PBR 材质重建、贴图、HDRI（天空球 + SkyLight 反射）、
+                  <b>IES 配光文件</b>（UE 原生 TextureLightProfile，直接生成带配光曲线的灯光）。
+                </div>
+              </div>
+              {['Houdini'].map(n => (
                 <div className="plug-row" key={n}>
                   <span className="plug-name">{n}</span>
                   <span className="plug-desc">素材直接发送 / 一键替换</span>
@@ -2554,7 +2709,7 @@ export default function App() {
                     <div className="mxjob" key={j.id}>
                       <span className={'mxst ' + j.status}>{j.status === 'done' ? '✔' : j.status === 'failed' ? '✘' : '…'}</span>
                       <span className="mxtitle" title={j.message || ''}>
-                        {j.target === 'blender' ? 'Blender · ' : j.target === 'su' ? 'SketchUp · ' : ''}{j.title}
+                        {j.target === 'blender' ? 'Blender · ' : j.target === 'su' ? 'SketchUp · ' : j.target === 'ue' ? 'Unreal · ' : ''}{j.title}
                       </span>
                       <span className="mxmsg" title={j.message || ''}>{j.message || (j.status === 'pending' ? '排队中' : j.status)}</span>
                     </div>
@@ -2562,9 +2717,60 @@ export default function App() {
                 </div>
               </div>
             )}
-            <div className="hint">插件来源：应用目录下的 bridge/max/AssetManagerBridge.ms（安装时复制到 3ds Max 的 scripts\startup）；Blender 插件在 bridge/blender/&lt;Blender 版本&gt;/ 下；SketchUp 插件在 bridge/su/&lt;SketchUp 版本&gt;/ 下。</div>
+            <div className="hint">插件来源：应用目录下的 bridge/max/AssetManagerBridge.ms（安装时复制到 3ds Max 的 scripts\startup）；Blender 插件在 bridge/blender/&lt;Blender 版本&gt;/ 下；SketchUp 插件在 bridge/su/&lt;SketchUp 版本&gt;/ 下；UE 插件在 bridge/ue/&lt;引擎版本&gt;/AssetManagerBridge/ 下（装进工程的 Plugins）。</div>
             <div className="modal-b">
               <button className="btn" onClick={() => setPluginsOpen(false)}>关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {uePick && (
+        <div className="modal-mask" onMouseDown={() => setUePick(null)}>
+          <div className="modal wide" onMouseDown={e => e.stopPropagation()}>
+            <div className="modal-t">安装 UE 插件 · 选择工程</div>
+            <div className="hint">
+              只会装到你勾选的工程：写进 <b>工程\Plugins\AssetManagerBridge</b>，并在 <b>.uproject</b> 里启用它和
+              PythonScriptPlugin；<b>重启 UE 编辑器生效</b>。没装插件的工程不会被改动。
+            </div>
+            <div className="issues">
+              {uePick.items.length === 0 && (
+                <div className="hint" style={{ padding: 8 }}>
+                  没读到最近打开的 UE 工程（先在 UE 里打开一次工程，或用下面的「手动选择 .uproject…」）。
+                </div>
+              )}
+              {uePick.items.map(it => {
+                const on = uePick.sel.includes(it.file);
+                return (
+                  <label className="issue" key={it.file} style={{ cursor: 'pointer' }}
+                    title={it.file}>
+                    <input type="checkbox" checked={on} onChange={() => setUePick(cur => {
+                      if (!cur) return cur;
+                      const s = new Set(cur.sel);
+                      if (s.has(it.file)) s.delete(it.file); else s.add(it.file);
+                      return { ...cur, sel: [...s] };
+                    })} />
+                    <span className="iname">{it.name}</span>
+                    <span className="idetail">UE {it.engine || '?'}</span>
+                    <span className={it.installed ? 'plug-on' : 'plug-off'}>
+                      {it.installed ? (it.upToDate ? '已装·最新' : `已装 v${it.version || '?'}·待更新`) : '未安装'}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+            <div className="uvrow">
+              <button className="btn" onClick={() => setUePick(cur => cur && ({ ...cur, sel: cur.items.map(i => i.file) }))}>
+                全选
+              </button>
+              <button className="btn" onClick={() => setUePick(cur => cur && ({ ...cur, sel: [] }))}>全不选</button>
+              <button className="btn" onClick={addUeProjectsManually}>＋ 手动选择 .uproject…</button>
+            </div>
+            <div className="modal-b">
+              <button className="btn" onClick={() => setUePick(null)}>取消</button>
+              <button className="btn primary" disabled={bridgeBusy || !uePick.sel.length} onClick={installUeSelected}>
+                安装到选中的 {uePick.sel.length} 个工程
+              </button>
             </div>
           </div>
         </div>
@@ -2984,6 +3190,51 @@ export default function App() {
         </div>
       )}
 
+      {ueImportAsk && (
+        <div className="modal-mask" onMouseDown={() => setUeImportAsk(null)}>
+          <div className="modal" onMouseDown={e => e.stopPropagation()}>
+            <div className="modal-t">导入到 Unreal · {ueImportAsk.asset.name}</div>
+            <div className="hint">选择要导入的资产类型（可多选）。UE 会把 FBX 里有的东西都解析一遍，
+              没勾的类型导入后会被丢弃。</div>
+            <div className="uvrow" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 6 }}>
+              <label className="vp-check" onClick={() => setUeImpStatic(v => !v)}>
+                <span className={'box' + (ueImpStatic ? ' on' : '')}>{ueImpStatic ? '✓' : ''}</span>静态网格体
+              </label>
+              <label className="vp-check" onClick={() => setUeImpSkeletal(v => !v)}>
+                <span className={'box' + (ueImpSkeletal ? ' on' : '')}>{ueImpSkeletal ? '✓' : ''}</span>骨骼网格体
+              </label>
+              <label className="vp-check" onClick={() => setUeImpPhysics(v => !v)}>
+                <span className={'box' + (ueImpPhysics ? ' on' : '')}>{ueImpPhysics ? '✓' : ''}</span>物理资产
+              </label>
+              <label className="vp-check" onClick={() => setUeImpPlace(v => !v)}>
+                <span className={'box' + (ueImpPlace ? ' on' : '')}>{ueImpPlace ? '✓' : ''}</span>导入后放到视口
+              </label>
+            </div>
+            <div className="hint">物理资产只对骨骼网格体有效（没勾骨骼网格体时会被忽略）；FBX 里没有骨架的模型导不出骨骼网格体。
+              默认只导入资产、<b>不往视口放演员</b>；勾「导入后放到视口」才会放一个（重复导入会复用同名演员，不会堆叠）。</div>
+            <div className="modal-b">
+              <button className="btn" onClick={() => setUeImportAsk(null)}>取消</button>
+              <button className="btn primary"
+                disabled={!ueImpStatic && !ueImpSkeletal && !ueImpPhysics}
+                onClick={() => {
+                  const a = ueImportAsk.asset;
+                  setUeImportAsk(null);
+                  sendToTarget(a, 'ue', 'import', {
+                    options: {
+                      importOptions: {
+                        staticMesh: ueImpStatic, skeletalMesh: ueImpSkeletal,
+                        physicsAsset: ueImpPhysics, placeInViewport: ueImpPlace
+                      }
+                    }
+                  });
+                }}>
+                导入
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {hdriAsk && (
         <div className="modal-mask" onMouseDown={() => setHdriAsk(null)}>
           <div className="modal" onMouseDown={e => e.stopPropagation()}>
@@ -3054,5 +3305,7 @@ export default function App() {
     </div>
   );
 }
+
+
 
 

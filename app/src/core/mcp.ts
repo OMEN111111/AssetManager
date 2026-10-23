@@ -44,11 +44,11 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: 'send_to_dcc',
-    description: '把素材发送到 DCC（写操作）：max / blender / su，模式 import / material / texture / hdri',
+    description: '把素材发送到 DCC（写操作）：max / blender / su / ue，模式 import / material / texture / hdri / ies',
     inputSchema: obj({
       assetId: { type: 'integer' },
-      target: { type: 'string', enum: ['max', 'blender', 'su'] },
-      mode: { type: 'string', enum: ['import', 'material', 'texture', 'hdri'], default: 'import' }
+      target: { type: 'string', enum: ['max', 'blender', 'su', 'ue'] },
+      mode: { type: 'string', enum: ['import', 'material', 'texture', 'hdri', 'ies'], default: 'import' }
     }, ['assetId', 'target'])
   },
   {
@@ -117,8 +117,8 @@ export function callTool(db: DB, name: string, args: any, allowWrite: boolean) {
       const id = Number(args?.assetId);
       const target = String(args?.target || '');
       const mode = String(args?.mode || 'import');
-      if (!['max', 'blender', 'su'].includes(target)) return { error: 'target 不支持' };
-      if (!['import', 'material', 'texture', 'hdri'].includes(mode)) return { error: 'mode 不支持' };
+      if (!['max', 'blender', 'su', 'ue'].includes(target)) return { error: 'target 不支持' };
+      if (!['import', 'material', 'texture', 'hdri', 'ies'].includes(mode)) return { error: 'mode 不支持' };
       const r = sendJob(db, id, target, mode);
       return r;
     }

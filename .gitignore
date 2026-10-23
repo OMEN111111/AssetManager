@@ -35,3 +35,19 @@ Thumbs.db
 
 # release upload staging
 dist-release/
+
+# UE 测试工程（AMTest）：引擎生成物 + 插件拷贝 + 临时服务数据，一律不入库
+devtest/ue/AMTest*/Content/
+devtest/ue/AMTest*/Intermediate/
+devtest/ue/AMTest*/Saved/
+devtest/ue/AMTest*/DerivedDataCache/
+devtest/ue/AMTest*/Plugins/
+devtest/ue/AMTest*/Config/
+devtest/ue/.data/
+devtest/ue/work/
+devtest/ue/thread_out.json
+devtest/ue/thread_probe.py
+
+devtest/ue/t*_probe.py
+devtest/ue/t*_out.json
+devtest/ue/t*_run.log

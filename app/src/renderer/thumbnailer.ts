@@ -7,6 +7,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { buildMaterial, detectConfig } from './matlib';
 import type { AssetDetail } from './types';
 import { assertBinaryFbx } from './fbxcheck';
+import { parseIesFull, ies360Texture, iesMaterial } from './Viewer';
 
 let renderer: THREE.WebGLRenderer | null = null;
 let envTex: THREE.Texture | null = null;
@@ -186,3 +187,4 @@ export async function renderThumb(detail: AssetDetail): Promise<string> {
   });
   return url;
 }
+

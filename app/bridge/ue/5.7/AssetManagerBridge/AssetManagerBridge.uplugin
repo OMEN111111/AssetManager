@@ -1,0 +1,34 @@
+{
+	"FileVersion": 3,
+	"Version": 8,
+	"VersionName": "0.1.7",
+	"FriendlyName": "AssetManager Bridge",
+	"Description": "接收 AssetManager 发送的模型 / 材质 / 贴图 / HDRI / IES：队列轮询、PBR 材质重建、天空球环境、灯光配光文件。纯 Python 编辑器插件，无需编译。",
+	"Category": "Other",
+	"CreatedBy": "AssetManager",
+	"CreatedByURL": "https://github.com/OMEN111111/AssetManager",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [],
+	"Plugins": [
+		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		},
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
+		}
+	]
+}
+
+
+
+
+
+

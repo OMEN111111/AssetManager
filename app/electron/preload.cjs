@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld('amApi', {
     try { return webUtils.getPathForFile(file); } catch { return ''; }
   },
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
+  // 手动选文件（目前用于挑 .uproject 装 UE 插件）；filters 形如 [{ name, extensions }]
+  pickFiles: (filters) => ipcRenderer.invoke('dialog:pickFiles', filters),
   applyUpdate: (file) => ipcRenderer.invoke('update:apply', file),
   getCloseAction: () => ipcRenderer.invoke('app:getCloseAction'),
   setCloseAction: (v) => ipcRenderer.invoke('app:setCloseAction', v),

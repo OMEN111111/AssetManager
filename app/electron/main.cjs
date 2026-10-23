@@ -277,6 +277,13 @@ app.whenReady().then(async () => {
     const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] });
     return r.canceled ? '' : (r.filePaths[0] || '');
   });
+  // 手动选文件（多选）：挑 .uproject 装 UE 插件用
+  ipcMain.handle('dialog:pickFiles', async (_e, filters) => {
+    if (!win) return [];
+    const fl = Array.isArray(filters) && filters.length ? filters : [{ name: '所有文件', extensions: ['*'] }];
+    const r = await dialog.showOpenDialog(win, { properties: ['openFile', 'multiSelections'], filters: fl });
+    return r.canceled ? [] : (r.filePaths || []);
+  });
   ipcMain.on('drag:start', (event, payload) => {
     if (!win || !payload) return;
     const files = (Array.isArray(payload.files) ? payload.files : [])

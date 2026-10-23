@@ -206,6 +206,99 @@ export function iesMaterial(params: any, uni: any): THREE.MeshStandardMaterial {
   return mat;
 }
 
+/** 预览几何种类（与 geometries.makeGeometry 的入参一致） */
+type GeoKind = 'sphere' | 'box' | 'cylinder' | 'plane';
+
+/** 小写化（按文件名规则判断用，如 _dx 法线） */
+const lc = (s: any) => String(s || '').toLowerCase();
+
+/** 简易 JSON 请求（渲染端没有统一的 api() 封装，这里够用） */
+async function apiJson(url: string): Promise<any> {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+/** 通道预览的种类（对应 CSS 里的 .ci-* 图标） */
+type Channel = 'beauty' | 'clay' | 'albedo' | 'normal' | 'rough' | 'metallic' | 'ao' | 'height' | 'emissive';
+
+const CHANNEL_META: { key: Channel; label: string }[] = [
+  { key: 'beauty', label: '材质（完整 PBR）' },
+  { key: 'clay', label: '白模' },
+  { key: 'albedo', label: '颜色 / 基础色' },
+  { key: 'normal', label: '法线' },
+  { key: 'rough', label: '粗糙度' },
+  { key: 'metallic', label: '金属度' },
+  { key: 'ao', label: 'AO 环境光遮蔽' },
+  { key: 'height', label: '高度 / 置换' },
+  { key: 'emissive', label: '自发光' }
+];
+
+/**
+ * 通道预览材质：只看某一张贴图，用 Basic 材质避免光照干扰。
+ * base 是组装好的 PBR 材质（MeshStandardMaterial），从中取对应的 map。
+ */
+function channelMaterial(ch: Channel, base: any): THREE.Material {
+  const side = base?.side ?? THREE.FrontSide;
+  const pick = (t: any) => new THREE.MeshBasicMaterial({ map: t || null, color: t ? 0xffffff : 0x8b93a1, side });
+  switch (ch) {
+    case 'clay':
+      return new THREE.MeshStandardMaterial({ color: 0xd6d6d6, roughness: 0.85, metalness: 0, side });
+    case 'albedo':
+      return pick(base?.map);
+    case 'normal':
+      return pick(base?.normalMap);
+    case 'rough':
+      return pick(base?.roughnessMap);
+    case 'metallic':
+      return pick(base?.metalnessMap);
+    case 'ao':
+      return pick(base?.aoMap);
+    case 'height':
+      return pick(base?.displacementMap || base?.bumpMap);
+    case 'emissive':
+      return new THREE.MeshBasicMaterial({
+        map: base?.emissiveMap || null,
+        color: base?.emissiveMap ? 0xffffff : (base?.emissive?.getHex?.() ?? 0xffffff),
+        side
+      });
+    default:
+      return base;
+  }
+}
+
+/** 主光方向球：拖动改方位角（0=正面，顺时针）与俯仰角（90=正上方） */
+function LightBall({ az, el, onChange }: { az: number; el: number; onChange: (az: number, el: number) => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  const apply = (clientX: number, clientY: number) => {
+    const box = ref.current;
+    if (!box) return;
+    const r = box.getBoundingClientRect();
+    let x = ((clientX - r.left) / r.width) * 2 - 1;
+    let y = ((clientY - r.top) / r.height) * 2 - 1;
+    const d = Math.hypot(x, y);
+    if (d > 1) { x /= d; y /= d; }              // 拖出圆外就贴到边缘
+    const a = Math.round(((Math.atan2(x, -y) * 180) / Math.PI + 360) % 360);
+    const p = Math.round((1 - Math.min(1, d)) * 90);
+    onChange(a, Math.max(0, Math.min(90, p)));
+  };
+
+  // 反投影：r = 1 - el/90（圆心=顶光，边缘=地平线）
+  const rr = Math.max(0, 1 - el / 90);
+  const a = (az * Math.PI) / 180;
+  const left = 50 + Math.sin(a) * rr * 50;
+  const top = 50 - Math.cos(a) * rr * 50;
+
+  return (
+    <div className="lightball" ref={ref} title="拖动调整主光方向"
+      onPointerDown={e => { (e.currentTarget as any).setPointerCapture?.(e.pointerId); apply(e.clientX, e.clientY); }}
+      onPointerMove={e => { if (e.buttons === 1) apply(e.clientX, e.clientY); }}>
+      <span className="lb-dot" style={{ left: `${left}%`, top: `${top}%` }} />
+    </div>
+  );
+}
+
 export default function Viewer({ asset, onClose, variants, onVariant }:
   { asset: AssetDetail; onClose: () => void; variants?: any[]; onVariant?: (id: number) => void }) {
   const stageRef = useRef<HTMLDivElement>(null);

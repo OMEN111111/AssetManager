@@ -33,7 +33,17 @@ export const MODE_LABEL: Record<string, string> = {
   import: '导入模型',
   material: '创建材质',
   texture: '发送贴图',
-  hdri: '应用 HDRI'
+  hdri: '应用 HDRI',
+  ies: '发送 IES'
+};
+
+/** 各模式支持的 DCC（IES 只有 Unreal 原生支持；HDRI 三家都支持） */
+export const MODE_TARGETS: Record<string, BridgeTarget[]> = {
+  import: ['max', 'blender', 'su', 'ue'],
+  material: ['max', 'blender', 'su', 'ue'],
+  texture: ['max', 'blender', 'su', 'ue'],
+  hdri: ['max', 'blender', 'su', 'ue'],
+  ies: ['ue']
 };
 
 // 表结构在 core/db.ts 的 SCHEMA 中（随数据库打开自动创建）
@@ -216,6 +226,8 @@ export function buildPayload(db: DB, assetId: number, mode: string, modelOverrid
     if (!m && !override) return { error: '该素材没有可导入的模型文件' as const };
     // 软件临时导出的 GLB（FBX/OBJ 等 SketchUp 读不了的格式）直接用它
     const path2 = override || abs(bundle.root, m!.rel_path);
+    // 导入类型（只有 UE 用得到）：静态网格体 / 骨骼网格体 / 物理资产，默认只静态
+    const io = options?.importOptions || {};
     return {
       payload: {
         assetId,
@@ -225,14 +237,27 @@ export function buildPayload(db: DB, assetId: number, mode: string, modelOverrid
         ext: path.extname(path2).toLowerCase(),
         material: spec,
         maps: mapsBySlot(spec),
-        converted: !!override
+        converted: !!override,
+        importOptions: {
+          staticMesh: io.staticMesh !== false,
+          skeletalMesh: io.skeletalMesh === true,
+          physicsAsset: io.physicsAsset === true,
+          placeInViewport: io.placeInViewport === true
+        }
       }
     };
   }
 
   if (mode === 'material') {
     if (!Object.keys(spec.maps).length) return { error: '该素材没有可用的贴图' as const };
-    return { payload: { ...spec, assetId, assetName: String(a.name), sourceDir } };
+    // 父材质（只有 UE 用得到）：给了路径 → UE 基于它建材质实例；留空 → 独立材质
+    const parent = String(options?.parentMaterial || '').trim();
+    return {
+      payload: {
+        ...spec, assetId, assetName: String(a.name), sourceDir,
+        ...(parent ? { parentMaterial: parent } : {})
+      }
+    };
   }
 
   if (mode === 'texture') {
@@ -264,6 +289,21 @@ export function buildPayload(db: DB, assetId: number, mode: string, modelOverrid
           env: options?.env !== false,
           viewport: options?.viewport !== false
         }
+      }
+    };
+  }
+
+  // IES 配光文件：UE 原生支持（TextureLightProfile → SpotLight/PointLight 的 IESTexture）
+  if (mode === 'ies') {
+    const ies = bundle.files.filter(f => /\.(ies|ldt)$/i.test(f.rel_path));
+    if (!ies.length) return { error: '该素材里没有 .ies 文件' as const };
+    return {
+      payload: {
+        assetId,
+        name: String(a.name),
+        sourceDir,
+        files: ies.map(f => abs(bundle.root, f.rel_path)),
+        paths: ies.map(f => ({ path: abs(bundle.root, f.rel_path), role: f.role }))
       }
     };
   }
@@ -495,10 +535,19 @@ export function heartbeat(db: DB, target: string, version?: string, host?: strin
   return { ok: true, at: now };
 }
 
-/** 轮询取任务时顺手刷新在线时间（心跳包丢了也不会误判离线） */
+/** 轮询取任务时顺手刷新在线时间（心跳包丢了也不会误判离线）
+ *
+ * 没有客户端行时补一条：能取任务本身就说明插件活着，
+ * 万一心跳因为别的原因发不出去（比如插件跨线程调了引擎 API），界面也不该一直显示未连接。
+ */
 export function touchClient(db: DB, target: string) {
   try {
-    db.prepare('UPDATE bridge_clients SET last_seen=? WHERE target=?').run(Date.now(), target);
+    const now = Date.now();
+    const r = db.prepare('UPDATE bridge_clients SET last_seen=? WHERE target=?').run(now, target);
+    if (!Number(r.changes)) {
+      db.prepare('INSERT OR IGNORE INTO bridge_clients(target,last_seen,version,host,info) VALUES(?,?,?,?,NULL)')
+        .run(target, now, '', '');
+    }
   } catch { /* ignore */ }
 }
 
@@ -833,6 +882,254 @@ export function installInfo(appRoot: string) {
     startupDirs: dirs,
     installedAt,
     installed: installedAt.length > 0
+  };
+}
+
+// ---------------------------------------------------------------- Unreal Engine 安装
+
+const UE_PLUGIN_DIR = 'AssetManagerBridge';
+
+/** 安装包里有哪些 UE 系列目录（5.7 / 5.6 …） */
+export function ueSeries(appRoot: string): string[] {
+  const dir = path.join(appRoot, 'bridge', 'ue');
+  let ents: fs.Dirent[] = [];
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  return ents.filter(e => e.isDirectory() && /^\d+\.\d+$/.test(e.name))
+    .map(e => e.name)
+    .sort((a, b) => {
+      const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+      return (pa[0] - pb[0]) || (pa[1] - pb[1]);
+    });
+}
+
+/** 给某个 UE 版本挑系列：优先同版本，其次不超过它的最高系列，最后退回最低的 */
+export function pickUeSeries(series: string[], ueVersion: string): string | null {
+  if (!series.length) return null;
+  if (series.includes(ueVersion)) return ueVersion;
+  const [maj, min] = ueVersion.split('.').map(Number);
+  const le = series.filter(s => {
+    const [a, b] = s.split('.').map(Number);
+    return a < maj || (a === maj && b <= min);
+  });
+  if (le.length) return le[le.length - 1];
+  return series[0];
+}
+
+export interface UeProject {
+  /** .uproject 绝对路径 */
+  file: string;
+  /** 工程名（不带扩展名） */
+  name: string;
+  /** .uproject 里的 EngineAssociation（"5.7" 或源码版 GUID） */
+  engine: string;
+  /** 工程 Plugins 目录 */
+  pluginsDir: string;
+}
+
+/** UE 最近打开过的工程列表（%LOCALAPPDATA%\UnrealEngine\<ver>\Saved\Config\WindowsEditor\EditorSettings.ini） */
+function ueRecentProjects(): string[] {
+  const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  const base = path.join(local, 'UnrealEngine');
+  let versions: fs.Dirent[] = [];
+  try { versions = fs.readdirSync(base, { withFileTypes: true }); } catch { return []; }
+  const out: string[] = [];
+  for (const v of versions) {
+    if (!v.isDirectory()) continue;
+    for (const sub of ['WindowsEditor', 'Windows']) {
+      const ini = path.join(base, v.name, 'Saved', 'Config', sub, 'EditorSettings.ini');
+      let txt = '';
+      try { txt = fs.readFileSync(ini, 'utf8'); } catch { continue; }
+      for (const line of txt.split(/\r?\n/)) {
+        // RecentlyOpenedProjectFiles=(ProjectName="D:/X/Y/Y.uproject",LastOpenTime=...)
+        const m = line.match(/RecentlyOpenedProjectFiles=\(ProjectName="([^"]+\.uproject)"/i);
+        if (m && !out.includes(m[1])) out.push(m[1]);
+      }
+    }
+  }
+  return out;
+}
+
+/** 本机存在过的 UE 工程（按最近打开排序，去重） */
+export function ueProjects(): UeProject[] {
+  const out: UeProject[] = [];
+  const seen = new Set<string>();
+  for (const f of ueRecentProjects()) {
+    const norm = path.resolve(f);
+    if (seen.has(norm.toLowerCase())) continue;
+    seen.add(norm.toLowerCase());
+    if (!fs.existsSync(norm)) continue;
+    let engine = '';
+    try {
+      const j = JSON.parse(fs.readFileSync(norm, 'utf8'));
+      engine = String(j.EngineAssociation || '');
+    } catch { continue; }
+    out.push({
+      file: norm,
+      name: path.basename(norm, '.uproject'),
+      engine,
+      pluginsDir: path.join(path.dirname(norm), 'Plugins')
+    });
+  }
+  return out;
+}
+
+function uePluginVersionOf(file: string): string {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return String(j.VersionName || '');
+  } catch { return ''; }
+}
+
+/**
+ * 在 .uproject 里启用插件（保留原有缩进与顺序，只在缺失时追加）。
+ * 需要 PythonScriptPlugin 才会执行插件的 init_unreal.py。
+ */
+export function enableUePlugins(projectFile: string, names: string[]): { ok: boolean; added: string[]; error?: string } {
+  let raw = '';
+  try { raw = fs.readFileSync(projectFile, 'utf8'); } catch (e: any) {
+    return { ok: false, added: [], error: String(e?.message || e) };
+  }
+  let j: any;
+  try { j = JSON.parse(raw); } catch (e: any) {
+    return { ok: false, added: [], error: '解析 .uproject 失败：' + String(e?.message || e) };
+  }
+  const list: any[] = Array.isArray(j.Plugins) ? j.Plugins : [];
+  const added: string[] = [];
+  for (const name of names) {
+    const hit = list.find(p => String(p?.Name).toLowerCase() === name.toLowerCase());
+    if (hit) {
+      if (hit.Enabled === false) { hit.Enabled = true; added.push(name + '(启用)'); }
+      continue;
+    }
+    list.push({ Name: name, Enabled: true });
+    added.push(name);
+  }
+  if (!added.length) return { ok: true, added };
+  j.Plugins = list;
+  // 用 tab 缩进写回（UE 自己也是这么存的）；只动 Plugins 字段，其它字段原样保留
+  try {
+    fs.writeFileSync(projectFile, JSON.stringify(j, null, '\t') + '\n', 'utf8');
+  } catch (e: any) {
+    return { ok: false, added: [], error: String(e?.message || e) };
+  }
+  return { ok: true, added };
+}
+
+/**
+ * 递归复制目录（打包版 src 在 app.asar 里：asar 的 fs 垫片不支持 cpSync/lstat 目录，
+ * 只能 readdirSync + copyFileSync 逐个来）
+ */
+function copyTreeSafe(src: string, dst: string) {
+  let entries: fs.Dirent[] = [];
+  try { entries = fs.readdirSync(src, { withFileTypes: true }); } catch { return; }
+  fs.mkdirSync(dst, { recursive: true });
+  for (const e of entries) {
+    const from = path.join(src, e.name);
+    const to = path.join(dst, e.name);
+    if (e.isDirectory()) copyTreeSafe(from, to);
+    else if (e.isFile()) {
+      try { fs.copyFileSync(from, to); } catch { /* ignore */ }
+    }
+  }
+}
+
+/** 从 .uproject 路径读一个工程条目（手动选工程时用，不要求在「最近打开」列表里） */
+export function ueProjectFromFile(file: string): UeProject | null {
+  const norm = path.resolve(String(file || ''));
+  if (!norm.toLowerCase().endsWith('.uproject') || !fs.existsSync(norm)) return null;
+  let engine = '';
+  try {
+    engine = String(JSON.parse(fs.readFileSync(norm, 'utf8')).EngineAssociation || '');
+  } catch {
+    return null;   // 不是合法 JSON 就不是工程文件
+  }
+  return {
+    file: norm,
+    name: path.basename(norm, '.uproject'),
+    engine,
+    pluginsDir: path.join(path.dirname(norm), 'Plugins')
+  };
+}
+
+/** 把 UE 插件装进**指定的** UE 工程（按各工程引擎版本挑系列）
+ *
+ * projects：要安装的 .uproject 绝对路径（用户手动选/勾选的），必填。
+ * 不再默认装到本机所有最近工程——那样会悄悄改动一堆别人的工程。
+ */
+export function installForUe(appRoot: string, projects: string[]) {
+  const series = ueSeries(appRoot);
+  if (!series.length) {
+    return { ok: false, error: '安装包缺少 bridge/ue/<UE 版本>/ 目录（重新打包）' };
+  }
+  const wanted = (projects || []).map(f => ueProjectFromFile(f)).filter(Boolean) as UeProject[];
+  const bad = (projects || []).filter((f, i) => !wanted[i]);
+  if (!wanted.length) {
+    return { ok: false, error: '没有可用的 .uproject（选中的文件不存在或不是 UE 工程）', series };
+  }
+
+  const installed: { project: string; engine: string; series: string; version: string; dir: string }[] = [];
+  const failed: { project: string; error: string }[] = [];
+  for (const p of wanted) {
+    const pick = pickUeSeries(series, p.engine || series[series.length - 1]);
+    const src = path.join(appRoot, 'bridge', 'ue', pick || '', UE_PLUGIN_DIR);
+    if (!pick || !fs.existsSync(src)) {
+      failed.push({ project: p.name, error: `缺少 bridge/ue/${pick}/${UE_PLUGIN_DIR}` });
+      continue;
+    }
+    try {
+      const dst = path.join(p.pluginsDir, UE_PLUGIN_DIR);
+      fs.rmSync(dst, { recursive: true, force: true });
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      copyTreeSafe(src, dst);
+      if (!fs.existsSync(path.join(dst, UE_PLUGIN_DIR + '.uplugin'))) {
+        throw new Error('插件文件没拷出来（安装包里的 bridge/ue 不完整）');
+      }
+      const en = enableUePlugins(p.file, [UE_PLUGIN_DIR, 'PythonScriptPlugin', 'EditorScriptingUtilities']);
+      if (!en.ok) throw new Error(en.error || '启用插件失败');
+      installed.push({
+        project: p.name, engine: p.engine || '(未知)', series: pick,
+        version: uePluginVersionOf(path.join(dst, UE_PLUGIN_DIR + '.uplugin')), dir: dst
+      });
+    } catch (e: any) {
+      failed.push({ project: p.name, error: String(e?.message || e) });
+    }
+  }
+  return {
+    ok: installed.length > 0, installed, failed, series,
+    projects: wanted.map(p => p.file),
+    invalid: bad
+  };
+}
+
+/** 面板用：本机最近打开的 UE 工程 + 每个工程是否已装插件、版本是否与安装包一致 */
+export function ueInstallInfo(appRoot: string) {
+  const series = ueSeries(appRoot);
+  // 「是否最新」要比对真正的实现文件（只比 .uplugin 会把「代码变了但描述没变」当成最新）
+  const implFile = (dir: string) => path.join(dir, 'Content', 'Python', 'assetmanager_ue.py');
+  const items = ueProjects().map(p => {
+    const dstDir = path.join(p.pluginsDir, UE_PLUGIN_DIR);
+    const dst = path.join(dstDir, UE_PLUGIN_DIR + '.uplugin');
+    const exists = fs.existsSync(dst);
+    const pick = pickUeSeries(series, p.engine || series[series.length - 1]);
+    const srcDir = pick ? path.join(appRoot, 'bridge', 'ue', pick, UE_PLUGIN_DIR) : '';
+    let same = false;
+    try {
+      same = exists && !!srcDir
+        && fs.readFileSync(implFile(srcDir), 'utf8') === fs.readFileSync(implFile(dstDir), 'utf8')
+        && fs.readFileSync(path.join(srcDir, UE_PLUGIN_DIR + '.uplugin'), 'utf8')
+          === fs.readFileSync(dst, 'utf8');
+    } catch { /* 读不到就当不是最新 */ }
+    return {
+      name: p.name, file: p.file, engine: p.engine,
+      installed: exists, version: exists ? uePluginVersionOf(dst) : '', upToDate: same
+    };
+  });
+  return {
+    series,
+    projects: items.map(i => ({ name: i.name, file: i.file, engine: i.engine })),
+    items,
+    installedAt: items.filter(i => i.installed).map(i => i.file),
+    installed: items.some(i => i.installed)
   };
 }
 
