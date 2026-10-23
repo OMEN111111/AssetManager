@@ -32,6 +32,37 @@ function planarUV(g: THREE.BufferGeometry) {
   g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
 }
 
+/** 盒体：按「三角面」选主轴做平面投影——同一三角形只用一套投影，避免跨轴三角形被拉伸，
+ *  只在倒角过渡处留下细缝（这是盒式投影的固有特性）。会把几何转成非索引以便逐角写 UV。 */
+function planarUVByTriangle(g: THREE.BufferGeometry) {
+  const src: THREE.BufferGeometry = g.index ? g.toNonIndexed() : g;
+  const pos = src.attributes.position;
+  if (!pos) return g;
+  const uv = new Float32Array(pos.count * 2);
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  const ab = new THREE.Vector3(), ac = new THREE.Vector3(), n = new THREE.Vector3();
+  const s = 1 / UV_WORLD;
+  for (let i = 0; i + 2 < pos.count; i += 3) {
+    a.fromBufferAttribute(pos, i); b.fromBufferAttribute(pos, i + 1); c.fromBufferAttribute(pos, i + 2);
+    ab.subVectors(b, a); ac.subVectors(c, a); n.crossVectors(ab, ac);
+    const ax = Math.abs(n.x), ay = Math.abs(n.y), az = Math.abs(n.z);
+    for (let k = 0; k < 3; k++) {
+      const p = k === 0 ? a : k === 1 ? b : c;
+      let u = 0, v = 0;
+      if (ax >= ay && ax >= az) { u = p.z * s + 0.5; v = p.y * s + 0.5; }
+      else if (ay >= ax && ay >= az) { u = p.x * s + 0.5; v = p.z * s + 0.5; }
+      else { u = p.x * s + 0.5; v = p.y * s + 0.5; }
+      uv[(i + k) * 2] = u; uv[(i + k) * 2 + 1] = v;
+    }
+  }
+  g.setIndex(null);
+  g.setAttribute('position', pos.clone());
+  if (src.attributes.normal) g.setAttribute('normal', src.attributes.normal.clone());
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  g.setAttribute('uv1', new THREE.BufferAttribute(uv.slice(), 2));
+  return g;
+}
+
 /** 球：按弧长换算 UV，u/v 使用同一个世界尺度 */
 function sphereUV(g: THREE.BufferGeometry, radius: number) {
   const pos = g.attributes.position;
@@ -111,9 +142,41 @@ function roundedCylinder(radius: number, height: number, fillet: number, radial:
 
 export type PreviewGeometry = 'sphere' | 'box' | 'cylinder' | 'plane';
 
-/** 对自定义基本体按类型重算 UV（三向世界尺度投影，避免侧面/极点/端盖拉伸） */
+/** 对「没有 UV」的自定义基本体按类型生成 UV（只做兜底；有自带 UV 的模型不要覆盖） */
 export function remapUV(kind: PreviewGeometry, g: THREE.BufferGeometry) {
-  if (!g.attributes.position) return;
+  const pos = g.attributes.position;
+  if (!pos) return;
+  if (kind === 'sphere') {
+    g.computeBoundingBox();
+    const size = new THREE.Vector3();
+    g.boundingBox.getSize(size);
+    const radius = Math.max(size.x, size.y, size.z) / 2 || 1;
+    sphereUV(g, radius);
+    return;
+  }
+  if (kind === 'cylinder') {
+    g.computeBoundingBox();
+    const size = new THREE.Vector3();
+    g.boundingBox.getSize(size);
+    const half = size.y / 2 || 1;
+    const uv = new Float32Array(pos.count * 2);
+    const p = new THREE.Vector3();
+    for (let i = 0; i < pos.count; i++) {
+      p.fromBufferAttribute(pos, i);
+      const rad = Math.hypot(p.x, p.z);
+      const ang = Math.atan2(p.x, p.z);
+      if (Math.abs(Math.abs(p.y) - half) < 1e-3) {
+        uv[i * 2] = p.x / UV_WORLD; uv[i * 2 + 1] = p.z / UV_WORLD;
+      } else {
+        // 用局部半径算弧长，倒角处不会被拉伸
+        uv[i * 2] = (ang * rad) / UV_WORLD;
+        uv[i * 2 + 1] = (p.y + half) / UV_WORLD;
+      }
+    }
+    g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    return;
+  }
+  if (kind === 'box') { planarUVByTriangle(g); return; }
   if (kind !== 'plane') planarUV(g);
 }
 
@@ -153,7 +216,7 @@ export function makeGeometry(kind: PreviewGeometry, planeAxis: 'v' | 'h' = 'v'):
     // 细分会拆散顶点，必须焊接后重算法线，否则倒角处出现黑缝
     g = mergeVertices(g, 1e-4);
     g.computeVertexNormals();
-    planarUV(g);
+    planarUVByTriangle(g);
     return withUv1(g);
   }
   if (kind === 'cylinder') {
@@ -173,16 +236,14 @@ export function makeGeometry(kind: PreviewGeometry, planeAxis: 'v' | 'h' = 'v'):
     g.computeVertexNormals();
     return withUv1(g);
   }
-  // 球：用「立方体球化」+ 世界尺度投影代替经纬球，消除极点挤压
-  const g = new THREE.BoxGeometry(2, 2, 2, 128, 128, 128);
-  const pos = g.attributes.position;
-  const p = new THREE.Vector3();
-  for (let i = 0; i < pos.count; i++) {
-    p.fromBufferAttribute(pos, i).normalize();
-    pos.setXYZ(i, p.x, p.y, p.z);
+  // 球：经纬球自带正确 UV（接缝处顶点重复，不会插值出缝），UV 按世界尺度铺开
+  const g = new THREE.SphereGeometry(1, 192, 96);
+  const uv = g.attributes.uv;
+  for (let i = 0; i < uv.count; i++) {
+    uv.setXY(i, uv.getX(i) * (2 * Math.PI / UV_WORLD), uv.getY(i) * (Math.PI / UV_WORLD));
   }
+  uv.needsUpdate = true;
   g.computeVertexNormals();
-  planarUV(g);
   return withUv1(g);
 }
 

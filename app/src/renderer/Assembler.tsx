@@ -42,6 +42,7 @@ async function loadCustomGeometry(kind: string, ver = 0): Promise<THREE.BufferGe
     root?.traverse?.((o: any) => { if (!mesh && o.isMesh) mesh = o; });
     if (!mesh) { geoCache.set(key, null); return null; }
     const g = mesh.geometry.clone();
+    const hadUv = !!(g.attributes.uv && g.attributes.uv.count);
     g.computeBoundingBox();
     const size = new THREE.Vector3();
     g.boundingBox.getSize(size);
@@ -52,7 +53,7 @@ async function loadCustomGeometry(kind: string, ver = 0): Promise<THREE.BufferGe
     g.boundingBox.getCenter(c);
     g.translate(-c.x, -c.y, -c.z);
     if (!g.attributes.normal) g.computeVertexNormals();
-    if (!g.attributes.uv) {
+    if (!hadUv) {
       const pos = g.attributes.position;
       const uv = new Float32Array(pos.count * 2);
       for (let i = 0; i < pos.count; i++) {
@@ -61,6 +62,7 @@ async function loadCustomGeometry(kind: string, ver = 0): Promise<THREE.BufferGe
       }
       g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
     }
+    g.userData.autoUv = !hadUv;
     if (!g.attributes.uv1) g.setAttribute('uv1', g.attributes.uv);
     geoCache.set(key, g);
     return g;
@@ -441,8 +443,8 @@ export default function Assembler({ asset, onClose, folderPath }:
           ng.boundingBox.getCenter(c);
           ng.translate(-c.x, -c.y, -c.z);
         }
-        if (custom) remapUV('cylinder', ng);
-      } else if (custom && (geom === 'sphere' || geom === 'box')) {
+        if (custom && custom.userData.autoUv) remapUV('cylinder', ng);
+      } else if (custom && custom.userData.autoUv && (geom === 'sphere' || geom === 'box')) {
         remapUV(geom, ng);
       }
       if (custom && geom === 'plane' && planeAxis === 'h') ng.rotateX(-Math.PI / 2);
