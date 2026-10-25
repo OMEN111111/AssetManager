@@ -34,7 +34,7 @@
 */
 
 
-global AMB_SCRIPT_VERSION = "0.1.14"
+global AMB_SCRIPT_VERSION = "0.2.0"
 global AMB_PROTOCOL = 1
 global AMB_LOADED = undefined
 global AMB_PORT = 0
@@ -52,6 +52,8 @@ global AMB_NEXT_SCAN = 0
 global AMB_TOOLBAR = undefined
 global AMB_LAST_EXPORT = ""
 global AMB_CURRENT_ASSET = undefined
+-- 本次会话的资产注册表：每项 #(uuid, 名称, 源目录, 模型文件)；重启 Max 清空
+global AMB_ASSET_REG = #()
 global AMB_PENDING_IMPORT = undefined
 global AMB_PENDING_SPEC = undefined
 global AMB_PENDING_MODE = "editor"
@@ -87,6 +89,8 @@ global amb_cursor_ground, amb_move_to_point, amb_move_to_center, amb_begin_impor
 global amb_roots_of, amb_world_bounds, amb_shift_world
 global amb_drop_material
 global amb_asset_info, amb_info_direct, amb_drop_asset
+global amb_obj_uuid, amb_obj_prop, amb_nodes_deep, amb_tag_asset, amb_reg_put, amb_reg_get, amb_asset_of_obj
+global amb_collect_uuid, amb_export_any, amb_export_back, amb_maps_target, amb_notify_exported
 global amb_toolbar_refresh, amb_toolbar_show, amb_toolbar_toggle, amb_install_menu
 global AssetManagerBridge_Toolbar
 global ambToolbar, ambTemplateDlg, ambImportDlg, ambPackDlg
@@ -625,6 +629,8 @@ fn amb_info_from_payload payload kind spec = (
   if src != "" do append info #("sourceDir", src)
   local mp = amb_jgets payload "modelPath"
   if mp != "" do append info #("modelPath", mp)
+  local uv = amb_jgets payload "uuid"
+  if uv != "" do append info #("uuid", uv)
   if spec != undefined do append info #("material", spec)
   AMB_CURRENT_ASSET = info
   try (amb_toolbar_refresh()) catch ()
@@ -646,6 +652,12 @@ fn amb_do_import payload = (
   if not ok do return #(false, "导入失败：" + err, undefined)
 
   local created = for o in objects where (findItem before o == 0) collect o
+  local uuid = amb_jgets payload "uuid"
+  if uuid != "" and created.count > 0 do (
+    amb_reg_put uuid #(uuid, amb_jgets payload "name", amb_jgets payload "sourceDir", amb_jgets payload "modelPath")
+    local nTag = amb_tag_asset created uuid (amb_jgets payload "name") (amb_jgets payload "sourceDir") (amb_jgets payload "modelPath")
+    amb_log ("uuid tag (queue) " + uuid + " objects=" + (nTag as string))
+  )
   local applied = 0
   local matMsg = ""
   local spec = amb_jget payload "material"
@@ -1339,6 +1351,14 @@ fn amb_import_now choice = (
   if created.count == 0 do return "导入完成，但没有新增对象"
   try (clearSelection(); select created) catch ()
 
+  -- 资产归属：记住 UUID → 源目录/模型文件，并给对象打标（导回靠它认人）
+  local uuid = amb_jgets info "uuid"
+  if uuid != "" do (
+    amb_reg_put uuid #(uuid, amb_jgets info "name", amb_jgets info "sourceDir", amb_jgets info "modelPath")
+    local nTag = amb_tag_asset created uuid (amb_jgets info "name") (amb_jgets info "sourceDir") (amb_jgets info "modelPath")
+    amb_log ("uuid tag " + uuid + " objects=" + (nTag as string))
+  )
+
   -- 素材里有贴图配置就补上（模型自带材质时不动）
   local spec = amb_jget info "material"
   local autoMat = false
@@ -1397,20 +1417,21 @@ fn amb_asset_info assetId = (
   try (amb_parse txt) catch undefined
 )
 
-fn amb_info_direct assetId kind sourceDir nm modelPath = (
+fn amb_info_direct assetId kind sourceDir nm modelPath uuid = (
   local info = #()
   append info #("assetId", assetId)
   append info #("name", nm)
   append info #("type", kind)
   if sourceDir != "" do append info #("sourceDir", sourceDir)
   if modelPath != "" do append info #("modelPath", modelPath)
+  if uuid != "" do append info #("uuid", uuid)
   info
 )
 
 /** AssetManager 拖过来的 .ms 调这里 */
-fn amb_drop_asset assetId filePath kind sourceDir nm modelPath = (
+fn amb_drop_asset assetId filePath kind sourceDir nm modelPath uuid:"" = (
   amb_log ("drop asset=" + (assetId as string) + " kind=" + (kind as string) + " file=" + (filePath as string))
-  local info = amb_info_direct assetId (kind as string) (sourceDir as string) (nm as string) (modelPath as string)
+  local info = amb_info_direct assetId (kind as string) (sourceDir as string) (nm as string) (modelPath as string) (uuid as string)
   local spec = undefined
   if filePath != "" do (
     local r = undefined
@@ -1435,6 +1456,209 @@ fn amb_drop_asset assetId filePath kind sourceDir nm modelPath = (
   )
 )
 
+/* ------------------------------------------------ 资产归属（UUID）/ 导回 */
+
+/** 取对象的 UUID；没有就返回空串（注意：getUserProp 没有时返回 undefined，直接 as string 会得到 "undefined"） */
+fn amb_obj_uuid o = (
+  local raw = undefined
+  try (raw = getUserProp o #ambUuid) catch (raw = undefined)
+  if raw == undefined then return ""
+  local s = raw as string
+  if s == "undefined" do return ""
+  s
+)
+
+/** 取对象的某个资产属性（同样处理 undefined） */
+fn amb_obj_prop o key = (
+  local raw = undefined
+  try (raw = getUserProp o key) catch (raw = undefined)
+  if raw == undefined then return ""
+  local s = raw as string
+  if s == "undefined" do return ""
+  s
+)
+/** 递归展开（组头 Helper 也会返回，方便收集组内对象） */
+fn amb_nodes_deep roots = (
+  local out = #()
+  local queue = #()
+  local cur = undefined
+  local ch = undefined
+  local c = undefined
+  local i = 1
+  for o in roots do append queue o
+  while i <= queue.count do (
+    cur = queue[i]
+    append out cur
+    ch = undefined
+    try (ch = cur.children) catch (ch = undefined)
+    if ch != undefined do (for c in ch do append queue c)
+    i += 1
+  )
+  out
+)
+
+/** 会话注册表：uuid → #(uuid, 名称, 源目录, 模型文件) */
+fn amb_reg_put uuid rec = (
+  local idx = 0
+  local k = 1
+  for r in AMB_ASSET_REG do (
+    if (r[1] as string) == uuid do idx = k
+    k += 1
+  )
+  if idx > 0 then AMB_ASSET_REG[idx] = rec else append AMB_ASSET_REG rec
+  rec
+)
+
+fn amb_reg_get uuid = (
+  local out = undefined
+  for r in AMB_ASSET_REG do (
+    if (r[1] as string) == uuid do out = r
+  )
+  out
+)
+
+/** 给对象（含组内）打资产标记；新增/附加/分离出来的对象由导出时提示补 */
+fn amb_tag_asset objs uuid nm dir model = (
+  if uuid == "" do return 0
+  local all = amb_nodes_deep objs
+  local n = 0
+  for o in all where (superClassOf o == GeometryClass) do (
+    try (
+      setUserProp o #ambUuid uuid
+      setUserProp o #ambName nm
+      setUserProp o #ambDir dir
+      setUserProp o #ambModel model
+      n += 1
+    ) catch ()
+  )
+  n
+)
+
+/** 从对象上取资产信息：#(uuid, 名称, 源目录, 模型文件)；注册表优先，其次对象属性 */
+fn amb_asset_of_obj o = (
+  local uuid = amb_obj_uuid o
+  if uuid == "" do return #("", "", "", "")
+  local r = amb_reg_get uuid
+  if r != undefined do return r
+  #(uuid, (amb_obj_prop o #ambName), (amb_obj_prop o #ambDir), (amb_obj_prop o #ambModel))
+)
+
+/** 场景里属于该 uuid 的所有几何体 */
+fn amb_collect_uuid uuid = (
+  local out = #()
+  if uuid == "" do return out
+  local all = amb_nodes_deep objects
+  local u = ""
+  for o in all where (superClassOf o == GeometryClass) do (
+    u = amb_obj_uuid o
+    if u == uuid do append out o
+  )
+  out
+)
+
+/** 贴图落点：资产里已有 maps 子目录就放那儿，否则放资产根目录 */
+fn amb_maps_target dir = (
+  local sub = dir + "\\maps"
+  if (amb_is_dir sub) then sub else dir
+)
+
+/** 按扩展名导出（FBX / OBJ） */
+fn amb_export_any file objs ext withMat = (
+  local ok = true
+  local err = ""
+  try (
+    clearSelection()
+    if objs.count > 0 do select objs
+    if ext == ".obj" then (
+      exportFile file #noPrompt selectedOnly:true using:ObjExp
+    ) else (
+      try (FBXExporterSetParam "EmbedTextures" false) catch ()
+      try (FBXExporterSetParam "Animation" false) catch ()
+      try (FBXExporterSetParam "Materials" (if withMat then true else false)) catch ()
+      exportFile file #noPrompt selectedOnly:true using:FBXEXP
+    )
+  ) catch (ok = false; err = amb_err())
+  if ok and not (doesFileExist file) do (ok = false; err = "导出命令没有生成文件")
+  amb_log ("export-back " + file + " ok=" + (ok as string) + " " + err)
+  #(ok, err)
+)
+
+/** 通知 AssetManager 重扫该资产（UUID 认人） */
+fn amb_notify_exported uuid dir = (
+  if not (amb_ensure_port()) do return false
+  local payload = "{\"uuid\":\"" + (amb_esc uuid) + "\",\"dir\":\"" + (amb_esc dir) + "\"}"
+  local r = amb_post_json (amb_url "/api/bridge/max/exported") payload
+  amb_log ("notify exported uuid=" + uuid + " ok=" + ((r != undefined) as string))
+  (r != undefined)
+)
+
+/** 导回到源目录：按当前选中对象的 UUID 收集整个资产，写回原文件（.max/.glb 另存 FBX） */
+fn amb_export_back = (
+  local sel = selection as array
+  if sel.count == 0 do return "先在视口里选中该资产的对象"
+  local tagged = undefined
+  local uuid = ""
+  local u = ""
+  for o in sel while tagged == undefined do (
+    u = amb_obj_uuid o
+    if u != "" do (tagged = o; uuid = u)
+  )
+  if tagged == undefined do return "选中对象没有素材来源（UUID），不做导回"
+
+  local rec = amb_asset_of_obj tagged
+  local nm = rec[2] as string
+  local dir = rec[3] as string
+  local model = rec[4] as string
+  if dir == "" or dir == undefined do return "这个资产没有记录源目录：请重新从 AssetManager 发送一次再改"
+
+  local mine = amb_collect_uuid uuid
+  if mine.count == 0 do return "场景里找不到该资产的对象"
+
+  -- 目标文件：Model 是 FBX/OBJ 就覆盖；.max/.glb 等另存 FBX（不覆盖原文件）
+  local ext = toLower (getFilenameType model)
+  local target = model
+  local mode = "overwrite"
+  if ext != ".fbx" and ext != ".obj" do (
+    local baseName = nm
+    if baseName == "" do baseName = getFilenameFile model
+    if baseName == "" do baseName = "Asset_Export"
+    target = dir + "\\" + baseName + "_fromMax.fbx"
+    ext = ".fbx"
+    mode = "copy"
+  )
+  if target == undefined or target == "" do return "没有可写回的目标文件"
+
+  -- 覆盖前先备份到临时目录（FBX 导出会删同目录 .bak，所以不放旁边）
+  local backup = ""
+  if mode == "overwrite" and (doesFileExist target) do (
+    local bdir = ((dotNetClass "System.IO.Path").GetTempPath()) + "AssetManager\\backup"
+    try (if not (amb_is_dir bdir) do makeDir bdir) catch ()
+    local stamp = ""
+    try (stamp = (dotNetClass "System.DateTime").Now.ToString("yyyyMMdd-HHmmss")) catch (stamp = "bak")
+    backup = bdir + "\\" + (getFilenameFile target) + "-" + stamp + (getFilenameType target)
+    try (copyFile target backup) catch (backup = "")
+  )
+
+  local r = amb_export_any target mine ext true
+  if not r[1] do return ("导出失败：" + (r[2] as string))
+
+  -- 贴图：复制进资产目录（覆盖同名）+ 重写槽位表，让软件预览按槽位接图
+  local maps = amb_bitmaps_of mine
+  local mt = amb_maps_target dir
+  local mc = amb_copy_maps mt maps true
+  try (amb_write_slots dir mine) catch ()
+
+  try (amb_notify_exported uuid dir) catch ()
+
+  local msg = (if mode == "copy" then "已另存 FBX：" else "已覆盖导回：") + target
+  if mc[1].count > 0 do msg += "；贴图 " + (mc[1].count as string) + " 个"
+  if (mc[2].count + mc[3].count) > 0 do msg += "（跳过 " + (mc[2].count as string) + " / 失败 " + (mc[3].count as string) + "）"
+  if backup != "" do msg += "；原文件备份 " + backup
+  AMB_LAST_EXPORT = msg
+  amb_log msg
+  amb_toolbar_refresh()
+  msg
+)
 /* ---------------------------------------------------------------- 工具栏 */
 
 rollout ambToolbar "AssetManager" width:352
@@ -1445,6 +1669,7 @@ rollout ambToolbar "AssetManager" width:352
   (
     checkbox chkMaps "附带贴图（复制进包内 maps\\）" checked:false
     button btnPack "打包选中对象到指定位置…" width:322 height:24
+    button btnBack "导回到源目录（覆盖模型 + 贴图）" width:322 height:24
   )
   label lblLast "—" align:#left height:16
   button btnRefresh "刷新" width:110 height:22 across:3
@@ -1453,6 +1678,9 @@ rollout ambToolbar "AssetManager" width:352
 
   on btnPack pressed do (
     lblLast.text = amb_ellipsis (amb_export_pack withMat:true withMaps:chkMaps.checked) 52
+  )
+  on btnBack pressed do (
+    lblLast.text = amb_ellipsis (amb_export_back()) 52
   )
   on btnRefresh pressed do (
     try (amb_heartbeat()) catch ()
@@ -1559,6 +1787,7 @@ fn amb_toolbar_refresh = (
     local atype = amb_jgets AMB_CURRENT_ASSET "type"
     local aTxt = "当前素材：—"
     if an != "" do aTxt = "当前素材：" + an + "（" + atype + "）"
+    if AMB_ASSET_REG.count > 0 do aTxt += "  ·  本次会话 " + (AMB_ASSET_REG.count as string) + " 个资产"
     AMB_TOOLBAR.lblAsset.text = amb_ellipsis aTxt 44
     if AMB_LAST_EXPORT != "" do AMB_TOOLBAR.lblLast.text = amb_ellipsis AMB_LAST_EXPORT 52
   ) catch ()

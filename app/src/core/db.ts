@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -116,6 +117,10 @@ export function openDb(file: string): DB {
   if (!cols.some(c => c.name === 'thumb_file')) {
     db.exec('ALTER TABLE assets ADD COLUMN thumb_file TEXT');
   }
+  // Max 导回：素材的稳定标识（UUID），首次发送时生成
+  if (!cols.some(c => c.name === 'uuid')) {
+    db.exec('ALTER TABLE assets ADD COLUMN uuid TEXT');
+  }
   try {
     const mc = db.prepare('PRAGMA table_info(material_overrides)').all() as any[];
     if (mc.length && !mc.some(c => c.name === 'swizzle')) {
@@ -127,6 +132,28 @@ export function openDb(file: string): DB {
   return db;
 }
 
+/**
+ * 素材的稳定标识（3ds Max 导回用）。
+ * 首次调用生成 v4 UUID 并写回库里；已有就原样返回。
+ */
+export function assetUuid(db: DB, assetId: number): string {
+  try {
+    const r = db.prepare('SELECT uuid FROM assets WHERE id=?').get(assetId) as any;
+    if (!r) return '';
+    if (r.uuid) return String(r.uuid);
+    const u = randomUUID();
+    db.prepare('UPDATE assets SET uuid=? WHERE id=?').run(u, assetId);
+    return u;
+  } catch { return ''; }
+}
+
+/** 按 UUID 反查素材（Max 导回时回报用） */
+export function assetIdByUuid(db: DB, uuid: string): number | null {
+  try {
+    const r = db.prepare('SELECT id FROM assets WHERE uuid=?').get(String(uuid)) as any;
+    return r ? Number(r.id) : null;
+  } catch { return null; }
+}
 export function upsertLibrary(db: DB, root: string): number {
   const abs = path.resolve(root);
   const existing = db.prepare('SELECT id FROM libraries WHERE root = ?').get(abs) as { id: number } | undefined;

@@ -697,3 +697,34 @@ input,textarea,select,pre,code,.path,.dpath,.dvalue,.selectable{user-select:text
   border: 1px solid var(--line); cursor: crosshair; }
 .huedot { position: absolute; width: 10px; height: 10px; border-radius: 50%;
   border: 2px solid #fff; transform: translate(-50%, -50%); box-shadow: 0 0 0 1px #0006; pointer-events: none; }
+
+/* 0.4.8：贴图四通道常显 / 行内替换 / RGBA / HDRI 方形缩略图 */
+.vp-sec.off{display:none}                    /* 启用 HDRI 后整块光照直接隐藏（原来只是变淡） */
+.vp-sub-row{display:flex;align-items:center;gap:6px}
+.vp-addch{margin-left:auto;max-width:104px}
+.vp-texph{width:38px;height:38px;flex:none;display:grid;place-items:center;border-radius:5px;background:#0b0c0e;border:1px dashed rgba(255,255,255,.16);color:#5b6270;font-size:10px}
+.vp-texsel{flex:1;min-width:0;max-width:148px}
+.vp-rgba{display:grid;grid-template-columns:repeat(2,14px);grid-template-rows:repeat(2,14px);gap:2px;flex:none}
+.vp-c{width:14px;height:14px;font-size:9px;line-height:1;border-radius:3px;border:1px solid rgba(255,255,255,.14);background:#1a1d23;color:#9aa1ac;padding:0;cursor:pointer}
+.vp-c.on{background:#3b6ea5;border-color:#4d87c7;color:#fff}
+.hdri-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-height:200px;overflow:auto;padding-right:2px}
+.hdri-tile{display:flex;flex-direction:column;gap:3px;background:none;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:3px;cursor:pointer}
+.hdri-tile img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:4px;background:#0b0c0e;display:block}
+.hdri-tile em{font-style:normal;font-size:9px;color:#9aa1ac;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
+.hdri-tile.on{border-color:#4d87c7;box-shadow:inset 0 0 0 1px #4d87c7}
+.hdri-none{aspect-ratio:1;display:grid;place-items:center;background:#15181d;border-radius:4px;color:#6b7280;font-size:11px}
+
+/* 0.4.9：HDRI 下拉菜单（小图标、只上下滚动） + 材质组 */
+.hdri-btn{display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%}
+.hdri-cur{display:flex;align-items:center;gap:6px;min-width:0}
+.hdri-cur img{width:22px;height:22px;object-fit:cover;border-radius:4px;background:#0b0c0e;flex:none}
+.hdri-cur em{font-style:normal;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#b9c0cb}
+.hdri-pop{display:flex;flex-direction:column;gap:2px;max-height:210px;overflow-y:auto;overflow-x:hidden;
+  border:1px solid rgba(255,255,255,.1);border-radius:6px;background:#101216;padding:4px}
+.hdri-row{display:flex;align-items:center;gap:7px;background:none;border:0;padding:3px 4px;border-radius:5px;
+  cursor:pointer;text-align:left;width:100%}
+.hdri-row:hover{background:rgba(255,255,255,.06)}
+.hdri-row.on{background:rgba(77,135,199,.22)}
+.hdri-row img{width:26px;height:26px;object-fit:cover;border-radius:4px;background:#0b0c0e;flex:none}
+.hdri-row em{font-style:normal;font-size:10.5px;color:#b9c0cb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hdri-none.sm{width:26px;height:26px;flex:none;display:grid;place-items:center;background:#15181d;border-radius:4px;color:#6b7280;font-size:9px}

@@ -238,7 +238,67 @@ const CHANNEL_META: { key: Channel; label: string }[] = [
  * 通道预览材质：只看某一张贴图，用 Basic 材质避免光照干扰。
  * base 是组装好的 PBR 材质（MeshStandardMaterial），从中取对应的 map。
  */
-function channelMaterial(ch: Channel, base: any): THREE.Material {
+/** 多子材质：按槽位取/放材质（不能整块换成单材质） */
+function matOf(c: any) {
+  return Array.isArray(c?.mesh?.material) ? c.mesh.material[c.slot || 0] : c?.mesh?.material;
+}
+function setMatOf(c: any, m: any) {
+  const cur = c?.mesh?.material;
+  if (Array.isArray(cur)) {
+    const a = cur.slice();
+    a[c.slot || 0] = m;
+    c.mesh.material = a;
+  } else if (c?.mesh) {
+    c.mesh.material = m;
+  }
+}
+
+/** 把打包图按通道烘成灰度贴图（缓存，供通道预览使用） */
+const __chanCache = new WeakMap<THREE.Texture, Map<string, THREE.Texture>>();
+function bakeChannelTexture(tex: any, comp: string): any {
+  if (!tex || comp === 'rgb') return tex;
+  const img: any = tex.image;
+  const w = img?.naturalWidth || img?.width || 0;
+  const h = img?.naturalHeight || img?.height || 0;
+  if (!w || !h) return tex;
+  let m = __chanCache.get(tex);
+  if (!m) { m = new Map(); __chanCache.set(tex, m); }
+  const hit = m.get(comp);
+  if (hit) return hit;
+  try {
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const c = cv.getContext('2d')!;
+    c.drawImage(img, 0, 0);
+    const d = c.getImageData(0, 0, w, h);
+    const idx = comp === 'r' ? 0 : comp === 'g' ? 1 : comp === 'b' ? 2 : 3;
+    for (let i = 0; i < d.data.length; i += 4) {
+      const v = d.data[i + idx];
+      d.data[i] = v; d.data[i + 1] = v; d.data[i + 2] = v; d.data[i + 3] = 255;
+    }
+    c.putImageData(d, 0, 0);
+    const t = new THREE.CanvasTexture(cv);
+    t.colorSpace = THREE.NoColorSpace;
+    t.wrapS = tex.wrapS; t.wrapT = tex.wrapT;
+    t.repeat.copy(tex.repeat); t.offset.copy(tex.offset);
+    t.anisotropy = 8;
+    m.set(comp, t);
+    return t;
+  } catch { return tex; }
+}
+
+/** 打包图（ARM/ORM）在通道预览里该取哪个通道 */
+function channelSwz(m: any, ch: string): string {
+  if (!m) return 'rgb';
+  const key = ch === 'rough' ? 'roughness' : ch === 'albedo' ? 'baseColor' : ch;
+  const shared = (a: any, b: any) => a && b && a === b;
+  if (key === 'roughness' && shared(m.roughnessMap, m.metalnessMap)) return 'g';
+  if (key === 'metallic' && shared(m.metalnessMap, m.roughnessMap)) return 'b';
+  if (key === 'ao' && (shared(m.aoMap, m.roughnessMap) || shared(m.aoMap, m.metalnessMap))) return 'r';
+  return 'rgb';
+}
+
+function channelMaterial(ch: Channel, base: any, swz = 'rgb'): THREE.Material {
   const side = base?.side ?? THREE.FrontSide;
   const pick = (t: any) => new THREE.MeshBasicMaterial({ map: t || null, color: t ? 0xffffff : 0x8b93a1, side });
   switch (ch) {
@@ -249,11 +309,11 @@ function channelMaterial(ch: Channel, base: any): THREE.Material {
     case 'normal':
       return pick(base?.normalMap);
     case 'rough':
-      return pick(base?.roughnessMap);
+      return pick(bakeChannelTexture(base?.roughnessMap, swz));
     case 'metallic':
-      return pick(base?.metalnessMap);
+      return pick(bakeChannelTexture(base?.metalnessMap, swz));
     case 'ao':
-      return pick(base?.aoMap);
+      return pick(bakeChannelTexture(base?.aoMap, swz));
     case 'height':
       return pick(base?.displacementMap || base?.bumpMap);
     case 'emissive':
@@ -328,14 +388,11 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
   const [activeMat, setActiveMat] = useState(-1);
   const [meshList, setMeshList] = useState<any[]>([]);
   const [matGroups, setMatGroups] = useState<{ name: string; count: number }[]>([]);
+  const [udimOn, setUdimOn] = useState(false);              // 是否按 UDIM 图集处理（默认开）
+  const [panelOpen, setPanelOpen] = useState(true);        // 右侧详情面板展开/收起
   const [tiles, setTiles] = useState<string[]>([]);
   // F-007：模型材质/通道贴图覆盖
   const [ovVersion, setOvVersion] = useState(0);
-  const [ovOpen, setOvOpen] = useState(false);
-  const [ovMatSel, setOvMatSel] = useState('');
-  const [ovChSel, setOvChSel] = useState('baseColor');
-  const [ovSwz, setOvSwz] = useState<'rgb' | 'r' | 'g' | 'b' | 'a'>('rgb');
-  const [ovFileSel, setOvFileSel] = useState('');
 
   const [exposure, setExposure] = useState(1);
   const [envI, setEnvI] = useState(1);
@@ -350,6 +407,9 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
   const [hdriRot, setHdriRot] = useState(0);
   const [hdriBright, setHdriBright] = useState(1);
   const [texPreview, setTexPreview] = useState<{ src: string; name: string } | null>(null);
+  const [extraChans, setExtraChans] = useState<string[]>([]);
+  const [hdriOpen, setHdriOpen] = useState(false);             // HDRI 下拉菜单是否展开
+  const [ovMapState, setOvMapState] = useState<any>({});        // 已保存的手动贴图覆盖（材质→通道→{rel,swizzle}）   // 贴图区额外显示的通道（AO/置换/自发光/不透明）
   const [groupTex, setGroupTex] = useState<any[][]>([]);
   const [mapUv, setMapUv] = useState(0);
   const [showHdri, setShowHdri] = useState(false);
@@ -913,7 +973,9 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         const special = await preloadSpecialTextures(files);
         const manager = new THREE.LoadingManager();
         manager.setURLModifier(url => {
-          if (/^(data:|blob:|https?:)/i.test(url)) return url;
+          // 注意：FBX 里的贴图路径可能是 `..\别的目录\maps\x.jpg`（作者的相邻目录），three 会拼成绝对 http URL；
+          // 这里不能看到 http: 就放行，否则贴图 404、材质全黑。一律按「文件名」回素材目录里找。
+          if (/^(data:|blob:)/i.test(url)) return url;
           let name = url;
           try { name = decodeURIComponent(url.split('?')[0]); } catch { /* keep */ }
           name = name.replace(/\\/g, '/').split('/').pop()!.toLowerCase();
@@ -945,28 +1007,103 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         const fileNameOf = (src: string) => {
           try { return decodeURIComponent(String(src).split('/').pop() || ''); } catch { return ''; }
         };
+        // 按「材质对象身份」分组：FBX 里常有多个材质同名（或都叫 __DEFAULT），
+        // 按名字分组会把它们并成一个，表现就是「材质球识别不全」＋贴图串在一起。
+        // FBX 常导出成 MeshPhongMaterial：① 它没有 roughnessMap/metalnessMap 通道；
+        // ② 材质 color 常被写成绿/红之类的占位色，乘到贴图上就是"纯色"。
+        // 统一规范成 MeshStandardMaterial（有贴图时颜色刷白），通道才真正起作用。
+        const toStandard = (m: any): any => {
+          if (!m) return m;
+          const t = String(m.type || '');
+          const sanitize = (mm: any) => {
+            // FBX 常见的假自发光：emissive=白但没有自发光贴图 → 整块发白
+            if (!mm.emissiveMap && mm.emissive) {
+              const e = mm.emissive;
+              if (Math.max(e.r ?? 0, e.g ?? 0, e.b ?? 0) >= 0.9) e.setRGB(0, 0, 0);
+            }
+            if (typeof mm.emissiveIntensity === 'number' && mm.emissiveIntensity > 2) mm.emissiveIntensity = 1;
+            if (typeof mm.envMapIntensity === 'number' && mm.envMapIntensity > 1) mm.envMapIntensity = 1;
+            return mm;
+          };
+          if (t === 'MeshStandardMaterial' || t === 'MeshPhysicalMaterial') {
+            if (m.map && m.color && !m.color.equals?.WHITE) m.color.setRGB(1, 1, 1);
+            return sanitize(m);
+          }
+          const hasMap = !!m.map;
+          const std: any = new THREE.MeshStandardMaterial({
+            name: m.name,
+            color: hasMap ? 0xffffff : (m.color ? m.color.clone() : new THREE.Color(0xffffff)),
+            map: m.map || null,
+            normalMap: m.normalMap || null,
+            aoMap: m.aoMap || null,
+            aoMapIntensity: m.aoMapIntensity ?? 1,
+            emissiveMap: m.emissiveMap || null,
+            emissive: m.emissive ? m.emissive.clone() : new THREE.Color(0x000000),
+            alphaMap: m.alphaMap || null,
+            transparent: !!m.transparent,
+            opacity: m.opacity ?? 1,
+            alphaTest: m.alphaTest ?? 0,
+            side: m.side ?? THREE.FrontSide,
+            flatShading: !!m.flatShading,
+            // Phong 的 shininess → roughness 粗估（shininess 0..1000）
+            roughness: typeof m.shininess === 'number' ? Math.min(1, Math.max(0.05, 1 - m.shininess / 1000)) : 0.85,
+            metalness: 0
+          });
+          if (m.normalScale) std.normalScale.copy(m.normalScale);
+          if (m.normalMap) std.normalMapType = m.normalMapType ?? THREE.TangentSpaceNormalMap;
+          if (!std.emissiveMap && std.emissive) {
+            const e = std.emissive;
+            if (Math.max(e.r, e.g, e.b) >= 0.9) e.setRGB(0, 0, 0);
+          }
+          std.needsUpdate = true;
+          return std;
+        };
+        const normMat = (mm: any) => (Array.isArray(mm) ? mm.map(toStandard) : toStandard(mm));
+
         const baseKey = (material: any) => {
           const m = Array.isArray(material) ? material[0] : material;
-          const nm = String(m?.name || '').trim();
-          if (nm && nm !== '__DEFAULT') return 'n:' + nm;
-          const src = m?.map?.image?.src;
-          if (src) return 't:' + src;
-          return 'shared';
+          if (!m) return 'none';
+          const nm = String((m as any).name || '').trim();
+          // 有名按名字合并：FBXLoader 会给每个网格复制一份同名材质对象，
+          // 按对象身份分组会把同一个材质球拆成十几份；无名（__DEFAULT）才按对象身份区分。
+          if (nm && nm !== '__DEFAULT') return 'n:' + nm.toLowerCase();
+          const uid = (m as any).uuid || `${(m as any).type || 'mat'}`;
+          return 'm:' + uid;
         };
+        // 多子材质（3ds Max 的 Multi/Sub-Object）：three 会给出 mesh.material = [mat0, mat1...]，
+        // 必须按槽位单独看成"一个材质球"，并且**不能**把数组换成单材质（否则整块模型只剩一个材质）。
         obj.traverse((o: any) => {
           if (o.isMesh) {
+            if (o.material) o.material = normMat(o.material);
             const orig = o.material;
             const first = Array.isArray(orig) ? orig[0] : orig;
-            const hasOwn = !!(first && (first.map || first.emissiveMap));
-            const key = hasOwn ? baseKey(orig) : 'shared';
-            collected.push({
-              mesh: o, key, kept: hasOwn,
-              matName: (first?.name && first.name !== '__DEFAULT' ? first.name : fileNameOf(first?.map?.image?.src || '')) || `Mesh ${collected.length + 1}`,
-              ownMat: hasOwn ? orig : mat
-            });
+            // 只要网格自带材质就保留它（哪怕这个材质暂时没有贴图）：
+            // 之前用「有没有贴图」判断，FBX 里没读出贴图的材质会被换成全局单材质，
+            // 表现就是「木板变成铁扶手的材质」——而且是在贴图加载完之后才变，看着像闪一下。
+            const hasMat = !!first;
+            const slotName = (mm: any, si: number) =>
+              (mm?.name && mm.name !== '__DEFAULT' ? mm.name : fileNameOf(mm?.map?.image?.src || '')) || `材质 ${si + 1}`;
             if (o.geometry?.attributes?.uv && !o.geometry.attributes.uv1) o.geometry.setAttribute('uv1', o.geometry.attributes.uv);
-            // 模型自带贴图时保留原始材质，避免多材质模型全部套同一张贴图
-            if (!hasOwn) o.material = mat;
+            if (!hasMat) {
+              // 只有完全没材质的网格才退回全局材质
+              o.material = mat;
+              collected.push({ mesh: o, key: 'none', kept: false, matName: `Mesh ${collected.length + 1}`, ownMat: mat, slot: 0 });
+            } else if (Array.isArray(orig) && orig.length > 1) {
+              // 多子材质：每个槽位单独成组（frame / board …），整块 material 数组保持不动
+              orig.forEach((mm: any, si: number) => {
+                collected.push({
+                  mesh: o, key: baseKey(mm), kept: true,
+                  matName: slotName(mm, si),
+                  ownMat: orig, slot: si
+                });
+              });
+            } else {
+              collected.push({
+                mesh: o, key: baseKey(orig), kept: !!(first.map || first.emissiveMap),
+                matName: slotName(first, 0),
+                ownMat: orig, slot: 0
+              });
+            }
           }
         });
         // 按材质对象/贴图归组（空名字的不同材质也能分开）
@@ -976,33 +1113,92 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           arr.push(c);
           gmap.set(c.key, arr);
         }
-        // 无自带贴图的组：按材质名匹配同名贴图
+        // 逐材质组：以「模型自带材质」为准，只补它缺的通道（多材质模型绝不能被别的材质覆盖）
         for (const [key, list] of gmap) {
-          if (key === 'shared') continue;
+          if (key === "none") continue;
           const c0 = list[0];
-          const nm = String(c0.matName || '');
-          const norm = nm.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const own0: any = matOf(c0);
+          const nm = String(c0.matName || "");
+          const norm = nm.toLowerCase().replace(/[^a-z0-9]/g, "");
           const sub = files.filter(f => {
-            const n = f.rel_path.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const n = f.rel_path.toLowerCase().replace(/[^a-z0-9]/g, "");
             return norm.length >= 3 && n.includes(norm);
           });
-          if (!sub.some(f => /\.(png|jpe?g|tga|tiff?)$/i.test(f.rel_path))) continue;
-          const m = mat.clone();
-          const uBase2 = await udimAtlas(sub, ['diff', 'albedo', 'basecolor', 'color'], true);
-          const base = findFile(sub, 'basecolor', 'base_color', 'albedo', 'diffuse', '_diff', 'color');
-          if (uBase2) m.map = uBase2; else if (base) m.map = await tex(base, true);
-          const nor = findFile(sub, 'normal', '_nrm');
-          if (nor) m.normalMap = await tex(nor);
-          const rr = findFile(sub, 'roughness', 'rough');
-          if (rr) m.roughnessMap = await tex(rr);
-          const mm = findFile(sub, 'metallic', 'metal');
-          if (mm) { m.metalnessMap = await tex(mm); m.metalness = 1; }
-          const aa = findFile(sub, '_ao', 'occlusion');
-          if (aa) m.aoMap = await tex(aa);
+          const hasImgs = sub.some(f => /\.(png|jpe?g|tga|tiff?)$/i.test(f.rel_path));
+          const broken = (t: any) => !!t && !t.image;            // 有贴图对象但图没加载出来
+          const missing = (t: any) => !t || broken(t);
+          const lackBase = missing(own0?.map);
+          const lackNor = missing(own0?.normalMap);
+          const lackRough = !own0?.roughnessMap;
+          const lackMetal = !own0?.metalnessMap;
+          const lackAo = !own0?.aoMap;
+          const anyLack = lackBase || lackNor || lackRough || lackMetal || lackAo;
+          // 自带贴图齐全且都加载成功 → 原样保留
+          // 只要模型自带材质（哪怕只带漫反射）就原样保留、绝不改写：
+          // 往缺的通道里补素材目录的图会让表面看起来"被打乱"，而材质球列表仍是对的，非常难查
+          if (c0.kept) continue;
+          if (!hasImgs) continue;
+          // 保留模型材质本身（它带正确的颜色/参数），只往空槽里补本组自己的贴图
+          const m: any = (c0.kept && own0) ? own0 : new THREE.MeshStandardMaterial({
+            color: 0xffffff, roughness: 0.85, metalness: 0,
+            side: (mat as any).side, envMapIntensity: (mat as any).envMapIntensity
+          });
+          if (lackBase) {
+            const uBase2 = await udimAtlas(sub, ["diff", "albedo", "basecolor", "color"], true);
+            const base = findFile(sub, "basecolor", "base_color", "albedo", "diffuse", "_diff", "_col", "color");
+            if (uBase2) m.map = uBase2; else if (base) m.map = await tex(base, true);
+          }
+          if (lackNor) {
+            const nor = findFile(sub, "nor_gl", "nor_dx", "nor_ogl", "normal", "_nrm", "_norm", "bump");
+            if (nor) {
+              m.normalMap = await tex(nor);
+              if (/_dx|nor_dx/i.test(nor.rel_path)) m.normalScale = new THREE.Vector2(1, -1);
+            }
+          }
+          // 打包图（ARM/ORM）优先：一张图拆 R/G/B 分别给 AO / 粗糙 / 金属
+          const packed = findFile(sub, "_arm_", "_orm_", "_rma_", "_omr_", "arm.", "orm.");
+          if (packed) {
+            const pn = packed.rel_path.toLowerCase();
+            const omr = /(_omr_|_rma_|orm\.)/.test(pn);
+            const t = await tex(packed, false);
+            if (lackAo) { m.aoMap = bakeChannelTexture(t, 'r'); m.aoMapIntensity = 1; }
+            if (lackRough) m.roughnessMap = bakeChannelTexture(t, omr ? 'b' : 'g');
+            if (lackMetal) { m.metalnessMap = bakeChannelTexture(t, omr ? 'g' : 'b'); m.metalness = 1; }
+          } else {
+            if (lackRough) {
+              const rr = findFile(sub, "rough", "gloss", "rgh");
+              if (rr) m.roughnessMap = await tex(rr);
+            }
+            if (lackMetal) {
+              const mm2 = findFile(sub, "metal", "mtl", "spec");
+              if (mm2) { m.metalnessMap = await tex(mm2); m.metalness = 1; }
+            }
+            if (lackAo) {
+              const aa = findFile(sub, "_ao", "ao_", "occlusion", "occl");
+              if (aa) { m.aoMap = await tex(aa); m.aoMapIntensity = 1; }
+            }
+          }
+          // 其它通道：有就补（材质里没有对应槽位时不会影响外观）
+          if (!m.emissiveMap) {
+            const em = findFile(sub, "emissive", "emission", "emit");
+            if (em) { m.emissiveMap = await tex(em, true); m.emissive = new THREE.Color(0xffffff); }
+          }
+          if (!m.alphaMap) {
+            const op = findFile(sub, "opacity", "alpha", "transp");
+            if (op) { m.alphaMap = await tex(op, false); m.transparent = true; }
+          }
+          if (!(m as any).displacementMap && !(m as any).bumpMap) {
+            const hp = findFile(sub, "height", "displacement", "disp");
+            if (hp) { (m as any).displacementMap = await tex(hp, false); (m as any).displacementScale = 0.02; }
+          }
+          if (!m.name) m.name = nm;
           m.needsUpdate = true;
-          for (const c of list) { c.mesh.material = m; c.ownMat = m; }
+          if (m !== own0) for (const cc of list) { setMatOf(cc, m); cc.ownMat = cc.mesh.material; }
         }
         // UDIM：UV 超出 0–1 时按贴图内容决定「图集缩放」还是「单块平铺」
+        // 只有素材里确实存在 UDIM 分块文件（xxx_1001.jpg）时才按图集处理；
+        // 普通平铺贴图 + UV>1 在 Max 里就是「重复」，不能设 repeat=1/ru（否则表面会瞬间变错）
+        const hasUdimFiles = files.some(f => /[._-]\d{4}\.(png|jpe?g|tga|tiff?)$/i.test(String(f.rel_path)));
         const isAtlasTexture = (img: any): boolean => {
           try {
             const c = document.createElement('canvas');
@@ -1036,7 +1232,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           const maps = [m?.map, m?.normalMap, m?.roughnessMap, m?.metalnessMap, m?.aoMap, m?.emissiveMap];
           for (const t of maps) {
             if (!t) continue;
-            const atlas = t.image ? isAtlasTexture(t.image) : true;
+            const atlas = udimOn && hasUdimFiles && (t.image ? isAtlasTexture(t.image) : false);
             if (atlas) {
               t.wrapS = THREE.ClampToEdgeWrapping;
               t.wrapT = THREE.ClampToEdgeWrapping;
@@ -1063,7 +1259,9 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               ovMap[m][ch] = typeof v === 'string' ? { rel: v, swizzle: 'rgb' } : v;
             }
           }
-        } catch { /* ignore */ }
+        } catch (e) { (globalThis as any).__AMOVFETCH = String(e); }
+        (globalThis as any).__AMOVINFO = { assetId: asset.id, keys: Object.keys(ovMap), collected: collected.length };
+        setOvMapState(ovMap);
         if (Object.keys(ovMap).length) {
           const bake = (tex: THREE.Texture, comp: string): THREE.Texture => {
             const img: any = tex.image;
@@ -1102,21 +1300,29 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               t.wrapS = THREE.RepeatWrapping;
               t.wrapT = THREE.RepeatWrapping;
               t.anisotropy = 8;
-              res(swz && swz !== 'rgb' ? bake(t, swz) : t);
+              (t as any).userData = { ...(t as any).userData, src: url };
+              const out: any = swz && swz !== 'rgb' ? bake(t, swz) : t;
+              out.userData = { ...(out as any).userData, src: url };
+              res(out);
             }, undefined, rej);
             });
           };
+          const normKey2 = (x: string) => String(x || '').trim().toLowerCase();
+          const ovByKey: any = {};
+          for (const [ok2, ov2] of Object.entries(ovMap)) ovByKey[normKey2(ok2)] = ov2;
           for (const c of collected) {
-            const ov = ovMap[c.matName];
+            const gm2 = gmap.get(c.key);
+            const gname2 = (gm2 && gm2[0] && gm2[0].matName) || '';
+            const ov = ovByKey[normKey2(c.matName)] || ovByKey[normKey2(gname2)];
             if (!ov || !Object.keys(ov).length) continue;
-            const baseMat: any = Array.isArray(c.mesh.material) ? c.mesh.material[0] : c.mesh.material;
+            const baseMat: any = matOf(c);
             if (!baseMat) continue;
-            const cl: any = baseMat.clone();
+            const cl: any = toStandard(baseMat).clone();
             for (const [ch, ent] of Object.entries(ov)) {
               try {
                 const rel = ent.rel;
                 const swz = ent.swizzle || 'rgb';
-                if (ch === 'baseColor') cl.map = await loadOv(rel, true, swz);
+                if (ch === 'baseColor') { cl.map = await loadOv(rel, true, swz); cl.color?.setRGB(1, 1, 1); }
                 else if (ch === 'normal') cl.normalMap = await loadOv(rel, false, swz);
                 else if (ch === 'roughness') { cl.roughnessMap = await loadOv(rel, false, swz); cl.roughness = 1; }
                 else if (ch === 'metallic') { cl.metalnessMap = await loadOv(rel, false, swz); cl.metalness = 1; }
@@ -1124,13 +1330,18 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
                 else if (ch === 'emissive') { cl.emissiveMap = await loadOv(rel, true, swz); cl.emissive = new THREE.Color(0xffffff); }
                 else if (ch === 'height') { cl.displacementMap = await loadOv(rel, false, swz); cl.displacementScale = 0.02; }
                 else if (ch === 'opacity') { cl.alphaMap = await loadOv(rel, false, swz); cl.transparent = true; }
-              } catch { /* keep original channel */ }
+              } catch (e) { (globalThis as any).__AMOVERRR = String(e); /* keep original channel */ }
             }
             cl.needsUpdate = true;
-            c.mesh.material = cl;
-            c.ownMat = cl;
+            setMatOf(c, cl);
+            (globalThis as any).__AMOVHIT = [...((globalThis as any).__AMOVHIT || []), c.matName + '#' + (c.slot ?? 0)];
+            c.ownMat = c.mesh.material;
           }
         }
+        // 材质全部处理完（含覆盖）后，按“槽位”快照最终材质：
+        // 之前 restoreMaterials 按整块数组快照还原，会把某个槽位的覆盖一并抹掉。
+        for (const c of collected) c.ownSlot = matOf(c);
+
         const box = new THREE.Box3().setFromObject(obj);
         const size = new THREE.Vector3(); box.getSize(size);
         const center = new THREE.Vector3(); box.getCenter(center);
@@ -1145,7 +1356,36 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           meshes
         }));
         api.current.groups = gs;
-        setMatGroups(gs.map(g => ({ name: g.name, count: g.meshes.length })));
+        // 调试出口：把每个网格/槽位的材质真实状态暴露出来（排查串图/纯色用，无 UI 影响）
+        (globalThis as any).__AMDBG = () => api.current.meshes.map((c: any) => {
+          const arr = Array.isArray(c.mesh.material) ? c.mesh.material : [c.mesh.material];
+          return {
+            mesh: c.mesh.name, slot: c.slot ?? 0, matName: c.matName,
+            slotMat: (() => {
+              const sm = Array.isArray(c.mesh.material) ? c.mesh.material[c.slot || 0] : c.mesh.material;
+              return {
+                name: sm?.name, type: sm?.type, rough: sm?.roughness, metal: sm?.metalness,
+                hasMap: !!sm?.map, hasNor: !!sm?.normalMap, hasRoughMap: !!sm?.roughnessMap, hasMetalMap: !!sm?.metalnessMap,
+                roughSrc: (sm?.roughnessMap?.image?.src || sm?.roughnessMap?.userData?.src || '').split('/').pop()
+              };
+            })(),
+            matCount: arr.length,
+            groupIdx: (c.mesh.geometry?.groups || []).map((g: any) => g.materialIndex),
+            mats: arr.map((m: any) => ({
+              type: m?.type, name: m?.name,
+              color: m?.color ? m.color.getHexString() : null,
+              hasMap: !!m?.map, mapImg: !!m?.map?.image, mapSrc: (m?.map?.image?.src || '').split('/').pop(),
+              hasNor: !!m?.normalMap, hasRoughMap: !!m?.roughnessMap, hasMetalMap: !!m?.metalnessMap,
+              rough: m?.roughness, metal: m?.metalness, hasAo: !!m?.aoMap
+            }))
+          };
+        });
+        const nameSeen: Record<string, number> = {};
+        setMatGroups(gs.map(g => {
+          const base = String(g.name || '材质');
+          nameSeen[base] = (nameSeen[base] || 0) + 1;
+          return { name: nameSeen[base] > 1 ? `${base} (${nameSeen[base]})` : base, count: g.meshes.length };
+        }));
         // 每个材质组的贴图（用于右侧随材质切换）
         const texInfo = (src: string) => {
           const idm = String(src || '').match(/\/api\/file\/(\d+)/);
@@ -1154,11 +1394,11 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           return { src, id, name: f ? String(f.rel_path).split('/').pop()! : fileNameOf(src) };
         };
         const groupTex = gs.map(g => {
-          const mm: any = Array.isArray(g.meshes[0].mesh.material) ? g.meshes[0].mesh.material[0] : g.meshes[0].mesh.material;
+          const mm: any = matOf(g.meshes[0]);
           const rows: any[] = [];
           const seen = new Set<string>();
           const add = (k: string, t: any) => {
-            const s2 = t?.image?.src;
+            const s2 = t?.image?.src || t?.userData?.src;
             if (!s2 || seen.has(s2)) return;
             seen.add(s2);
             rows.push({ k, ...texInfo(s2) });
@@ -1193,28 +1433,41 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       api.current.setMaterial = (m: THREE.Material) => {
         for (const c of api.current.meshes) c.mesh.material = m;
       };
-      api.current.restoreMaterials = () => {
-        for (const c of api.current.meshes) c.mesh.material = c.ownMat || mat;
-      };
-      // FBX 自带贴图可能加载失败（map 存在但 image 为空），此时回退到组装材质，避免全黑
-      setTimeout(() => {
-        let changed = false;
+      // 通道预览必须用「每个槽位自己的材质」，不能拿全局 baseMat（模型的 baseMat 是兜底材质）
+      api.current.setChannel = (ch: any) => {
         for (const c of api.current.meshes as any[]) {
-          if (!c.kept) continue;
-          const mm: any = c.mesh.material;
-          const img: any = mm?.map?.image;
-          const ok = img && ((img.width || img.height) || img.data);
-          if (!ok) {
-            c.mesh.material = mat;
-            c.ownMat = mat;
-            c.kept = false;
-            changed = true;
-          } else if (mm.map) {
-            mm.map.colorSpace = THREE.SRGBColorSpace;
+          const own = c.ownSlot || c.ownMat || mat;
+          if (!own) continue;
+          if (ch === 'beauty') {
+            if (Array.isArray(c.mesh.material)) setMatOf(c, own);
+            else c.mesh.material = own;
+            continue;
+          }
+          setMatOf(c, channelMaterial(ch, own, channelSwz(own, ch)));
+        }
+      };
+      api.current.restoreMaterials = () => {
+        for (const c of api.current.meshes as any[]) {
+          const back = c.ownSlot || c.ownMat || mat;
+          if (Array.isArray(c.mesh.material)) setMatOf(c, back);   // 只还原本槽位，不动别的槽
+          else c.mesh.material = back;
+        }
+      };
+      // 加载后只做一件事：把贴图色彩空间摆正。
+      // 以前这里有一段「贴图没加载出来就回退到组装材质」，它把多子材质（数组）当成"没贴图"，
+      // 1.2 秒后把整个材质数组换成全局单材质 —— 这就是「打开瞬间正确、随后闪一下变错」，
+      // 而且会把手动指定的贴图覆盖一并抹掉。绝不能再替换材质。
+      setTimeout(() => {
+        for (const c of api.current.meshes as any[]) {
+          const arr = Array.isArray(c.mesh.material) ? c.mesh.material : [c.mesh.material];
+          for (const mm of arr as any[]) {
+            if (!mm) continue;
+            if (mm.map && mm.map.colorSpace !== THREE.SRGBColorSpace) {
+              mm.map.colorSpace = THREE.SRGBColorSpace;
+            }
             mm.needsUpdate = true;
           }
         }
-        if (changed) api.current.restoreMaterials?.();
       }, 1200);
       api.current.setGeom = (kind: GeoKind) => {
         const b = api.current.ball; if (!b) return;
@@ -1243,10 +1496,8 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
 
   // channel material
   useEffect(() => {
-    const m = api.current.baseMat;
-    if (!m || !api.current.setMaterial) return;
-    if (channel === 'beauty') api.current.restoreMaterials?.();
-    else api.current.setMaterial(channelMaterial(channel, m));
+    if (!api.current.setChannel) return;
+    api.current.setChannel(channel);
   }, [channel, asset.id, meshList.length]);
 
   // geometry
@@ -1443,16 +1694,64 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       return f ? { k, id: f.id, src: `/api/file/${f.id}`, name: String(f.rel_path).split('/').pop() } : null;
     })
     .filter(Boolean) as { k: string; id: number; src: string; name: string }[];
-  const shownTex = activeMat >= 0 && groupTex[activeMat] ? groupTex[activeMat] : textureRows;
+  // 多材质模型：不选具体材质时，右侧贴图列表显示各组贴图的并集（而不是单个材质的推测结果）
+  const allGroupTex = (() => {
+    const seen = new Set<string>();
+    const out: { k: string; id: number; src: string; name: string }[] = [];
+    for (const rows of groupTex) for (const r of rows as any[]) {
+      if (!r || seen.has(r.src)) continue;
+      seen.add(r.src); out.push(r);
+    }
+    return out;
+  })();
+  const shownTex = activeMat >= 0 && groupTex[activeMat] ? groupTex[activeMat] : (allGroupTex.length ? allGroupTex : textureRows);
 
-  async function saveOverride() {
-    if (!ovMatSel) return;
+  // ---- 贴图区：四路常显（颜色/法线/粗糙/金属），其它通道可手动添加 ----
+  const CH_LABEL: Record<string, string> = { baseColor: '颜色', normal: '法线', roughness: '粗糙', metallic: '金属', ao: 'AO', height: '置换', emissive: '自发光', opacity: '不透明' };
+  const CH_LABEL_ORDER = ['baseColor', 'normal', 'roughness', 'metallic', 'ao', 'height', 'emissive', 'opacity'];
+  const imgFiles = asset.files.filter((f: any) => /\.(png|jpe?g|tga|tiff?|exr|bmp|webp)$/i.test(f.rel_path) && f.role !== 'preview');
+  const relOf = (id: number) => {
+    const f = asset.files.find((x: any) => x.id === id);
+    return f ? String(f.rel_path) : '';
+  };
+  const ovOf = (ch: string) => {
+    const g = matGroups[activeMat >= 0 ? activeMat : 0];
+    const key = String(g?.name || '').trim().toLowerCase();
+    for (const [k, v] of Object.entries<any>(ovMapState || {})) {
+      if (String(k).trim().toLowerCase() === key) return v?.[ch];
+    }
+    return undefined;
+  };
+  const TEX_ROWS = ['baseColor', 'normal', 'roughness', 'metallic', ...extraChans].map((ch: string) => {
+    const hit: any = shownTex.find((r: any) => r.k === ch);
+    const ov: any = ovOf(ch);
+    const rel = ov?.rel || (hit?.id ? relOf(hit.id) : '');
+    const f = rel ? asset.files.find((x: any) => String(x.rel_path) === rel) : null;
+    // 手动指定的贴图（还没写进素材目录时走 override-file）也要有缩略图
+    const src = ov?.rel
+      ? (f ? `/api/file/${f.id}?v=${ovVersion}` : `/api/override-file?assetId=${asset.id}&rel=${encodeURIComponent(rel)}&v=${ovVersion}`)
+      : (hit?.src || '');
+    return {
+      k: ch,
+      src,
+      name: rel ? String(rel).split('/').pop() : (hit?.name || ''),
+      id: hit?.id || 0,
+      rel,
+      swz: ov?.swizzle || 'rgb'
+    };
+  });
+
+  /** 行内替换 / 切 RGBA：写覆盖表；有原图时同时把新图覆盖进素材目录（浏览替换后的效果=最终效果） */
+  async function setTexFor(ch: string, rel: string, swz?: string, targetId?: number) {
+    const g = matGroups[activeMat >= 0 ? activeMat : 0];
+    const material = String(g?.name || matGroups[0]?.name || '').replace(/\s+\(\d+\)$/, '');
+    if (!material) return;
+    if (rel && targetId && !confirm('会把选中的图复制进素材目录、覆盖这一路原来的贴图（原图备份到临时目录）。继续？')) return;
     await fetch(`/api/model/${asset.id}/overrides`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ material: ovMatSel, channel: ovChSel, fileRel: ovFileSel, swizzle: ovSwz })
+      body: JSON.stringify({ material, channel: ch, fileRel: rel, swizzle: swz || 'rgb', replaceFileId: rel ? (targetId || 0) : 0 })
     });
-    setOvOpen(false);
-    setOvVersion(v => v + 1);
+    setOvVersion((v: number) => v + 1);
   }
 
   return (
@@ -1468,6 +1767,8 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               ))}
             </div>
           )}
+          <button className="btn tiny" title={panelOpen ? '收起右侧详情面板' : '展开右侧详情面板'}
+            onClick={() => setPanelOpen(v => !v)}>{panelOpen ? '⟩' : '⟨'}</button>
           <button className="btn" onClick={onClose}>关闭</button>
         </div>
       </header>
@@ -1512,7 +1813,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           </>}
         </div>
 
-        <aside className={'vx-panel' + (isHdri ? ' minimal' : '')}>
+          {panelOpen && (<aside className={'vx-panel' + (isHdri ? ' minimal' : '')}>
           <div className={'vp-sec' + (hdriId ? ' off' : '')}>
             <div className="vp-t">{isIes ? '场景' : '光照'} {hdriId ? '（HDRI 接管）' : ''}</div>
             {isIes && (
@@ -1632,10 +1933,28 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
 
           {!isIes && (<div className="vp-sec">
             <div className="vp-t">HDRI 照明</div>
-            <select className="field" value={hdriId ?? ''} onChange={e => setHdriId(e.target.value ? Number(e.target.value) : null)}>
-              <option value="">不启用（棚拍环境）</option>
-              {hdris.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
-            </select>
+            <button className="btn hdri-btn" onClick={() => setHdriOpen(v => !v)}>
+              <span className="hdri-cur">
+                {hdriId ? <img src={`/api/thumb/${hdriId}`} alt="" /> : <span className="hdri-none sm">无</span>}
+                <em>{hdriId ? (hdris.find((h: any) => h.id === hdriId)?.name || '已选 HDRI') : '不启用（棚拍环境）'}</em>
+              </span>
+              <span>{hdriOpen ? '▴' : '▾'}</span>
+            </button>
+            {hdriOpen && (
+              <div className="hdri-pop">
+                <button className={'hdri-row' + (!hdriId ? ' on' : '')}
+                  onClick={() => { setHdriId(null); setHdriOpen(false); }}>
+                  <span className="hdri-none sm">无</span><em>不启用（棚拍环境）</em>
+                </button>
+                {hdris.map((h: any) => (
+                  <button key={h.id} className={'hdri-row' + (hdriId === h.id ? ' on' : '')} title={h.name}
+                    onClick={() => { setHdriId(h.id); setHdriOpen(false); }}>
+                    <img src={`/api/thumb/${h.id}`} alt="" loading="lazy" />
+                    <em>{h.name}</em>
+                  </button>
+                ))}
+              </div>
+            )}
             <label className="vp-check" onClick={() => setHdriVisible(v => !v)}>
               <span className={'box' + (hdriVisible ? ' on' : '')}>{hdriVisible ? '✓' : ''}</span>显示 HDRI 背景
             </label>
@@ -1661,12 +1980,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
                     {m.name}<span className="vp-cnt">{m.count}</span>
                   </button>
                 ))}
-                <button className="btn tiny" style={{ marginTop: 6 }} onClick={() => {
-                  setOvMatSel(matGroups[activeMat >= 0 ? activeMat : 0]?.name || matGroups[0]?.name || '');
-                  setOvChSel('baseColor');
-                  setOvFileSel('');
-                  setOvOpen(true);
-                }}>贴图覆盖…</button>
+
               </>
             ) : (
               <>
@@ -1680,20 +1994,44 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
                 </div>
               </>
             )}
-            <div className="vp-sub">贴图</div>
+            <div className="vp-sub vp-sub-row">贴图
+              <label className="vp-mini" title="素材里存在 _1001 之类的分块贴图时才需要开">
+                <input type="checkbox" checked={udimOn} onChange={e => setUdimOn(e.target.checked)} /> UDIM
+              </label>
+              <select className="sortsel vp-addch" value="" title="添加通道"
+                onChange={e => { const v = e.target.value; if (v) setExtraChans(x => x.includes(v) ? x : [...x, v]); e.currentTarget.value = ''; }}>
+                <option value="">＋ 通道</option>
+                {CH_LABEL_ORDER.filter(k => k !== 'baseColor' && k !== 'normal' && k !== 'roughness' && k !== 'metallic' && !extraChans.includes(k))
+                  .map(k => <option key={k} value={k}>{CH_LABEL[k]}</option>)}
+              </select>
+            </div>
             <div className="vp-row"><span>UV 集</span>
               <select className="sortsel" value={mapUv} onChange={e => setMapUv(Number(e.target.value))}>
                 {uvNames.map((n, i) => <option key={n} value={i}>{n}</option>)}
               </select>
             </div>
-            {shownTex.map((r: any) => (
-              <button className="vp-tex" key={r.k + r.name} onClick={() => setTexPreview({ src: r.src, name: r.name })}>
-                <img src={r.src} alt="" loading="lazy" />
-                <span>{r.k}</span>
-                <em>{r.name}</em>
-              </button>
+            {TEX_ROWS.map((r: any) => (
+              <div className="vp-tex" key={r.k}>
+                {r.src
+                  ? <img src={r.src} alt="" loading="lazy" onClick={() => setTexPreview({ src: r.src, name: r.name })} title="点击放大预览" />
+                  : <span className="vp-texph" title="这一路还没有贴图">无</span>}
+                <span>{CH_LABEL[r.k] || r.k}</span>
+                <select className="sortsel vp-texsel" value={r.rel || ''} title="替换这一路的贴图"
+                  onChange={e => setTexFor(r.k, e.target.value, undefined, r.id)}>
+                  <option value="">{r.rel ? (r.name || '（当前）') : '选择贴图…'}</option>
+                  {imgFiles.map((f: any) => (
+                    <option key={f.id} value={f.rel_path}>{String(f.rel_path).split('/').pop()}</option>
+                  ))}
+                </select>
+                <div className="vp-rgba">
+                  {(['r', 'g', 'b', 'a'] as const).map(c2 => (
+                    <button key={c2} className={'vp-c' + ((r.swz || 'rgb') === c2 ? ' on' : '')}
+                      title={`取 ${c2.toUpperCase()} 通道`}
+                      onClick={() => setTexFor(r.k, r.rel || '', (r.swz || 'rgb') === c2 ? 'rgb' : c2, r.id)}>{c2.toUpperCase()}</button>
+                  ))}
+                </div>
+              </div>
             ))}
-            {shownTex.length === 0 && <div className="hint">没有识别到贴图</div>}
           </div>)}
           {!isIes && (<div className="vp-sec">
             <div className="vp-t">显示</div>
@@ -1706,58 +2044,10 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               <button className={'btn tiny' + (uvMode ? ' primary' : '')} onClick={() => setUvMode(v => !v)}>UV 分屏</button>
             </div>
           </div>)}
-        </aside>
+          </aside>)}
       </div>
 
       <div className="vxhint">F 聚焦 · 拖动旋转 · 滚轮缩放 · Esc 关闭</div>
-
-      {ovOpen && (
-        <div className="modal-mask" onMouseDown={() => setOvOpen(false)}>
-          <div className="modal" onMouseDown={e => e.stopPropagation()}>
-            <div className="modal-t">贴图覆盖 · {asset.name}</div>
-            <div className="hint" style={{ fontSize: 12 }}>
-              为某个材质的通道指定贴图，保存后用于预览与发送到 3ds Max（不改 FBX 原文件）。
-            </div>
-            <div className="uvrow">
-              <label>材质</label>
-              <select className="sortsel" value={ovMatSel} onChange={e => setOvMatSel(e.target.value)}>
-                {matGroups.map(g => <option key={g.name} value={g.name}>{g.name}</option>)}
-                {matGroups.length === 0 && <option value="">（未识别到材质）</option>}
-              </select>
-            </div>
-            <div className="uvrow">
-              <label>通道</label>
-              <select className="sortsel" value={ovChSel} onChange={e => setOvChSel(e.target.value)}>
-                {['baseColor', 'normal', 'roughness', 'metallic', 'ao', 'height', 'emissive', 'opacity'].map(c =>
-                  <option key={c} value={c}>{c}</option>)}
-              </select>
-            </div>
-            <div className="uvrow">
-              <label>取通道</label>
-              <select className="sortsel" value={ovSwz} onChange={e => setOvSwz(e.target.value as any)}>
-                <option value="rgb">RGB（彩色原图）</option>
-                <option value="r">R 通道（灰度）</option>
-                <option value="g">G 通道（灰度）</option>
-                <option value="b">B 通道（灰度）</option>
-                <option value="a">A 通道（灰度）</option>
-              </select>
-            </div>
-            <div className="uvrow">
-              <label>贴图</label>
-              <select className="sortsel" style={{ flex: 1 }} value={ovFileSel} onChange={e => setOvFileSel(e.target.value)}>
-                <option value="">（清除，恢复自动）</option>
-                {asset.files.filter(f => /\.(png|jpe?g|webp|tga|tiff?)$/i.test(f.rel_path)).map(f => (
-                  <option key={f.id} value={f.rel_path}>{String(f.rel_path).split('/').pop()}</option>
-                ))}
-              </select>
-            </div>
-            <div className="modal-b">
-              <button className="btn" onClick={() => setOvOpen(false)}>关闭</button>
-              <button className="btn primary" onClick={saveOverride}>保存并重载</button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {texPreview && (
         <div className="texoverlay" onMouseDown={() => setTexPreview(null)}>

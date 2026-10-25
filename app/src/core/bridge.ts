@@ -8,25 +8,27 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { assetUuid } from './db.ts';
 import type { DB } from './db.ts';
 
 /** 插件协议版本（服务端 + .ms 一起改） */
 export const BRIDGE_PROTOCOL = 1;
 /** 插件脚本版本（面板显示；与应用版本保持一致，第三位递增） */
-export const BRIDGE_SCRIPT_VERSION = '0.1.14';
+export const BRIDGE_SCRIPT_VERSION = '0.2.0';
 
 const LEASE_MS = 90_000;
 const CONNECTED_MS = 6000;
 const DEDUPE_MS = 30_000;
 
-export type BridgeTarget = 'max' | 'su' | 'blender' | 'houdini' | 'ue';
+export type BridgeTarget = 'max' | 'su' | 'blender' | 'houdini' | 'ue' | 'maya';
 
 export const TARGET_LABEL: Record<string, string> = {
   max: '3ds Max',
   su: 'SketchUp',
   blender: 'Blender',
   houdini: 'Houdini',
-  ue: 'Unreal Engine'
+  ue: 'Unreal Engine',
+  maya: 'Maya'
 };
 
 export const MODE_LABEL: Record<string, string> = {
@@ -37,13 +39,13 @@ export const MODE_LABEL: Record<string, string> = {
   ies: '发送 IES'
 };
 
-/** 各模式支持的 DCC（IES 只有 Unreal 原生支持；HDRI 三家都支持） */
+/** 各模式支持的 DCC（IES 只有 UE / Maya(Arnold) 原生支持） */
 export const MODE_TARGETS: Record<string, BridgeTarget[]> = {
-  import: ['max', 'blender', 'su', 'ue'],
-  material: ['max', 'blender', 'su', 'ue'],
-  texture: ['max', 'blender', 'su', 'ue'],
-  hdri: ['max', 'blender', 'su', 'ue'],
-  ies: ['ue']
+  import: ['max', 'blender', 'su', 'ue', 'maya'],
+  material: ['max', 'blender', 'su', 'ue', 'maya'],
+  texture: ['max', 'blender', 'su', 'ue', 'maya'],
+  hdri: ['max', 'blender', 'su', 'ue', 'maya'],
+  ies: ['ue', 'maya']
 };
 
 // 表结构在 core/db.ts 的 SCHEMA 中（随数据库打开自动创建）
@@ -231,6 +233,7 @@ export function buildPayload(db: DB, assetId: number, mode: string, modelOverrid
     return {
       payload: {
         assetId,
+        uuid: assetUuid(db, assetId),
         name: String(a.name),
         sourceDir,
         modelPath: path2,
@@ -426,6 +429,7 @@ export function writeDropScript(db: DB, assetId: number, appRoot: string) {
   const bridge = maxScriptPathForDrop(appRoot);
   const sourceDir = path.join(bundle.root, String(a.rel_dir));
   const modelPath = m ? abs(bundle.root, m.rel_path) : '';
+  const uuid = assetUuid(db, assetId);
 
   const dir = process.env.AM_WORKSPACE
     ? path.join(process.env.AM_WORKSPACE, 'cache', 'drops')
@@ -443,8 +447,8 @@ export function writeDropScript(db: DB, assetId: number, appRoot: string) {
     `  try (`,
     `    -- 每次都先加载当前脚本：Max 里可能还留着旧版本（进程不重启就不会更新）`,
     `    try (fileIn ${verbatim(bridge)}) catch ()`,
-    `    -- 参数：id、代表文件、类型、源目录、名称、模型文件（源目录随文件一起带，避免插件认错素材）`,
-    `    amb_drop_asset ${assetId} ${verbatim(primary)} ${JSON.stringify(kind)} ${verbatim(sourceDir)} ${verbatim(String(a.name))} ${verbatim(modelPath)}`,
+    `    -- 参数：id、代表文件、类型、源目录、名称、模型文件、UUID（导回时按 UUID 认资产）`,
+    `    amb_drop_asset ${assetId} ${verbatim(primary)} ${JSON.stringify(kind)} ${verbatim(sourceDir)} ${verbatim(String(a.name))} ${verbatim(modelPath)} uuid:${verbatim(uuid)}`,
     `  ) catch (ok = false; err = try ((getCurrentException()) as string) catch ("?"))`,
     `  if not ok do (`,
     `    try (messageBox ("AssetManager 拖放失败：\\n" + err + "\\n\\n请确认 AssetManager 正在运行，并且插件已安装到 3ds Max。") title:"AssetManager") catch ()`,
@@ -1019,14 +1023,15 @@ export function enableUePlugins(projectFile: string, names: string[]): { ok: boo
  * 递归复制目录（打包版 src 在 app.asar 里：asar 的 fs 垫片不支持 cpSync/lstat 目录，
  * 只能 readdirSync + copyFileSync 逐个来）
  */
-function copyTreeSafe(src: string, dst: string) {
+function copyTreeSafe(src: string, dst: string, skip: Set<string> = new Set()) {
   let entries: fs.Dirent[] = [];
   try { entries = fs.readdirSync(src, { withFileTypes: true }); } catch { return; }
   fs.mkdirSync(dst, { recursive: true });
   for (const e of entries) {
+    if (skip.has(e.name)) continue;
     const from = path.join(src, e.name);
     const to = path.join(dst, e.name);
-    if (e.isDirectory()) copyTreeSafe(from, to);
+    if (e.isDirectory()) copyTreeSafe(from, to, skip);
     else if (e.isFile()) {
       try { fs.copyFileSync(from, to); } catch { /* ignore */ }
     }
@@ -1129,6 +1134,145 @@ export function ueInstallInfo(appRoot: string) {
     projects: items.map(i => ({ name: i.name, file: i.file, engine: i.engine })),
     items,
     installedAt: items.filter(i => i.installed).map(i => i.file),
+    installed: items.some(i => i.installed)
+  };
+}
+
+// ---------------------------------------------------------------- Maya 安装
+
+const MAYA_MODULE = 'AssetManagerBridge';
+const MAYA_PY = path.join('scripts', 'assetmanager_maya.py');
+
+/** 安装包里有哪些 Maya 系列目录（2025 / 2026 …） */
+export function mayaSeries(appRoot: string): string[] {
+  const dir = path.join(appRoot, 'bridge', 'maya');
+  let ents: fs.Dirent[] = [];
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  return ents.filter(e => e.isDirectory() && /^\d{4}$/.test(e.name))
+    .map(e => e.name)
+    .sort((a, b) => Number(a) - Number(b));
+}
+
+/** 本机 Maya 的用户目录（%USERPROFILE%\Documents\maya\<年份>，里面才有 modules/ 或 prefs/） */
+export function mayaUserDirs(): { version: string; modules: string }[] {
+  const base0 = process.env.MAYA_APP_DIR
+    || path.join(os.homedir(), 'Documents', 'maya');
+  // Windows 的「文档」可能被重定向到 OneDrive，两处都看一眼
+  const bases = [base0, path.join(os.homedir(), 'OneDrive', 'Documents', 'maya')];
+  const out: { version: string; modules: string }[] = [];
+  const seen = new Set<string>();
+  for (const base of bases) {
+    let ents: fs.Dirent[] = [];
+    try { ents = fs.readdirSync(base, { withFileTypes: true }); } catch { continue; }
+    for (const e of ents) {
+      if (!e.isDirectory() || !/^\d{4}$/.test(e.name)) continue;
+      const vdir = path.join(base, e.name);
+      const modules = path.join(vdir, 'modules');
+      const used = fs.existsSync(modules) || fs.existsSync(path.join(vdir, 'prefs'))
+        || fs.existsSync(path.join(vdir, 'Maya.env'));
+      if (!used) continue;
+      const key = (base + '|' + e.name).toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ version: e.name, modules });
+    }
+  }
+  return out.sort((a, b) => Number(a.version) - Number(b.version));
+}
+
+/** 给某个 Maya 版本挑系列：优先同年份，其次不超过它的最高系列，最后退回最低的 */
+export function pickMayaSeries(series: string[], mayaVersion: string): string | null {
+  if (!series.length) return null;
+  if (series.includes(mayaVersion)) return mayaVersion;
+  const le = series.filter(s => Number(s) <= Number(mayaVersion));
+  if (le.length) return le[le.length - 1];
+  return series[0];
+}
+
+function mayaPluginVersionOf(file: string): string {
+  try {
+    const m = fs.readFileSync(file, 'utf8').match(/AM_PLUGIN_VERSION\s*=\s*"([^"]+)"/);
+    return m ? m[1] : '';
+  } catch { return ''; }
+}
+
+/**
+ * 一键把 Maya 插件装进本机所有 Maya 用户目录：
+ *   <Documents>\maya\<年份>\modules\AssetManagerBridge.mod      （模块声明，指向同目录下的插件文件夹）
+ *   <Documents>\maya\<年份>\modules\AssetManagerBridge\scripts\  （userSetup.py + assetmanager_maya.py）
+ * 只动用户目录，不碰 Maya 安装目录，也不改 Maya.env。
+ */
+export function installForMaya(appRoot: string) {
+  const series = mayaSeries(appRoot);
+  if (!series.length) {
+    return { ok: false, error: '安装包缺少 bridge/maya/<Maya 版本>/ 目录（重新打包）' };
+  }
+  const dirs = mayaUserDirs();
+  if (!dirs.length) {
+    return {
+      ok: false,
+      error: '没找到 Maya 用户目录（%USERPROFILE%\\Documents\\maya\\20XX\\modules）：先启动一次 Maya 再装',
+      series
+    };
+  }
+
+  const installed: { maya: string; series: string; version: string; dir: string }[] = [];
+  const failed: { maya: string; error: string }[] = [];
+  for (const d of dirs) {
+    const pick = pickMayaSeries(series, d.version);
+    if (!pick) continue;
+    const srcDir = path.join(appRoot, 'bridge', 'maya', pick);
+    const srcMod = path.join(srcDir, MAYA_MODULE + '.mod');
+    const srcPy = path.join(srcDir, MAYA_PY);
+    if (!fs.existsSync(srcMod) || !fs.existsSync(srcPy)) {
+      failed.push({ maya: d.version, error: `缺少 ${pick}/${MAYA_MODULE}.mod 或 ${MAYA_PY}` });
+      continue;
+    }
+    try {
+      const dstPlugin = path.join(d.modules, MAYA_MODULE);
+      fs.mkdirSync(dstPlugin, { recursive: true });
+      // 跳过 __pycache__（Maya 自己会在用户目录里重新生成）
+      copyTreeSafe(path.join(srcDir, 'scripts'), path.join(dstPlugin, 'scripts'), new Set(['__pycache__']));
+      // .mod 里的版本号跟插件版本走（.mod 的版本号只是显示用，Maya 不校验）
+      const version = mayaPluginVersionOf(path.join(dstPlugin, MAYA_PY));
+      const modText = fs.readFileSync(srcMod, 'utf8')
+        .replace(/^(\+\s*\S+\s+)\S+/m, `$1${version || '0.1.0'}`);
+      fs.writeFileSync(path.join(d.modules, MAYA_MODULE + '.mod'), modText, 'utf8');
+      installed.push({
+        maya: d.version, series: pick, version: mayaPluginVersionOf(path.join(dstPlugin, MAYA_PY)),
+        dir: path.join(d.modules, MAYA_MODULE + '.mod')
+      });
+    } catch (e: any) {
+      failed.push({ maya: d.version, error: String(e?.message || e) });
+    }
+  }
+  return { ok: installed.length > 0, installed, failed, series, dirs: dirs.map(d => d.modules) };
+}
+
+/** 面板用：装到哪些 Maya、版本是否与安装包一致 */
+export function mayaInstallInfo(appRoot: string) {
+  const series = mayaSeries(appRoot);
+  const dirs = mayaUserDirs();
+  const items = dirs.map(d => {
+    const modFile = path.join(d.modules, MAYA_MODULE + '.mod');
+    const pyFile = path.join(d.modules, MAYA_MODULE, MAYA_PY);
+    const exists = fs.existsSync(modFile) && fs.existsSync(pyFile);
+    const pick = pickMayaSeries(series, d.version);
+    const srcPy = pick ? path.join(appRoot, 'bridge', 'maya', pick, MAYA_PY) : '';
+    let same = false;
+    try {
+      same = exists && !!srcPy && fs.readFileSync(srcPy, 'utf8') === fs.readFileSync(pyFile, 'utf8');
+    } catch { /* 读不到就当不是最新 */ }
+    return {
+      maya: d.version, dir: modFile, installed: exists,
+      version: exists ? mayaPluginVersionOf(pyFile) : '', upToDate: same
+    };
+  });
+  return {
+    series,
+    dirs: dirs.map(d => d.modules),
+    items,
+    installedAt: items.filter(i => i.installed).map(i => i.dir + (i.upToDate ? '' : ' (版本不同)')),
     installed: items.some(i => i.installed)
   };
 }

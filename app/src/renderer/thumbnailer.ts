@@ -124,7 +124,8 @@ export async function renderThumb(detail: AssetDetail): Promise<string> {
     }
     const manager = new THREE.LoadingManager();
     manager.setURLModifier(url => {
-      if (/^(data:|blob:|https?:)/i.test(url)) return url;
+      // 同上：FBX 的贴图路径可能是绝对路径或 `..\别的目录\…`，一律按文件名回素材目录找，不能看到 http: 就放行
+      if (/^(data:|blob:)/i.test(url)) return url;
       let name = url;
       try { name = decodeURIComponent(url.split('?')[0]); } catch { /* keep */ }
       const id = byName.get(name.replace(/\\/g, '/').split('/').pop()!.toLowerCase());

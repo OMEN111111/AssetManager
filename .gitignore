@@ -51,3 +51,8 @@ devtest/ue/thread_probe.py
 devtest/ue/t*_probe.py
 devtest/ue/t*_out.json
 devtest/ue/t*_run.log
+
+# Maya 测试：临时服务数据 + 测试产物（插件本身在 app/bridge/maya/）
+devtest/maya/.data/
+devtest/maya/work/
+

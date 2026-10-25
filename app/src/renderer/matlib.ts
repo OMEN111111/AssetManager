@@ -77,12 +77,12 @@ export function detectConfig(files: AssetFile[], slotMap?: Record<string, string
   const packed = find(files, '_arm_', '_orm_', '_omr_', '_rma_', '_arm.', '_orm.');
   const cfg: MaterialConfig = { workflow: 'MR', channels: {} };
 
-  const base = find(files, 'basecolor', 'base_color', 'albedo', 'diffuse', '_diff', 'color');
-  const normal = find(files, 'normal', 'nor_gl', 'nor_dx', '_nrm');
-  const rough = find(files, 'roughness', 'rough');
-  const metal = find(files, 'metallic', 'metal');
-  const ao = find(files, '_ao', 'ambient', 'occlusion');
-  const height = find(files, 'height', 'displacement', '_disp');
+  const base = find(files, 'basecolor', 'base_color', 'albedo', 'diffuse', '_diff', 'diffuse', 'color', '_col');
+  const normal = find(files, 'normal', 'nor_gl', 'nor_dx', 'nor_', '_nrm', 'nrm_', '_n.', 'bump');
+  const rough = find(files, 'roughness', 'rough', '_rgh', 'rgh_', 'gloss');
+  const metal = find(files, 'metallic', 'metal', '_mtl', 'mtl_', 'specular', '_spec');
+  const ao = find(files, '_ao', 'ao_', 'ambient', 'occlusion', 'occl');
+  const height = find(files, 'height', 'displacement', '_disp', 'disp_', 'bump');
 
   if (base) cfg.channels.baseColor = { fileId: base.id, channel: 'rgb', intensity: 1 };
   if (normal) cfg.channels.normal = {

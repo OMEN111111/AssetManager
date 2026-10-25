@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { openDb, upsertLibrary, listLibraries } from '../core/db.ts';
+import { openDb, upsertLibrary, listLibraries, assetUuid, assetIdByUuid } from '../core/db.ts';
 import { scanLibrary, scanState } from '../core/scan.ts';
 import { MCP_TOOLS, callTool } from '../core/mcp.ts';
 import {
@@ -14,6 +14,7 @@ import {
   installForBlender, blenderSeries, blenderUserDirs,
   installForSu, suSeries as suPluginSeries, suUserDirs, suInstallInfo,
   installForUe, ueSeries as uePluginSeries, ueProjects, ueInstallInfo,
+  installForMaya, mayaSeries as mayaPluginSeries, mayaUserDirs, mayaInstallInfo,
   resolvePath, assetInfo, writeDropScript,
   suConvertCheck,
   BRIDGE_PROTOCOL, BRIDGE_SCRIPT_VERSION
@@ -910,6 +911,40 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     return json(res, 200, r);
   }
 
+  // Max 导回完成回调：按 UUID 找到素材 → 后台重扫该库，刷新文件/大小/预览
+  if (p === '/api/bridge/max/exported' && req.method === 'POST') {
+    const b = await body(req);
+    const uuid = String(b.uuid || '');
+    let assetId = uuid ? assetIdByUuid(db, uuid) : null;
+    // 兼容：只给了目录时用「库根 + rel_dir」反查
+    if (!assetId && b.dir) {
+      const dirAbs = path.resolve(String(b.dir));
+      const libs = listLibraries(db) as any[];
+      for (const lib of libs) {
+        const rootAbs = path.resolve(String(lib.root));
+        if (dirAbs.toLowerCase().startsWith(rootAbs.toLowerCase())) {
+          const rel = dirAbs.slice(rootAbs.length).replace(/^[\\/]+/, '').replace(/\\/g, '/');
+          const row = db.prepare('SELECT id FROM assets WHERE library_id=? AND rel_dir=?').get(lib.id, rel) as any;
+          if (row) { assetId = Number(row.id); break; }
+        }
+      }
+    }
+    if (!assetId) return json(res, 404, { ok: false, error: '找不到对应素材（UUID 未登记？）' });
+    const a = db.prepare('SELECT library_id FROM assets WHERE id=?').get(assetId) as any;
+    const lib = db.prepare('SELECT root FROM libraries WHERE id=?').get(a.library_id) as any;
+    if (lib?.root && !scanState.running) {
+      setTimeout(() => { try { scanLibrary(db, Number(a.library_id), path.resolve(String(lib.root))); } catch (e) { console.error('rescan after max export failed', e); } }, 10);
+    }
+    // 顺手把 UUID 映射镜像到工作空间（库重建后仍可找回）
+    try {
+      const rows = db.prepare("SELECT a.uuid, a.rel_dir, l.root FROM assets a JOIN libraries l ON l.id=a.library_id WHERE a.uuid IS NOT NULL AND a.uuid<>''").all() as any[];
+      const map: Record<string, string> = {};
+      for (const r of rows) map[`${r.root}::${r.rel_dir}`] = String(r.uuid);
+      fs.writeFileSync(path.join(DATA_DIR, 'asset-uuids.json'), JSON.stringify(map, null, 2), 'utf8');
+    } catch { /* ignore */ }
+    return json(res, 200, { ok: true, assetId, rescanning: !scanState.running });
+  }
+
   // 拖放提示：AssetManager 开始拖拽某个素材时登记一次，Max 的 #postImport 据此认素材
   if (p === '/api/bridge/dragging') {
     if (req.method === 'POST') {
@@ -977,9 +1012,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   const options = b.options && typeof b.options === 'object' ? b.options : undefined;
     if (!assetId) return json(res, 400, { error: 'assetId required' });
     if (!['import', 'material', 'texture', 'hdri', 'ies'].includes(mode)) return json(res, 400, { error: '未知的发送模式' });
-    if (!['max', 'blender', 'su', 'ue'].includes(target)) return json(res, 400, { error: '未知的发送目标' });
-    if (mode === 'ies' && target !== 'ue') {
-      return json(res, 400, { error: 'IES 配光文件目前只有 Unreal Engine 支持' });
+    if (!['max', 'blender', 'su', 'ue', 'maya'].includes(target)) return json(res, 400, { error: '未知的发送目标' });
+    if (mode === 'ies' && target !== 'ue' && target !== 'maya') {
+      return json(res, 400, { error: 'IES 配光文件目前只有 Unreal Engine / Maya(Arnold) 支持' });
     }
 
     // SketchUp 读不了的模型格式（FBX/OBJ/PLY）：先让渲染端用 three 转成 GLB 再发
@@ -1080,6 +1115,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     });
   }
 
+  // 一键把 Maya 插件装进本机所有 Maya 用户目录（按各年份挑对应系列，写 .mod + scripts）
+  if (p === '/api/bridge/install-maya' && req.method === 'POST') {
+    return json(res, 200, installForMaya(APP_ROOT));
+  }
+
+  // 只查不装：包里的 Maya 系列 + 本机 Maya 用户目录 + 已装版本
+  if (p === '/api/bridge/maya-where' && req.method === 'GET') {
+    return json(res, 200, { ...mayaInstallInfo(APP_ROOT), series: mayaPluginSeries(APP_ROOT), dirs: mayaUserDirs() });
+  }
+
   if (p === '/api/bridge/test' && req.method === 'POST') {
     const st = bridgeStatus(db);
     const max = (st.targets as any).max;
@@ -1123,6 +1168,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
         copyTree(path.join(APP_ROOT, 'bridge', 'ue'), outDir, new Set(['tools', '__pycache__']));
       } catch { /* ignore */ }
       dir = outDir;
+    } else if (which === 'maya') {
+      // Maya 插件按年份分目录（2025/ …）：整份复制，用户也可以自己拷进 Documents\maya\modules
+      const outDir = path.join(DATA_DIR, 'plugins', 'maya');
+      try {
+        copyTree(path.join(APP_ROOT, 'bridge', 'maya'), outDir, new Set(['tools', '__pycache__']));
+      } catch { /* ignore */ }
+      dir = outDir;
     } else if (which === 'geometry') {
       const outDir = wsPath('geometry');
       try { fs.mkdirSync(outDir, { recursive: true }); } catch { /* ignore */ }
@@ -1137,7 +1189,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   }
 
   // 插件侧接口：/api/bridge/<target>/(next|result|heartbeat)
-  const mBridgeTarget = p.match(/^\/api\/bridge\/(max|su|blender|houdini|ue)\/(next|result|heartbeat)$/);
+  const mBridgeTarget = p.match(/^\/api\/bridge\/(max|su|blender|houdini|ue|maya)\/(next|result|heartbeat)$/);
   if (mBridgeTarget) {
     const target = mBridgeTarget[1];
     const action = mBridgeTarget[2];
@@ -1334,7 +1386,29 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
           ON CONFLICT(asset_key, material, channel) DO UPDATE SET file_rel=excluded.file_rel, swizzle=excluded.swizzle, updated_at=excluded.updated_at`)
           .run(key, material, channel, fileRel, swizzle, Date.now());
       }
-      return json(res, 200, { ok: true });
+      // 写穿：把选中的贴图复制到素材目录、覆盖「被替换的那张」同名文件（保留文件名 = 模型里的贴图索引不变），
+      // 这样模型直接导入 DCC 时用的就是替换后的图。覆盖前备份到 %TEMP%\AssetManager\texbackup\
+      let wrote = '';
+      const replaceFileId = Number(b.replaceFileId || 0);
+      if (fileRel && replaceFileId > 0) {
+        try {
+          const tf = db.prepare('SELECT rel_path FROM files WHERE id=? AND asset_id=?').get(replaceFileId, id) as any;
+          const lib = db.prepare('SELECT l.root FROM libraries l JOIN assets a ON a.library_id=l.id WHERE a.id=?').get(id) as any;
+          if (tf && lib?.root && !/preview/i.test(String(tf.rel_path))) {
+            const dst = path.join(String(lib.root), String(tf.rel_path));
+            const src = path.join(String(lib.root), fileRel);
+            if (fs.existsSync(src) && fs.existsSync(dst) && path.resolve(src) !== path.resolve(dst)) {
+              const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+              const bdir = path.join(os.tmpdir(), 'AssetManager', 'texbackup', stamp);
+              fs.mkdirSync(bdir, { recursive: true });
+              fs.copyFileSync(dst, path.join(bdir, path.basename(dst)));
+              fs.copyFileSync(src, dst);
+              wrote = dst;
+            }
+          }
+        } catch (e) { console.error('override write-through failed', e); }
+      }
+      return json(res, 200, { ok: true, wrote });
     }
   }
 

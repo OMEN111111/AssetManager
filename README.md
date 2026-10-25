@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/OMEN111111/AssetManager)](https://github.com/OMEN111111/AssetManager/releases)
 
-本地 3D 资产库管理器：把散落在硬盘里的 **模型 / 材质 / 贴图 / 图纸 / HDRI / IES** 统一索引，提供实时预览、材质组装、标签与整理，并把素材一键发到 **3ds Max / Blender / SketchUp / Unreal Engine**。
+本地 3D 资产库管理器：把散落在硬盘里的 **模型 / 材质 / 贴图 / 图纸 / HDRI / IES** 统一索引，提供实时预览、材质组装、标签与整理，并把素材一键发到 **3ds Max / Blender / SketchUp / Unreal Engine / Maya**。
 纯本地运行，素材文件只读，不上传任何内容。
 
 ![素材网格](prototype/shots/01-grid.png)
@@ -41,24 +41,27 @@
 
 ## 发送到 DCC
 
-详情页和右键统一一个入口「**→ 发送到…**」，弹层列出四个目标（未连接的也能发，任务排队等它启动）。
+详情页和右键统一一个入口「**→ 发送到…**」，弹层列出五个目标（未连接的也能发，任务排队等它启动）。
 队列走本地 HTTP：插件约 0.8 秒轮询取任务、5 秒心跳、执行后回传结果；软件换端口时插件自动跟随
 （读 `%LOCALAPPDATA%\AssetManager\bridge.json`，探不通则回退扫描 8787–8805）。
 
 | 目标 | 插件 | 能做的事 |
 | --- | --- | --- |
-| 3ds Max | `bridge/max/`（MaxScript 0.1.14） | 拖放导入放置、打包选中、材质重建、HDRI（环境贴图 / 视口背景） |
+| 3ds Max | `bridge/max/`（MaxScript 0.2.0） | 拖放导入放置、打包选中、材质重建、HDRI（环境贴图 / 视口背景）、**导回源目录（按 UUID 覆盖模型+贴图）** |
 | Blender | `bridge/blender/<版本>/`（Python 0.1.5，5.2 / 4.0 / 3.6） | 模型导入、PBR 材质重建、贴图、HDRI 世界环境 |
 | SketchUp | `bridge/su/2026/`（Ruby 0.1.2） | 模型导入（FBX/OBJ/PLY 自动转 GLB）、原生 PBR 材质、贴图、HDRI 环境 |
 | Unreal Engine | `bridge/ue/<引擎版本>/`（Python 编辑器插件 0.1.7，5.6 / 5.7 / 5.8） | 模型导入（静态 / 骨骼 / 物理资产）、PBR 材质（可指定父材质建实例）、贴图、HDRI 天空球 + SkyLight、**IES 灯光** |
+| Maya | `bridge/maya/<Maya 年份>/`（Python 模块 0.1.0，2025） | 模型导入（FBX / OBJ / MA / MB / ABC / USD）、PBR 材质（原生 `standardSurface`）、贴图、HDRI（Arnold 天空穹灯 / 无 Arnold 时环境球）、**IES 灯光**（Arnold） |
 
 - 插件按 DCC / 引擎版本分目录、各自独立编号（与软件版本解耦），插件面板里可一键安装。
-  UE 插件装进**你勾选的工程的 `Plugins/`**（并在 `.uproject` 里启用它和 `PythonScriptPlugin`），重启编辑器生效。
+  UE 插件装进**你勾选的工程的 `Plugins/`**（并在 `.uproject` 里启用它和 `PythonScriptPlugin`），重启编辑器生效；
+  Maya 插件写进 `Documents\maya\<年份>\modules`（只动用户目录，不碰 Maya 安装目录、不改 `Maya.env`），重启 Maya 生效。
 - **FBX/OBJ 自动转 GLB**：SketchUp 没有 FBX 导入器，发这类模型时软件先用 three.js 临时导出成 GLB
   （单位按 FBX `UnitScaleFactor` 折成米、贴图随 GLB 嵌入），只写工作区 `converted\`，素材文件不动。
 - **材质重建用各 DCC 原生材质**：SketchUp 走原生 PBR，打包图按通道抽灰度；UE 用 `MaterialEditingLibrary` 连节点；
+  Maya 用原生 `standardSurface`（不依赖 Arnold，打包图只建一个 file 节点、按 R/G/B 取通道）；
   同名材质原地重建不堆 `.001`，不覆盖用户同名材质。
-- **IES 只有 UE 支持**（`TextureLightProfile` → 灯光 IES 槽），其它目标不提供 `ies` 模式。
+- **IES 支持 UE 与 Maya**（UE：`TextureLightProfile` → 灯光 IES 槽；Maya：Arnold `aiPhotometricLight`），其它目标不提供 `ies` 模式。
 
 ## MCP（AI 客户端接入）
 
@@ -100,6 +103,7 @@
 | `app/bridge/blender/<系列>/` | Blender 插件（Python，3D 视图侧栏面板） |
 | `app/bridge/su/<系列>/` | SketchUp 插件（Ruby，扩展菜单 + HtmlDialog） |
 | `app/bridge/ue/<引擎版本>/AssetManagerBridge/` | UE Python 编辑器插件（工具 → AssetManager） |
+| `app/bridge/maya/<Maya 年份>/` | Maya Python 模块插件（主菜单栏 → AssetManager）：`AssetManagerBridge.mod` + `scripts/userSetup.py` + `scripts/assetmanager_maya.py` |
 
 ## 目录结构
 
@@ -109,7 +113,7 @@ app/               应用本体
   src/server/      本地 HTTP API + 静态服务
   src/core/        数据库、扫描器、桥接队列、MCP
   src/renderer/    React 界面（App / Viewer / Assembler / matlib / geometries / glbconvert）
-  bridge/          DCC 插件：max/（MaxScript）、blender/<版本>/、su/<版本>/、ue/<引擎版本>/
+  bridge/          DCC 插件：max/（MaxScript）、blender/<版本>/、su/<版本>/、ue/<引擎版本>/、maya/<Maya 年份>/
   build/           构建产物与图标（server.mjs 由构建生成）
 prototype/         界面截图（README 配图）
 devtest/           开发期 CDP 验证脚本与测试页
@@ -146,6 +150,10 @@ cd app/bridge/ue && node tools/sync-ue-bridge.mjs --check
 
 # SketchUp：装进 Plugins 后，在 SketchUp 的 Ruby 控制台里
 #   load "<仓库路径>/app/bridge/su/tools/test_su.rb"
+
+# Maya：系列同步检查 + mayapy 集成测试（92 项断言；脚本自带临时服务与临时素材库）
+cd app/bridge/maya && node tools/sync-maya-bridge.mjs --check
+pwsh -File devtest/maya/run-test.ps1        # 需要本机装好 Maya（mayapy）
 ```
 
 ## 打包
@@ -189,3 +197,5 @@ pnpm dist             # electron-builder：NSIS 安装版 + 便携版
 ## 许可
 
 [MIT](LICENSE)
+
+

@@ -1006,15 +1006,17 @@ export default function App() {
 
   async function loadBridge() {
     try {
-      const [st, info, maxJobs, blJobs, suJobs, ueJobs] = await Promise.all([
+      const [st, info, maxJobs, blJobs, suJobs, ueJobs, mayaJobs] = await Promise.all([
         api('/api/bridge/status'), api('/api/bridge/info'),
         api('/api/bridge/jobs?target=max&limit=8'), api('/api/bridge/jobs?target=blender&limit=8'),
-        api('/api/bridge/jobs?target=su&limit=8'), api('/api/bridge/jobs?target=ue&limit=8')
+        api('/api/bridge/jobs?target=su&limit=8'), api('/api/bridge/jobs?target=ue&limit=8'),
+        api('/api/bridge/jobs?target=maya&limit=8')
       ]);
       setBridge(st);
       setBridgeInfo(info);
-      // Max / Blender / SketchUp / UE 的任务合并显示，新的在前
-      const merged = [...(maxJobs?.jobs || []), ...(blJobs?.jobs || []), ...(suJobs?.jobs || []), ...(ueJobs?.jobs || [])]
+      // Max / Blender / SketchUp / UE / Maya 的任务合并显示，新的在前
+      const merged = [...(maxJobs?.jobs || []), ...(blJobs?.jobs || []), ...(suJobs?.jobs || []),
+        ...(ueJobs?.jobs || []), ...(mayaJobs?.jobs || [])]
         .sort((a: any, b: any) => (b.id || 0) - (a.id || 0))
         .slice(0, 8);
       setBridgeJobs(merged);
@@ -1032,20 +1034,21 @@ export default function App() {
   }
 
   /** 可发送的软件（顺序=菜单顺序） */
-  const SEND_TARGETS: { key: 'max' | 'blender' | 'su' | 'ue'; label: string }[] = [
+  const SEND_TARGETS: { key: 'max' | 'blender' | 'su' | 'ue' | 'maya'; label: string }[] = [
     { key: 'max', label: '3ds Max' },
     { key: 'blender', label: 'Blender' },
     { key: 'su', label: 'SketchUp' },
-    { key: 'ue', label: 'Unreal Engine' }
+    { key: 'ue', label: 'Unreal Engine' },
+    { key: 'maya', label: 'Maya' }
   ];
 
-  /** 某个模式能发给哪些软件（IES 只有 UE 原生支持） */
+  /** 某个模式能发给哪些软件（IES 需要原生支持配光文件的引擎：UE / Maya+Arnold） */
   const MODE_TARGETS: Record<string, string[]> = {
-    import: ['max', 'blender', 'su', 'ue'],
-    material: ['max', 'blender', 'su', 'ue'],
-    texture: ['max', 'blender', 'su', 'ue'],
-    hdri: ['max', 'blender', 'su', 'ue'],
-    ies: ['ue']
+    import: ['max', 'blender', 'su', 'ue', 'maya'],
+    material: ['max', 'blender', 'su', 'ue', 'maya'],
+    texture: ['max', 'blender', 'su', 'ue', 'maya'],
+    hdri: ['max', 'blender', 'su', 'ue', 'maya'],
+    ies: ['ue', 'maya']
   };
 
   /** 当前素材可选的发送目标 */
@@ -1062,6 +1065,8 @@ export default function App() {
   const suConnected = !!suTarget?.connected;
   const ueTarget = bridge?.targets?.ue;
   const ueConnected = !!ueTarget?.connected;
+  const mayaTarget = bridge?.targets?.maya;
+  const mayaConnected = !!mayaTarget?.connected;
 
   /** 打开「发送到…」菜单（锚在按钮下方或右键位置） */
   function openSendMenu(a: Asset, at: { x: number; y: number }) {
@@ -1080,8 +1085,9 @@ export default function App() {
     openSendMenu(a, { x: r.left, y: r.bottom + 4 });
   }
 
-  async function sendToTarget(a: Asset, target: 'max' | 'blender' | 'su' | 'ue', mode?: 'import' | 'material' | 'texture' | 'hdri' | 'ies', opts?: { options?: any }) {
-    const tName = target === 'blender' ? 'Blender' : target === 'su' ? 'SketchUp' : target === 'ue' ? 'Unreal Engine' : '3ds Max';
+  async function sendToTarget(a: Asset, target: 'max' | 'blender' | 'su' | 'ue' | 'maya', mode?: 'import' | 'material' | 'texture' | 'hdri' | 'ies', opts?: { options?: any }) {
+    const tName = target === 'blender' ? 'Blender' : target === 'su' ? 'SketchUp'
+      : target === 'ue' ? 'Unreal Engine' : target === 'maya' ? 'Maya' : '3ds Max';
     const online = !!bridge?.targets?.[target]?.connected;
     const m = mode || sendModeFor(a);
     if (!m) { showToast(`这类素材不支持发送到 ${tName}`, 'err'); return; }
@@ -1237,6 +1243,22 @@ export default function App() {
       if (!r?.ok) { showToast('安装失败：' + (r?.error || '未知原因'), 'err'); return; }
       const list = (r.installed || []).map((x: any) => `SketchUp ${x.sketchup} → v${x.version}（${x.series} 系列）`);
       showToast(`已装到 ${list.length} 个 SketchUp：${list.join('；')}。重启 SketchUp 生效`, 'ok');
+      await loadBridge();
+    } catch (e: any) {
+      showToast('安装失败：' + String(e?.message || e), 'err');
+    } finally { setBridgeBusy(false); }
+  }
+
+  /** 一键装 Maya 插件：写 .mod + scripts 到 %USERPROFILE%\Documents\maya\<年份>\modules */
+  async function installMayaPlugin() {
+    setBridgeBusy(true);
+    try {
+      const r = await api('/api/bridge/install-maya', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
+      });
+      if (!r?.ok) { showToast('安装失败：' + (r?.error || r?.failed?.[0]?.error || '未知原因'), 'err'); return; }
+      const list = (r.installed || []).map((x: any) => `Maya ${x.maya} → v${x.version}（${x.series} 系列）`);
+      showToast(`已装到 ${list.length} 个 Maya：${list.join('；')}。重启 Maya 生效`, 'ok');
       await loadBridge();
     } catch (e: any) {
       showToast('安装失败：' + String(e?.message || e), 'err');
@@ -2352,6 +2374,12 @@ export default function App() {
             : 'Unreal Engine 未连接（点开插件面板）'}>
           <span className={'mxdot' + (ueConnected ? ' on' : '')} />Unreal
         </button>
+        <button className={'bridgechip' + (mayaConnected ? ' on' : '')} onClick={() => setPluginsOpen(true)}
+          title={mayaConnected
+            ? `Maya 已连接${bridge?.targets?.maya?.version ? ' · 插件 v' + bridge.targets.maya.version : ''}`
+            : 'Maya 未连接（点开插件面板）'}>
+          <span className={'mxdot' + (mayaConnected ? ' on' : '')} />Maya
+        </button>
         <div className="status-right">
           <span className="cap">主题</span>
           {THEMES.map(t => (
@@ -2689,6 +2717,44 @@ export default function App() {
                   <b>IES 配光文件</b>（UE 原生 TextureLightProfile，直接生成带配光曲线的灯光）。
                 </div>
               </div>
+              <div className={'maxcard' + (mayaConnected ? ' on' : '')}>
+                <div className="mxhead">
+                  <span className="mxname">Maya</span>
+                  <span className={'mxdot' + (mayaConnected ? ' on' : '')} />
+                  <span className={mayaConnected ? 'plug-on' : 'plug-off'}>{mayaConnected ? '已连接' : '未连接'}</span>
+                  {!!mayaTarget?.version && <span className="mxver">插件 v{mayaTarget.version}</span>}
+                </div>
+                <div className="mxmeta">
+                  队列 {mayaTarget?.queued ?? 0} · 运行 {mayaTarget?.running ?? 0}
+                  {mayaTarget?.lastSeen ? ` · 最近心跳 ${new Date(mayaTarget.lastSeen).toLocaleTimeString()}` : ''}
+                </div>
+                {mayaTarget?.lastJob && (
+                  <div className="mxmeta mxlast" title={`${mayaTarget.lastJob.title} — ${mayaTarget.lastJob.message || ''}`}>
+                    最近任务：{mayaTarget.lastJob.status === 'done' ? '✔' : mayaTarget.lastJob.status === 'failed' ? '✘' : '…'}
+                    {' '}{mayaTarget.lastJob.title}
+                    {mayaTarget.lastJob.message ? ` — ${mayaTarget.lastJob.message}` : ''}
+                  </div>
+                )}
+                <div className="uvrow" style={{ marginTop: 8 }}>
+                  <button className="btn primary" disabled={bridgeBusy} onClick={installMayaPlugin}>
+                    安装/更新插件到 Maya
+                  </button>
+                  <button className="btn" onClick={async () => {
+                    const r = await api('/api/bridge/open-folder', {
+                      method: 'POST', headers: { 'content-type': 'application/json' },
+                      body: JSON.stringify({ which: 'maya' })
+                    });
+                    if (!r?.ok) showToast(r?.error || '打开失败', 'err');
+                  }}>打开 Maya 插件文件夹</button>
+                </div>
+                <div className="hint">
+                  插件按 Maya 年份分目录（<b>bridge/maya/2025/</b>：AssetManagerBridge.mod + scripts/），纯 Python，不用编译。
+                  「安装/更新插件到 Maya」写进 <b>Documents\maya\&lt;年份&gt;\modules</b>（只动用户目录，不碰 Maya 安装目录、不改 Maya.env），
+                  <b>重启 Maya 生效</b>，之后主菜单栏出现 <b>AssetManager</b>。
+                  支持：模型导入（FBX/OBJ/MA/MB/ABC/USD）、PBR 材质重建（<b>standardSurface</b>，不依赖 Arnold 也能用）、
+                  贴图、HDRI（装了 Arnold 走天空穹灯，否则退化成环境球）、<b>IES</b>（Arnold aiPhotometricLight）。
+                </div>
+              </div>
               {['Houdini'].map(n => (
                 <div className="plug-row" key={n}>
                   <span className="plug-name">{n}</span>
@@ -2709,7 +2775,7 @@ export default function App() {
                     <div className="mxjob" key={j.id}>
                       <span className={'mxst ' + j.status}>{j.status === 'done' ? '✔' : j.status === 'failed' ? '✘' : '…'}</span>
                       <span className="mxtitle" title={j.message || ''}>
-                        {j.target === 'blender' ? 'Blender · ' : j.target === 'su' ? 'SketchUp · ' : j.target === 'ue' ? 'Unreal · ' : ''}{j.title}
+                        {j.target === 'blender' ? 'Blender · ' : j.target === 'su' ? 'SketchUp · ' : j.target === 'ue' ? 'Unreal · ' : j.target === 'maya' ? 'Maya · ' : ''}{j.title}
                       </span>
                       <span className="mxmsg" title={j.message || ''}>{j.message || (j.status === 'pending' ? '排队中' : j.status)}</span>
                     </div>
@@ -2717,7 +2783,7 @@ export default function App() {
                 </div>
               </div>
             )}
-            <div className="hint">插件来源：应用目录下的 bridge/max/AssetManagerBridge.ms（安装时复制到 3ds Max 的 scripts\startup）；Blender 插件在 bridge/blender/&lt;Blender 版本&gt;/ 下；SketchUp 插件在 bridge/su/&lt;SketchUp 版本&gt;/ 下；UE 插件在 bridge/ue/&lt;引擎版本&gt;/AssetManagerBridge/ 下（装进工程的 Plugins）。</div>
+            <div className="hint">插件来源：应用目录下的 bridge/max/AssetManagerBridge.ms（安装时复制到 3ds Max 的 scripts\startup）；Blender 插件在 bridge/blender/&lt;Blender 版本&gt;/ 下；SketchUp 插件在 bridge/su/&lt;SketchUp 版本&gt;/ 下；UE 插件在 bridge/ue/&lt;引擎版本&gt;/AssetManagerBridge/ 下（装进工程的 Plugins）；Maya 插件在 bridge/maya/&lt;Maya 年份&gt;/ 下（装进 Documents\maya\&lt;年份&gt;\modules）。</div>
             <div className="modal-b">
               <button className="btn" onClick={() => setPluginsOpen(false)}>关闭</button>
             </div>
