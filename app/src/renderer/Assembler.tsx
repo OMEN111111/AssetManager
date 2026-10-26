@@ -7,7 +7,8 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import type { AssetDetail, AssetFile } from './types';
-import { CHANNELS, buildMaterial, channelFile, channelHint, channelLabel, detectConfig, missingRequired, type ChannelKey, type MaterialConfig } from './matlib';
+import { CHANNELS, DISP_SCALE, applyUvXform, buildMaterial, channelFile, channelHint, channelLabel, detectConfig, effectiveUv, loadTexture, missingRequired, sampleTexel, type ChannelKey, type MaterialConfig } from './matlib';
+import { smoothNormalsByPosition } from './geometries';
 import { makeGeometry, remapUV, uprightCylinder, rotateUV90 } from './geometries';
 import { history } from './history';
 import NumField from './NumField';
@@ -91,6 +92,47 @@ function Slide({ value, onChange, min, max, step = 1, digits = 2, reset, width =
   );
 }
 
+
+/**
+ * CPU 置换：按「贴图实际生效的 UV 变换」采样高度图后写进顶点。
+ * UV 变换与取通道都走 matlib 的共用实现（effectiveUv / applyUvXform / sampleTexel），
+ * 保证「通道预览里看到的贴图」和「置换采样的贴图」永远是同一张、同一处、同一通道。
+ */
+async function displaceByHeight(
+  g: THREE.BufferGeometry, f: any, strength: number, texIn?: any, uvCfg?: any, channel = 'r'
+) {
+  const ownTex = !texIn;                       // 自己加载的才由自己释放，别 dispose 材质的贴图
+  const tex: any = texIn || await loadTexture(f, false);
+  const img: any = tex?.image;
+  const w = img?.width || img?.naturalWidth || 0;
+  const h = img?.height || img?.naturalHeight || 0;
+  if (!w || !h) { if (ownTex) tex.dispose?.(); return; }
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const cx = cv.getContext('2d', { willReadFrequently: true })!;
+  cx.drawImage(img, 0, 0, w, h);
+  const data = cx.getImageData(0, 0, w, h).data;
+
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  const nor = g.attributes.normal as THREE.BufferAttribute;
+  const uvAttr = g.attributes.uv as THREE.BufferAttribute | undefined;
+  if (!uvAttr || !nor) { if (ownTex) tex.dispose?.(); return; }   // 没有 UV 就没法和通道预览对齐
+  const scale = (strength ?? 1) * DISP_SCALE;   // 与 matlib 的 displacementScale 同一个系数
+  const xf = effectiveUv(uvCfg, w, h);          // ← 含「非 1:1 贴图按宽高比补 V 平铺」
+  const flipY = (tex as any).flipY !== false;    // 贴图默认上传时上下翻转，canvas 原点在左上
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const [u, v] = applyUvXform(uvAttr.getX(i), uvAttr.getY(i), xf);
+    const hv = sampleTexel(data, w, h, u, v, channel, flipY);
+    const d = (hv - 0.5) * 2 * scale;            // 0.5 = 中性（不位移）
+    pos.setXYZ(i, x + nor.getX(i) * d, y + nor.getY(i) * d, z + nor.getZ(i) * d);
+  }
+  pos.needsUpdate = true;
+  smoothNormalsByPosition(g);
+  g.computeBoundingSphere();
+  if (ownTex) tex.dispose?.();
+}
+
 export default function Assembler({ asset, onClose, folderPath }:
   { asset: AssetDetail; onClose: () => void; folderPath?: string }) {
   const mount = useRef<HTMLDivElement>(null);
@@ -114,6 +156,7 @@ export default function Assembler({ asset, onClose, folderPath }:
   const [cylAxis, setCylAxis] = useState<'v' | 'h'>('v');
   const [customKinds, setCustomKinds] = useState<Set<string>>(new Set());
   const [geoVer, setGeoVer] = useState<Record<string, number>>({});
+  const dispSeq = useRef(0);
   const [exposure, setExposure] = useState(1);
   const [uvLink, setUvLink] = useState(true);
   const [envI, setEnvI] = useState(1);
@@ -320,10 +363,11 @@ export default function Assembler({ asset, onClose, folderPath }:
     ro.observe(el);
 
     (window as any).__asmApi = null;
-    api.current = { renderer, scene, key, roomEnv: scene.environment, mesh, setGeom: (g: string, axis: 'v' | 'h' = 'v') => {
+    api.current = { renderer, scene, key, roomEnv: scene.environment, mesh, geoBase: geo, setGeom: (g: string, axis: 'v' | 'h' = 'v') => {
       const ng = makeGeometry(g as any, axis);
       mesh.geometry.dispose();
       mesh.geometry = ng;
+      (api.current as any).geoBase = ng;
     } };
     (window as any).__asmApi = api.current;
 
@@ -363,8 +407,9 @@ export default function Assembler({ asset, onClose, folderPath }:
       canvas.removeEventListener('pointerup', up);
       canvas.removeEventListener('wheel', wheel);
       window.removeEventListener('keydown', keyDown);
+      try { renderer.forceContextLoss(); } catch { /* ignore */ }
       renderer.dispose();
-      el.innerHTML = '';
+      try { if (renderer.domElement.parentElement === el) el.removeChild(renderer.domElement); } catch { /* ignore */ }
     };
   }, [asset.id]);
 
@@ -452,34 +497,18 @@ export default function Assembler({ asset, onClose, folderPath }:
       if (!mesh) return;
       mesh.geometry.dispose();
       mesh.geometry = ng;
+      (api.current as any).geoBase = ng;
+      // 换了基本体要立刻按新几何的 UV 重新置换（否则新几何停在未置换状态，
+      // 因为置换 effect 的依赖里 geom 没变、buildMaterial 也没重跑）
+      await rebuildDisplacement();
     })();
     return () => { cancelled = true; };
   }, [geom, planeAxis, cylAxis, geoVer[geom]]);
-  function triplanar(base: THREE.MeshPhysicalMaterial): THREE.MeshPhysicalMaterial {
-    const m = base.clone();
-    const prev = base.onBeforeCompile;
-    m.onBeforeCompile = (shader: any) => {
-      prev?.call(m, shader);
-      shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nvarying vec3 vTriP; varying vec3 vTriN;')
-        .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\n vTriP = (modelMatrix * vec4(transformed, 1.0)).xyz;\n vTriN = normalize(mat3(modelMatrix) * objectNormal);');
-      shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', '#include <common>\nvarying vec3 vTriP; varying vec3 vTriN;')
-        .replace('#include <map_fragment>', `
-          #ifdef USE_MAP
-            vec3 tw = pow(abs(normalize(vTriN)), vec3(4.0));
-            tw /= max(tw.x + tw.y + tw.z, 1e-4);
-            vec3 tp = vTriP * 0.9;
-            diffuseColor *= texture2D(map, tp.zy) * tw.x + texture2D(map, tp.xz) * tw.y + texture2D(map, tp.xy) * tw.z;
-          #endif
-        `);
-    };
-    m.customProgramCacheKey = () => 'tri-' + base.uuid;
-    return m;
-  }
-
   function previewMaterial(base: THREE.MeshPhysicalMaterial, mode: string): THREE.Material {
-    if (mode === 'albedo') return new THREE.MeshBasicMaterial({ map: base.map || null, color: base.map ? 0xffffff : 0x999999 });
+    if (mode === 'albedo') {
+      const m0 = (base as any).map || (base as any).userData?.uvMap || null;
+      return new THREE.MeshBasicMaterial({ map: m0, color: m0 ? 0xffffff : 0x999999 });
+    }
     if (mode === 'normal') {
     const m = new THREE.MeshBasicMaterial({ map: base.normalMap || null, color: 0xffffff });
     if (base.normalMap && (base as any).userData?.normalSpace === 'dx') {
@@ -500,7 +529,27 @@ export default function Assembler({ asset, onClose, folderPath }:
     if (mode === 'rough') return new THREE.MeshBasicMaterial({ map: base.roughnessMap || null, color: 0xffffff });
     if (mode === 'metal') return new THREE.MeshBasicMaterial({ map: base.metalnessMap || null, color: 0xffffff });
     if (mode === 'ao') return new THREE.MeshBasicMaterial({ map: base.aoMap || null, color: 0xffffff });
-    if (mode === 'height') return new THREE.MeshBasicMaterial({ map: base.displacementMap || null, color: 0xffffff });
+    if (mode === 'height') {
+      const tex: any = (base as any).userData?.dispMap || base.displacementMap || null;
+      const m = new THREE.MeshBasicMaterial({ map: tex, color: 0xffffff });
+      // 取通道和 CPU 置换保持同一口径：单通道取该通道，rgb 取亮度
+      const ch = (cfg.channels.height as any)?.channel || 'r';
+      if (tex && ch !== 'r') {
+        const expr = ch === 'g' ? 'htex.g' : ch === 'b' ? 'htex.b' : ch === 'a' ? 'htex.a'
+          : 'dot(htex.rgb, vec3(0.2126, 0.7152, 0.0722))';
+        m.onBeforeCompile = (sh: any) => {
+          sh.fragmentShader = sh.fragmentShader.replace('#include <map_fragment>', `
+            #ifdef USE_MAP
+              vec4 htex = texture2D( map, vMapUv );
+              float hch = ${expr};
+              diffuseColor *= vec4(vec3(hch), 1.0);
+            #endif
+          `);
+        };
+        m.customProgramCacheKey = () => 'height-chan-' + ch;
+      }
+      return m;
+    }
     if (mode === 'emissive') return new THREE.MeshBasicMaterial({ map: base.emissiveMap || null, color: 0xffffff });
     if (mode === 'mask') return new THREE.MeshBasicMaterial({ map: base.alphaMap || null, color: 0xffffff });
     return base;
@@ -525,10 +574,17 @@ export default function Assembler({ asset, onClose, folderPath }:
         const mesh = api.current.mesh;
         if (!mesh) return;
         const old = mesh.material;
-        api.current.baseMat = m;
-        mesh.material = previewMaterial(m, previewRef.current);
-        if (old && old !== m && old !== mesh.material) old.dispose?.();
-        (window as any).__asmMat = m;
+        const base = m;
+        // 置换只由 CPU 做一次：材质自带的位移贴图挪进 userData 并关掉着色器位移，否则两份叠加会变形
+        const dm: any = (base as any).displacementMap || null;
+        if (dm) (base as any).userData = { ...(base as any).userData, dispMap: dm };
+        (base as any).displacementMap = null;
+        (base as any).displacementScale = 0;
+        api.current.baseMat = base;
+        mesh.material = previewMaterial(base, previewRef.current);
+        if (old && old !== base && old !== mesh.material) old.dispose?.();
+        (window as any).__asmMat = base;
+        rebuildDisplacement();   // 贴图/UV 变了要立刻重算置换，否则置换会停在旧平铺上
       });
     });
     return () => cancelAnimationFrame(raf);
@@ -566,7 +622,7 @@ export default function Assembler({ asset, onClose, folderPath }:
     return () => clearTimeout(t);
   }, [cfg]);
 
-  function setChannel(key: ChannelKey, patch: Partial<{ fileId: number; channel: string; intensity: number; invert: boolean; normalSpace: 'gl' | 'dx'; uv: { u: number; v: number; rot: number }; hsl: { h: number; s: number; l: number } }>) {
+  function setChannel(key: ChannelKey, patch: Partial<{ fileId: number; channel: string; intensity: number; strength: number; invert: boolean; normalSpace: 'gl' | 'dx'; uv: { u: number; v: number; rot: number }; hsl: { h: number; s: number; l: number } }>) {
     setCfg(prev => ({
       ...prev,
       channels: { ...prev.channels, [key]: { ...prev.channels[key], ...patch } }
@@ -621,15 +677,25 @@ export default function Assembler({ asset, onClose, folderPath }:
     const add = (id: string, type: string, file: string) => {
       nodes.push(`  <image name="${id}" type="${type}"><input name="file" type="filename" value="${file}"/></image>`);
     };
-    const bc = fileOf('baseColor'); if (bc) { add('img_base', 'color3', bc); inputs.push(`    <input name="base_color" type="color3" node="img_base"/>`); }
-    const mt = fileOf('metallic'); if (mt) { add('img_metal', 'float', mt); inputs.push(`    <input name="metalness" type="float" node="img_metal"/>`); }
-    const rg = fileOf('roughness'); if (rg) { add('img_rough', 'float', rg); inputs.push(`    <input name="specular_roughness" type="float" node="img_rough"/>`); }
-    const em = fileOf('emissive'); if (em) { add('img_emit', 'color3', em); inputs.push(`    <input name="emission" type="color3" node="img_emit"/>`); }
+    const bc = fileOf('baseColor'); if (bc) { add('img_base', 'color3', bc); inputs.push(`    <input name="base_color" type="color3" nodename="img_base"/>`); }
+    const mt = fileOf('metallic'); if (mt) { add('img_metal', 'float', mt); inputs.push(`    <input name="metalness" type="float" nodename="img_metal"/>`); }
+    const rg = fileOf('roughness'); if (rg) { add('img_rough', 'float', rg); inputs.push(`    <input name="specular_roughness" type="float" nodename="img_rough"/>`); }
+    const em = fileOf('emissive'); if (em) { add('img_emit', 'color3', em); inputs.push(`    <input name="emission" type="color3" nodename="img_emit"/>`); }
     const nr = fileOf('normal');
     if (nr) {
       add('img_normal', 'vector3', nr);
-      nodes.push('  <normalmap name="nm_normal" type="vector3"><input name="in" type="vector3" node="img_normal"/></normalmap>');
-      inputs.push('    <input name="normal" type="vector3" node="nm_normal"/>');
+      nodes.push('  <normalmap name="nm_normal" type="vector3"><input name="in" type="vector3" nodename="img_normal"/></normalmap>');
+      inputs.push('    <input name="normal" type="vector3" nodename="nm_normal"/>');
+    }
+    // 置换：与预览同一口径（0.5 中性、强度 × DISP_SCALE × 2，见 matlib.DISP_SCALE）
+    let dispInput = '';
+    const hp = fileOf('height');
+    if (hp) {
+      add('img_height', 'float', hp);
+      const dsc = (((cfg.channels.height as any)?.strength ?? 1) * 2 * DISP_SCALE).toFixed(5);
+      nodes.push('  <subtract name="h_center" type="float"><input name="in1" type="float" nodename="img_height"/><input name="in2" type="float" value="0.5"/></subtract>');
+      nodes.push(`  <displacement name="disp_height" type="displacementshader"><input name="displacement" type="float" nodename="h_center"/><input name="scale" type="float" value="${dsc}"/></displacement>`);
+      dispInput = '\n    <input name="displacementshader" type="displacementshader" nodename="disp_height"/>';
     }
     const text = `<?xml version="1.0"?>
 <materialx version="1.38" colorspace="lin_rec709">
@@ -638,7 +704,7 @@ ${inputs.join('\n')}
   </standard_surface>
 ${nodes.join('\n')}
   <surfacematerial name="${name}" type="material">
-    <input name="surfaceshader" type="surfaceshader" node="SR_${name}"/>
+    <input name="surfaceshader" type="surfaceshader" nodename="SR_${name}"/>${dispInput}
   </surfacematerial>
 </materialx>
 `;
@@ -730,6 +796,37 @@ ${nodes.join('\n')}
   }
   const def = CHANNELS.find(c => c.key === selected)!;
   const optionalLeft = CHANNELS.filter(c => c.optional && !cfg.channels[c.key]);
+
+  /** 按当前高度通道重建「已置换」的几何体（所有预览模式共享同一份几何） */
+  async function rebuildDisplacement() {
+    const mesh = api.current.mesh as any;
+    const base = (api.current as any).geoBase as THREE.BufferGeometry | undefined;
+    if (!mesh || !base) return;
+    const token = ++dispSeq.current;
+    const g = base.clone();
+    const hc = cfg.channels.height as any;
+    const hid = hc?.fileId;
+    const strength = hc?.strength ?? 1;
+    if (hid && strength > 0) {
+      const f = asset.files.find(x => x.id === hid);
+      const mat: any = api.current.baseMat as any;
+      const texIn = mat?.userData?.dispMap || mat?.displacementMap || null;   // 与材质/通道预览同一张图
+      const channel = hc?.channel || 'r';
+      if (f || texIn) { try { await displaceByHeight(g, f, strength, texIn, cfg.uv, channel); } catch { /* 保留原几何 */ } }
+    }
+    if (token !== dispSeq.current) { g.dispose(); return; }
+    const old = mesh.geometry as THREE.BufferGeometry;
+    mesh.geometry = g;
+    if (old && old !== base && old !== g) old.dispose();
+  }
+
+  useEffect(() => {
+    rebuildDisplacement();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfg.channels.height?.fileId, (cfg.channels.height as any)?.strength,
+      (cfg.channels.height as any)?.channel, cfg.uv?.repeatU, cfg.uv?.repeatV, cfg.uv?.rot,
+      cfg.uv?.offsetU, cfg.uv?.offsetV, geom, geoVer[geom], cfg.workflow]);
+
 
   return (
     <div className="viewer asm">
@@ -944,7 +1041,16 @@ ${nodes.join('\n')}
               </div>
             </div>
           )}
-          {!colorChannel && (
+          {selected === 'height' && (
+            <div className="param">
+              <div className="plabel">置换强度<span>默认 1（越大起伏越明显）</span></div>
+              <div className="uvrow">
+                <Slide key={selected + 'strength'} value={(selCfg as any).strength ?? 1} step={0.1} min={0} max={10}
+                  reset={1} width={66} onChange={v => setChannel('height', { strength: v })} />
+              </div>
+            </div>
+          )}
+          {!colorChannel && selected !== 'height' && (
             <div className="param">
               <div className="plabel">强度</div>
               <div className="uvrow">

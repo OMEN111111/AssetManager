@@ -12,6 +12,7 @@ export interface ChannelCfg {
   fileId?: number;
   channel?: 'rgb' | 'r' | 'g' | 'b' | 'a';
   intensity?: number;
+  strength?: number;   // 置换强度（默认 1）
   invert?: boolean;
   normalSpace?: 'gl' | 'dx';
   uv?: UvCfg;
@@ -104,6 +105,66 @@ export function detectConfig(files: AssetFile[], slotMap?: Record<string, string
   return cfg;
 }
 
+/** 置换强度 1 对应的实际位移量（球半径的 3%）；预览与 .mtlx 共用同一个系数 */
+export const DISP_SCALE = 0.03;
+
+/** 一张贴图实际生效的 UV 变换（repeat / offset / rotation，中心恒为 0.5） */
+export interface UvXform {
+  repeatU: number; repeatV: number; rot: number; offsetU: number; offsetV: number;
+  /** true = 用户没动过整体 UV，这里做的是「非 1:1 贴图按宽高比补 V 平铺」的修正 */
+  aspectFixed?: boolean;
+}
+
+/**
+ * 贴图真正生效的 UV 变换 —— **唯一来源**。
+ * texFor（着色器/通道预览）与装配器的 CPU 置换都必须走这里，
+ * 否则「看到的贴图」和「置换采样的贴图」会错位。
+ * 非 1:1 的图在没设过 UV 时按宽高比补 V 平铺（B-002：几何 UV 是世界尺度，不修正会被拉伸）。
+ */
+export function effectiveUv(gUv?: MaterialConfig['uv'], imgW = 0, imgH = 0): UvXform {
+  const ru = gUv?.repeatU ?? 1, rv = gUv?.repeatV ?? 1;
+  const rot = gUv?.rot ?? 0, ou = gUv?.offsetU ?? 0, ov = gUv?.offsetV ?? 0;
+  const hasUv = !(ru === 1 && rv === 1 && !rot && !ou && !ov);
+  if (!hasUv) {
+    const a = imgW && imgH ? imgW / imgH : 1;
+    if (Math.abs(a - 1) > 0.01) return { repeatU: 1, repeatV: a, rot: 0, offsetU: 0, offsetV: 0, aspectFixed: true };
+  }
+  return { repeatU: ru, repeatV: rv, rot, offsetU: ou, offsetV: ov, aspectFixed: false };
+}
+
+/** 几何 UV → 贴图 UV（结果与 three 的 texture.matrix 完全一致） */
+export function applyUvXform(u0: number, v0: number, xf: UvXform): [number, number] {
+  const ccx = 0.5, ccy = 0.5;   // 与 texFor 的 center 一致
+  const co = Math.cos(xf.rot), si = Math.sin(xf.rot);
+  const consU = -xf.repeatU * (co * ccx + si * ccy) + ccx + xf.offsetU;
+  const consV = -xf.repeatV * (-si * ccx + co * ccy) + ccy + xf.offsetV;
+  return [
+    xf.repeatU * (co * u0 + si * v0) + consU,
+    xf.repeatV * (-si * u0 + co * v0) + consV
+  ];
+}
+
+const wrap01 = (v: number) => v - Math.floor(v);
+
+/**
+ * 从已解码的像素数组里按 UV 取一个 0..1 的标量（重复平铺）。
+ * flipY：three 上传贴图默认上下翻转，canvas 的像素原点在左上，所以要翻 v。
+ * channel：r/g/b/a 取单通道，rgb 取亮度（与 UI 的「取通道」一致）。
+ */
+export function sampleTexel(
+  data: Uint8ClampedArray | Uint8Array, w: number, h: number,
+  u: number, v: number, channel: string = 'r', flipY = true
+): number {
+  const x = Math.min(w - 1, Math.max(0, Math.floor(wrap01(u) * w)));
+  const y = Math.min(h - 1, Math.max(0, Math.floor(wrap01(flipY ? 1 - v : v) * h)));
+  const o = (y * w + x) * 4;
+  if (channel === 'r') return data[o] / 255;
+  if (channel === 'g') return data[o + 1] / 255;
+  if (channel === 'b') return data[o + 2] / 255;
+  if (channel === 'a') return data[o + 3] / 255;
+  return (0.2126 * data[o] + 0.7152 * data[o + 1] + 0.0722 * data[o + 2]) / 255;
+}
+
 const texCache = new Map<string, Promise<THREE.Texture>>();
 function neutralTexture(srgb: boolean): THREE.Texture {
   const cv = document.createElement('canvas');
@@ -131,6 +192,21 @@ export function loadTexture(f: AssetFile, srgb = false): Promise<THREE.Texture> 
       }
       return await new Promise<THREE.Texture>((res, rej) => {
         new THREE.TextureLoader().load(src, t => {
+          // 显存保护：单张 >2048 的贴图就地降采样（8K 一张约 350MB 显存）
+          try {
+            const img: any = (t as any).image;
+            const w = img?.width || img?.naturalWidth || 0;
+            const h = img?.height || img?.naturalHeight || 0;
+            const max = 2048;
+            if (w && h && Math.max(w, h) > max) {
+              const sc = max / Math.max(w, h);
+              const cv = document.createElement('canvas');
+              cv.width = Math.max(1, Math.round(w * sc));
+              cv.height = Math.max(1, Math.round(h * sc));
+              cv.getContext('2d')!.drawImage(img, 0, 0, cv.width, cv.height);
+              (t as any).image = cv;
+            }
+          } catch { /* ignore */ }
           if (srgb) t.colorSpace = THREE.SRGBColorSpace;
           t.anisotropy = 8;
           t.wrapS = THREE.RepeatWrapping;
@@ -150,44 +226,24 @@ export function loadTexture(f: AssetFile, srgb = false): Promise<THREE.Texture> 
   return p;
 }
 
-/** 整材质 UV：平铺 / 旋转 / 位移，所有通道共用 */
+/** 整材质 UV：平铺 / 旋转 / 位移，所有通道共用（实际变换见 effectiveUv） */
 async function texFor(f: AssetFile, srgb: boolean, gUv?: MaterialConfig['uv']) {
   const base = await loadTexture(f, srgb);
-  const ru = gUv?.repeatU ?? 1;
-  const rv = gUv?.repeatV ?? 1;
-  const rot = gUv?.rot ?? 0;
-  const ou = gUv?.offsetU ?? 0;
-  const ov = gUv?.offsetV ?? 0;
-  const hasUv = !(ru === 1 && rv === 1 && !rot && !ou && !ov);
-
-  // B-002：非 1:1 贴图按宽高比修正 V 方向平铺，避免被方形 UV 拉伸（几何 UV 为世界尺度）
-  if (!hasUv) {
-    const img: any = base.image;
-    const iw = img?.width || img?.videoWidth || 0;
-    const ih = img?.height || img?.videoHeight || 0;
-    const a = iw && ih ? iw / ih : 1;
-    if (Math.abs(a - 1) > 0.01) {
-      const t0 = base.clone();
-      t0.needsUpdate = true;
-      t0.wrapS = THREE.RepeatWrapping;
-      t0.wrapT = THREE.RepeatWrapping;
-      t0.center.set(0.5, 0.5);
-      t0.repeat.set(1, a);
-      t0.offset.set(0, 0);
-      t0.rotation = 0;
-      return t0;
-    }
-    return base;
-  }
+  const img: any = base.image;
+  const iw = img?.width || img?.videoWidth || 0;
+  const ih = img?.height || img?.videoHeight || 0;
+  const xf = effectiveUv(gUv, iw, ih);
+  const identity = xf.repeatU === 1 && xf.repeatV === 1 && !xf.rot && !xf.offsetU && !xf.offsetV;
+  if (identity) return base;
 
   const t = base.clone();
   t.needsUpdate = true;
   t.wrapS = THREE.RepeatWrapping;
   t.wrapT = THREE.RepeatWrapping;
   t.center.set(0.5, 0.5);
-  t.repeat.set(ru, rv);
-  t.offset.set(ou, ov);
-  t.rotation = rot;
+  t.repeat.set(xf.repeatU, xf.repeatV);
+  t.offset.set(xf.offsetU, xf.offsetV);
+  t.rotation = xf.rot;
   return t;
 }
 
@@ -325,7 +381,8 @@ export async function buildMaterial(files: AssetFile[], cfg: MaterialConfig) {
   const heightF = fileOf(c.height);
   if (heightF) {
     mat.displacementMap = await texFor(heightF, false, gUv);
-    mat.displacementScale = (c.height?.intensity ?? 1) * 0.02;
+    // 与装配器 CPU 置换同一系数（强度 1 → 位移量 DISP_SCALE），保证导出的 .mtlx / 别的 DCC 与预览一致
+    mat.displacementScale = ((c.height as any)?.strength ?? 1) * DISP_SCALE;
   }
 
   const em = fileOf(c.emissive);

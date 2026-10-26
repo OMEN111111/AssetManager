@@ -195,6 +195,9 @@ function saveRequestBody(req: http.IncomingMessage, file: string, limitBytes = 3
 
 const xmlEsc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
+// 与 renderer/matlib.ts 的 DISP_SCALE 保持一致（服务端单独打包，不能跨端 import）
+const DISP_SCALE = 0.03;
+
 function buildMtlx(name: string, cfg: any, byId: Map<number, any>) {
   const ch = cfg.channels || {};
   const fileOf = (k: string) => (ch[k]?.fileId ? byId.get(ch[k].fileId) : null);
@@ -216,6 +219,15 @@ function buildMtlx(name: string, cfg: any, byId: Map<number, any>) {
     nodes.push(`  <image name="img_Normal" type="vector3">\n    <input name="file" type="filename" value="${xmlEsc(fname)}" />\n  </image>`);
     nodes.push(`  <normalmap name="nm" type="vector3">\n    <input name="in" type="vector3" nodename="img_Normal" />\n  </normalmap>`);
   }
+  // 置换：装配器预览是「0.5 中性、强度 × DISP_SCALE × 2」的 CPU 位移，这里写成同一口径的位移着色器
+  let disp = '';
+  if (height) {
+    const strength = Number(ch.height?.strength ?? 1);
+    const dsc = (Math.max(0, Number.isFinite(strength) ? strength : 1) * 2 * DISP_SCALE).toFixed(5);
+    nodes.push('  <subtract name="h_center" type="float">\n    <input name="in1" type="float" nodename="img_Height" />\n    <input name="in2" type="float" value="0.5" />\n  </subtract>');
+    nodes.push(`  <displacement name="disp_Height" type="displacementshader">\n    <input name="displacement" type="float" nodename="h_center" />\n    <input name="scale" type="float" value="${dsc}" />\n  </displacement>`);
+    disp = '\n    <input name="displacementshader" type="displacementshader" nodename="disp_Height" />';
+  }
   const id = name.replace(/[^A-Za-z0-9_]/g, '_') || 'Material';
   const links = [
     base ? '    <input name="base_color" type="color3" nodename="img_BaseColor" />' : '',
@@ -231,7 +243,7 @@ ${nodes.join('\n')}
 ${links}
   </standard_surface>
   <surfacematerial name="${id}_mat" type="material">
-    <input name="surfaceshader" type="surfaceshader" nodename="${id}" />
+    <input name="surfaceshader" type="surfaceshader" nodename="${id}" />${disp}
   </surfacematerial>
 </materialx>
 `;

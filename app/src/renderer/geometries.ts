@@ -1,7 +1,5 @@
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
-import { TessellateModifier } from 'three/examples/jsm/modifiers/TessellateModifier.js';
-import { mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 /** 一个纹理重复对应的世界尺寸；所有几何体共用，保证贴图密度一致 */
 export const UV_WORLD = 2.0;
@@ -207,20 +205,63 @@ export function uprightCylinder(g: THREE.BufferGeometry) {
   g.translate(-c.x, -c.y, -c.z);
 }
 
+
+/**
+ * 按「空间位置」平滑法线：只按位置合并法线，不受 UV 接缝影响。
+ * 圆角方细分后同一位置的顶点会因 UV 断开而重复，computeVertexNormals 会各算各的，
+ * 倒角处就出现一条暗缝 —— 这里按位置累加面法线（面积加权）再统一归一化。
+ */
+export function smoothNormalsByPosition(g: THREE.BufferGeometry) {
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  const idx = g.index;
+  const keyOf = (i: number) => `${Math.round(pos.getX(i) * 1e4)},${Math.round(pos.getY(i) * 1e4)},${Math.round(pos.getZ(i) * 1e4)}`;
+  const acc = new Map<string, THREE.Vector3>();
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  const ab = new THREE.Vector3(), cb = new THREE.Vector3(), fn = new THREE.Vector3();
+  const tri = idx ? idx.count / 3 : pos.count / 3;
+  for (let t = 0; t < tri; t++) {
+    const i0 = idx ? idx.getX(t * 3) : t * 3;
+    const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
+    const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+    a.fromBufferAttribute(pos, i0);
+    b.fromBufferAttribute(pos, i1);
+    c.fromBufferAttribute(pos, i2);
+    cb.subVectors(c, b);
+    ab.subVectors(a, b);
+    fn.crossVectors(cb, ab);            // 未归一化 = 面积加权
+    for (const i of [i0, i1, i2]) {
+      const k = keyOf(i);
+      let v = acc.get(k);
+      if (!v) { v = new THREE.Vector3(); acc.set(k, v); }
+      v.add(fn);
+    }
+  }
+  const normals = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    const v = acc.get(keyOf(i));
+    if (v && v.lengthSq() > 1e-12) {
+      const n = v.clone().normalize();
+      normals[i * 3] = n.x; normals[i * 3 + 1] = n.y; normals[i * 3 + 2] = n.z;
+    }
+  }
+  g.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+}
+
 export function makeGeometry(kind: PreviewGeometry, planeAxis: 'v' | 'h' = 'v'): THREE.BufferGeometry {
   if (kind === 'box') {
     const size = 1.7;
-    // 圆角盒：先倒角，再细分所有面，保证高度置换在平面区域也有均匀顶点
-    let g: THREE.BufferGeometry = new RoundedBoxGeometry(size, size, size, 24, 0.16);
-    g = new TessellateModifier(0.045, 4).modify(g) as THREE.BufferGeometry;
-    // 细分会拆散顶点，必须焊接后重算法线，否则倒角处出现黑缝
-    g = mergeVertices(g, 1e-4);
-    g.computeVertexNormals();
+    // 圆角盒：直接用高分段圆角盒。
+    // 不要再用 TessellateModifier 细分——它是逐三角形细分，会在共享边留下 T 型接点：
+    // 平面时看不出来，一开置换两个三角形的顶点位移不同就裂成黑缝。
+    const g: THREE.BufferGeometry = new RoundedBoxGeometry(size, size, size, 160, 0.16);
     planarUVByTriangle(g);
+    smoothNormalsByPosition(g);   // 倒角处不再出现暗缝
     return withUv1(g);
   }
   if (kind === 'cylinder') {
-    return withUv1(roundedCylinder(0.86, 2.0, 0.16, 160));
+    const g = roundedCylinder(0.86, 2.0, 0.16, 160);
+    smoothNormalsByPosition(g);   // 侧壁与顶/底盖交界同理
+    return withUv1(g);
   }
   if (kind === 'plane') {
     const g = new THREE.PlaneGeometry(2.4, 2.4, 96, 96);

@@ -56,3 +56,10 @@ devtest/ue/t*_run.log
 devtest/maya/.data/
 devtest/maya/work/
 
+
+# 置换对齐验证页（esbuild 产物与截图，可随时重打）
+devtest/disp/node_modules/
+devtest/disp/*.js
+devtest/disp/out-*.png
+
+devtest/disp/*.css

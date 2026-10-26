@@ -17,6 +17,74 @@ import type { AssetDetail, AssetFile } from './types';
 
 type Preset = 'maya' | 'max' | 'blender';
 
+// 整个渲染端共用一个 WebGL 上下文：反复打开/关闭复杂模型时，每次 new WebGLRenderer
+// 都会占一个上下文，浏览器上限（~16 个）用完后就会报 "Error creating WebGL context"。
+let sharedRenderer: THREE.WebGLRenderer | null = null;
+let viewerDoubleSided = false;   // 双面渲染（模块级：材质工具函数里也要用）
+
+/** 递归释放场景里的几何/材质/贴图（换模型时必须做，否则显存只增不减） */
+/** 预览用贴图上限：8K 贴图一张就要 ~350MB 显存（含 mipmap），几个材质就把显卡顶爆 */
+const TEX_MAPS = ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap',
+  'alphaMap', 'displacementMap', 'bumpMap', 'specularMap', 'lightMap'];
+
+/** 把模型里所有贴图按显存预算降采样（在加入场景、第一次上传前调用） */
+async function capTexturesForVram(root: any, timeoutMs = 15000): Promise<{ capped: number; max: number; total: number }> {
+  const seen = new Set<any>();
+  const list: any[] = [];
+  root.traverse((o: any) => {
+    const mats = Array.isArray(o.material) ? o.material : (o.material ? [o.material] : []);
+    for (const m of mats) {
+      if (!m) continue;
+      for (const k of TEX_MAPS) {
+        const t = (m as any)[k];
+        if (t && !seen.has(t)) { seen.add(t); list.push(t); }
+      }
+    }
+  });
+  const max = list.length > 30 ? 1024 : list.length > 12 ? 1536 : 2048;
+  const t0 = performance.now();
+  let capped = 0;
+  for (const t of list) {
+    while ((!t.image || !(t.image.width || t.image.naturalWidth)) && performance.now() - t0 < timeoutMs) {
+      await new Promise(r => setTimeout(r, 40));
+    }
+    const img: any = t.image;
+    const w = img?.width || img?.naturalWidth || 0;
+    const h = img?.height || img?.naturalHeight || 0;
+    if (!w || !h || Math.max(w, h) <= max) continue;
+    const sc = max / Math.max(w, h);
+    try {
+      const cv = document.createElement('canvas');
+      cv.width = Math.max(1, Math.round(w * sc));
+      cv.height = Math.max(1, Math.round(h * sc));
+      cv.getContext('2d')!.drawImage(img, 0, 0, cv.width, cv.height);
+      try { (img as any).close?.(); } catch { /* ImageBitmap */ }
+      t.image = cv;
+      t.needsUpdate = true;
+      capped++;
+    } catch { /* 降采样失败就保留原图 */ }
+  }
+  return { capped, max, total: list.length };
+}
+
+function disposeSceneResources(sc: THREE.Scene) {
+  sc.traverse((o: any) => {
+    if (o.geometry?.dispose) o.geometry.dispose();
+    const mats = Array.isArray(o.material) ? o.material : (o.material ? [o.material] : []);
+    for (const m of mats) {
+      if (!m) continue;
+      for (const k of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap',
+        'alphaMap', 'displacementMap', 'bumpMap', 'envMap', 'lightMap', 'specularMap']) {
+        const t = (m as any)[k];
+        if (t?.dispose) { try { t.dispose(); } catch { /* ignore */ } }
+      }
+      try { m.dispose?.(); } catch { /* ignore */ }
+    }
+  });
+  sc.clear();
+}
+
+
 /** 解析 IESNA 文本，取垂直配光曲线（平均水平角），用于推导光束角与光斑衰减 */
 function kelvinToColor(k: number): THREE.Color {
   const t = Math.max(1000, Math.min(40000, k)) / 100;
@@ -298,6 +366,109 @@ function channelSwz(m: any, ch: string): string {
   return 'rgb';
 }
 
+/** 贴图是否真的加载出来了（FBX 里常见「有 map 对象但 image 为空」） */
+function texAlive(t: any): boolean {
+  if (!t) return false;
+  const im = t.image;
+  return !!(im && (im.width || im.naturalWidth));
+}
+
+const CH_KW: Record<string, string[]> = {
+  baseColor: ['basecolor', 'base_color', 'albedo', 'diffuse', '_diff', 'color', '_col'],
+  normal: ['normal', 'nor_gl', 'nor_dx', 'nor_', '_nrm', 'nrm_', 'bump'],
+  roughness: ['rough', 'rgh', 'gloss'],
+  metallic: ['metal', 'mtl', 'specular', '_spec'],
+  ao: ['_ao', 'ao_', 'occlusion', 'occl'],
+  emissive: ['emissive', 'emission', 'emit'],
+  opacity: ['opacity', 'alpha', 'transp'],
+  height: ['height', 'displacement', 'disp', '_disp']
+};
+const PACK_RE = /(_arm_|_orm_|_rma_|_omr_|arm\.|orm\.)/i;
+const nameTokens = (s0: string) => String(s0 || '').toLowerCase().replace(/\.[a-z0-9]+$/, '')
+  .split(/[^a-z0-9]+/).filter(t => t && t.length >= 3 && !['material', 'mat', 'default', 'object', 'mesh', 'null', 'the'].includes(t));
+const baseName = (s0: string) => String(s0 || '').split(/[\\/]/).pop()!.toLowerCase();
+
+/** 按材质名 / 贴图名 / 顺序，给每个材质槽位补上缺的或坏掉的贴图（打包图按通道拆） */
+export interface MatchAssign { material: string; channel: string; rel: string; swizzle: string }
+export async function autoMatchSlotTextures(groups: any[], files: AssetFile[]): Promise<{ changed: number; assigns: MatchAssign[] }> {
+  const imgs = files.filter(f => /\.(png|jpe?g|tga|tiff?|bmp|webp)$/i.test(f.rel_path));
+  if (!imgs.length) return { changed: 0, assigns: [] };
+  const assigns: MatchAssign[] = [];
+  let changedGroups = 0;
+  for (const g of groups) {
+    if (!g?.meshes?.length) continue;
+    const own: any = matOf(g.meshes[0]);
+    if (!own) continue;
+    const mt = nameTokens(g.name);
+    const m: any = own.clone();
+    m.side = viewerDoubleSided ? THREE.DoubleSide : THREE.FrontSide;
+    const used = new Set<number>();
+    let changed = false;
+    for (const ch of ['baseColor', 'normal', 'roughness', 'metallic', 'ao', 'emissive', 'opacity', 'height'] as const) {
+      const cur = ch === 'baseColor' ? m.map : ch === 'normal' ? m.normalMap
+        : ch === 'roughness' ? m.roughnessMap : ch === 'metallic' ? m.metalnessMap
+        : ch === 'ao' ? m.aoMap : ch === 'emissive' ? m.emissiveMap
+        : ch === 'opacity' ? m.alphaMap : (m.displacementMap || m.bumpMap);
+      if (texAlive(cur)) continue;
+      const kws = CH_KW[ch] || [];
+      let best: any = null, bestScore = 0;
+      for (const f of imgs) {
+        const bn = baseName(f.rel_path);
+        const packed = PACK_RE.test(bn);
+        let sc = 0;
+        if (kws.some(k => bn.includes(k))) sc += 50;
+        if (mt.length && mt.every(t => bn.includes(t))) sc += 35;
+        else if (mt.some(t => bn.includes(t))) sc += 15;
+        if (packed && ['roughness', 'metallic', 'ao'].includes(ch)) sc += 25;
+        if (!packed && used.has(f.id)) sc = 0;
+        if (sc > bestScore) { best = f; bestScore = sc; }
+      }
+      if (!best || bestScore < (['opacity', 'emissive', 'height'].includes(ch) ? 50 : 20)) continue;
+      const bn = baseName(best.rel_path);
+      const packed = PACK_RE.test(bn);
+      try {
+        if (packed && ['roughness', 'metallic', 'ao'].includes(ch)) {
+          const t = await loadTexture(best, false);
+          const comp = ch === 'ao' ? 'r' : ch === 'roughness' ? 'g' : 'b';
+          const bt: any = bakeChannelTexture(t, comp);
+          bt.userData = { ...(bt.userData || {}), rel: String(best.rel_path), swz: comp };
+          if (ch === 'roughness') { m.roughnessMap = bt; m.roughness = 1; }
+          else if (ch === 'metallic') { m.metalnessMap = bt; m.metalness = 1; }
+          else { m.aoMap = bt; m.aoMapIntensity = 1; }
+        } else if (ch === 'baseColor') { m.map = await loadTexture(best, true); m.map.userData = { ...(m.map.userData || {}), rel: String(best.rel_path), swz: 'rgb' }; m.color?.setRGB(1, 1, 1); }
+        else if (ch === 'normal') {
+          m.normalMap = await loadTexture(best, false);
+          m.normalMap.userData = { ...(m.normalMap.userData || {}), rel: String(best.rel_path), swz: 'rgb' };
+          if (/_dx|nor_dx/i.test(bn)) m.normalScale = new THREE.Vector2(1, -1);
+        }
+        else if (ch === 'roughness') { m.roughnessMap = await loadTexture(best, false);
+        m.roughnessMap.userData = { ...(m.roughnessMap.userData || {}), rel: String(best.rel_path), swz: 'rgb' }; m.roughness = 1; }
+        else if (ch === 'metallic') { m.metalnessMap = await loadTexture(best, false);
+        m.metalnessMap.userData = { ...(m.metalnessMap.userData || {}), rel: String(best.rel_path), swz: 'rgb' }; m.metalness = 1; }
+        else if (ch === 'ao') { m.aoMap = await loadTexture(best, false);
+        m.aoMap.userData = { ...(m.aoMap.userData || {}), rel: String(best.rel_path), swz: 'rgb' }; m.aoMapIntensity = 1; }
+        else if (ch === 'emissive') { m.emissiveMap = await loadTexture(best, true);
+        m.emissiveMap.userData = { ...(m.emissiveMap.userData || {}), rel: String(best.rel_path), swz: 'rgb' }; m.emissive = new THREE.Color(0xffffff); }
+        else if (ch === 'opacity') { m.alphaMap = await loadTexture(best, false);
+        m.alphaMap.userData = { ...(m.alphaMap.userData || {}), rel: String(best.rel_path), swz: 'rgb' }; m.transparent = true; }
+        else {
+          m.displacementMap = await loadTexture(best, false);
+          m.displacementMap.userData = { ...(m.displacementMap.userData || {}), rel: String(best.rel_path), swz: 'rgb' };
+          m.displacementScale = 0.02;
+        }
+        used.add(best.id);
+        assigns.push({ material: String(g.name || '').replace(/\s+\(\d+\)$/, ''), channel: ch, rel: String(best.rel_path), swizzle: packed && ['roughness', 'metallic', 'ao'].includes(ch) ? (ch === 'ao' ? 'r' : ch === 'roughness' ? 'g' : 'b') : 'rgb' });
+        changed = true;
+      } catch { /* skip */ }
+    }
+    if (!changed) continue;
+    m.needsUpdate = true;
+    for (const cc of g.meshes) { setMatOf(cc, m); cc.ownSlot = m; cc.ownMat = cc.mesh.material; }
+    changedGroups++;
+  }
+  return { changed: changedGroups, assigns };
+}
+
 function channelMaterial(ch: Channel, base: any, swz = 'rgb'): THREE.Material {
   const side = base?.side ?? THREE.FrontSide;
   const pick = (t: any) => new THREE.MeshBasicMaterial({ map: t || null, color: t ? 0xffffff : 0x8b93a1, side });
@@ -393,6 +564,8 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
   const [tiles, setTiles] = useState<string[]>([]);
   // F-007：模型材质/通道贴图覆盖
   const [ovVersion, setOvVersion] = useState(0);
+  const [matchBusy, setMatchBusy] = useState(false);
+  const [doubleSided, setDoubleSided] = useState(false);   // 双面渲染
 
   const [exposure, setExposure] = useState(1);
   const [envI, setEnvI] = useState(1);
@@ -635,12 +808,31 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     const el = stageRef.current;
     if (!el) return;
     let disposed = false;
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-    renderer.setSize(el.clientWidth || 900, el.clientHeight || 600, true);
+    let renderer: THREE.WebGLRenderer;
+    const ctxLost = (r: THREE.WebGLRenderer | null) => {
+      try { return !!(r?.getContext?.() as any)?.isContextLost?.(); } catch { return true; }
+    };
+    if (sharedRenderer && !ctxLost(sharedRenderer)) {
+      renderer = sharedRenderer;
+      if (renderer.domElement.parentElement !== el) el.appendChild(renderer.domElement);
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(el.clientWidth || 900, el.clientHeight || 600, true);
+    } else {
+      renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+      sharedRenderer = renderer;
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(el.clientWidth || 900, el.clientHeight || 600, true);
+      el.appendChild(renderer.domElement);
+      renderer.domElement.addEventListener('webglcontextlost', (ev: Event) => {
+        ev.preventDefault();
+        sharedRenderer = null;                 // 下次打开重新建上下文，不白屏卡死
+        try { renderer.dispose(); } catch { /* ignore */ }
+        setError('显卡显存不足，预览已停止（再次打开会重建显卡上下文）');
+      });
+    }
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    el.appendChild(renderer.domElement);
+    if (renderer.domElement.parentElement !== el) el.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0b0c0e);
@@ -770,7 +962,10 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     (async () => {
       const files = asset.files;
       // 统一走 matlib.loadTexture：TIFF/TGA 会先解码成 PNG，失败也有占位贴图兜底
-      const tex = (f: AssetFile, srgb = false) => loadTexture(f, srgb);
+      const tex = (f: AssetFile, srgb = false) => loadTexture(f, srgb).then((t: any) => {
+        t.userData = { ...(t.userData || {}), rel: String(f.rel_path), swz: 'rgb' };
+        return t;
+      });
 
       // UDIM 分块文件（xxx_1001.jpg / xxx.1002.jpg …）合成为一张图集
       const udimAtlas = async (list: AssetFile[], keys: string[], srgb = false): Promise<THREE.Texture | null> => {
@@ -971,6 +1166,16 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         }
         // TIFF / TGA 贴图先解码成 PNG blob（浏览器原生解码不了）
         const special = await preloadSpecialTextures(files);
+        api.current.specialMap = special;
+        // 同一个 blob 也按「文件 id」索引：FBX 里的贴图文件名常被改写成 Map #1 之类，
+        // 单靠文件名匹配会漏掉 TIFF/TGA，浏览器又解不了 TIFF → 贴图变空。
+        const specialById = new Map<number, string>();
+        for (const f of files) {
+          if (!SPECIAL_TEX.test(f.rel_path)) continue;
+          const bn = String(f.rel_path).split('/').pop()!.toLowerCase();
+          const u = special.get(bn);
+          if (u) specialById.set(f.id, u);
+        }
         const manager = new THREE.LoadingManager();
         manager.setURLModifier(url => {
           // 注意：FBX 里的贴图路径可能是 `..\别的目录\maps\x.jpg`（作者的相邻目录），three 会拼成绝对 http URL；
@@ -982,7 +1187,12 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           const sp = special.get(name);
           if (sp) return sp;
           const id = fileByName.get(name);
-          return id ? `/api/file/${id}` : url;
+          if (id) {
+            const sp2 = specialById.get(id);
+            if (sp2) return sp2;
+            return `/api/file/${id}`;
+          }
+          return url;
         });
         setStatus('解析模型…');
         let obj: any;
@@ -1003,6 +1213,12 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           const gl: any = await new Promise((res, rej) => new GLTFLoader(manager).load(`/api/file/${modelFile.id}`, res, undefined, rej));
           obj = gl.scene || gl.scenes?.[0];
         }
+        // 显存保护：8K/4K 贴图在加入场景前降采样（否则几十张贴图会把 8G 显卡顶爆 → 上下文丢失）
+        try {
+          setStatus('优化贴图显存…');
+          const cap = await capTexturesForVram(obj);
+          (globalThis as any).__AMGLTEX = cap;
+        } catch { /* ignore */ }
         const collected: any[] = [];
         const fileNameOf = (src: string) => {
           try { return decodeURIComponent(String(src).split('/').pop() || ''); } catch { return ''; }
@@ -1060,13 +1276,23 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         };
         const normMat = (mm: any) => (Array.isArray(mm) ? mm.map(toStandard) : toStandard(mm));
 
+        // 材质「身份」= 名字 + 贴图签名。
+        // 只按名字合并会把「同名但贴图不同」的多维子材质并成一个（Max Multi/Sub-Object 里很常见），
+        // 结果就是 A 部件的贴图被 B 部件覆盖 —— 表现就是「贴图乱/串图」。
+        const matSig = (m: any) => {
+          if (!m) return 'none';
+          const map = m.map?.image?.src || m.map?.source?.data?.uuid || '';
+          const nor = m.normalMap?.image?.src || '';
+          const col = m.color?.getHexString?.() || '';
+          return [map, nor, col].join('~');
+        };
         const baseKey = (material: any) => {
           const m = Array.isArray(material) ? material[0] : material;
           if (!m) return 'none';
           const nm = String((m as any).name || '').trim();
-          // 有名按名字合并：FBXLoader 会给每个网格复制一份同名材质对象，
-          // 按对象身份分组会把同一个材质球拆成十几份；无名（__DEFAULT）才按对象身份区分。
-          if (nm && nm !== '__DEFAULT') return 'n:' + nm.toLowerCase();
+          // 同名同贴图 → 合并（FBXLoader 会给每个网格复制材质对象）；
+          // 同名不同贴图 → 必须分开，否则会互相覆盖。
+          if (nm && nm !== '__DEFAULT') return 'n:' + nm.toLowerCase() + '|' + matSig(m);
           const uid = (m as any).uuid || `${(m as any).type || 'mat'}`;
           return 'm:' + uid;
         };
@@ -1139,10 +1365,14 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           if (c0.kept) continue;
           if (!hasImgs) continue;
           // 保留模型材质本身（它带正确的颜色/参数），只往空槽里补本组自己的贴图
-          const m: any = (c0.kept && own0) ? own0 : new THREE.MeshStandardMaterial({
-            color: 0xffffff, roughness: 0.85, metalness: 0,
-            side: (mat as any).side, envMapIntensity: (mat as any).envMapIntensity
-          });
+          // 从原材质复制（保留它已有的颜色/参数/其它通道），只补缺的那几路；
+          // 以前这里 new 一个空材质，会把「只有法线/粗糙」的材质丢掉已有贴图。
+          const m: any = own0
+            ? toStandard(own0).clone()
+            : new THREE.MeshStandardMaterial({
+                color: 0xffffff, roughness: 0.85, metalness: 0,
+                side: (mat as any).side, envMapIntensity: (mat as any).envMapIntensity
+              });
           if (lackBase) {
             const uBase2 = await udimAtlas(sub, ["diff", "albedo", "basecolor", "color"], true);
             const base = findFile(sub, "basecolor", "base_color", "albedo", "diffuse", "_diff", "_col", "color");
@@ -1293,18 +1523,16 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               if (u) url = u;
             }
             return new Promise<THREE.Texture>((res, rej) => {
-            const f = files.find(x => String(x.rel_path) === rel);
-            let url = f ? `/api/file/${f.id}` : `/api/override-file?assetId=${asset.id}&rel=${encodeURIComponent(rel)}`;
-            new THREE.TextureLoader().load(url, t => {
-              t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-              t.wrapS = THREE.RepeatWrapping;
-              t.wrapT = THREE.RepeatWrapping;
-              t.anisotropy = 8;
-              (t as any).userData = { ...(t as any).userData, src: url };
-              const out: any = swz && swz !== 'rgb' ? bake(t, swz) : t;
-              out.userData = { ...(out as any).userData, src: url };
-              res(out);
-            }, undefined, rej);
+              new THREE.TextureLoader().load(url, t => {
+                t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+                t.wrapS = THREE.RepeatWrapping;
+                t.wrapT = THREE.RepeatWrapping;
+                t.anisotropy = 8;
+                (t as any).userData = { ...(t as any).userData, src: url, rel, swz };
+                const out: any = swz && swz !== 'rgb' ? bake(t, swz) : t;
+                out.userData = { ...(out as any).userData, src: url, rel, swz };
+                res(out);
+              }, undefined, rej);
             });
           };
           const normKey2 = (x: string) => String(x || '').trim().toLowerCase();
@@ -1388,10 +1616,17 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         }));
         // 每个材质组的贴图（用于右侧随材质切换）
         const texInfo = (src: string) => {
+          // TIFF/TGA 在浏览器里不能直接显示：换成预解码的 PNG blob
+          const sm: Map<string, string> | undefined = api.current.specialMap;
+          if (sm && SPECIAL_TEX.test(src)) {
+            const base = String(src).split(/[\\/]/).pop()!.toLowerCase();
+            const blob = sm.get(base);
+            if (blob) src = blob;
+          }
           const idm = String(src || '').match(/\/api\/file\/(\d+)/);
           const id = idm ? Number(idm[1]) : 0;
           const f = id ? asset.files.find(x => x.id === id) : undefined;
-          return { src, id, name: f ? String(f.rel_path).split('/').pop()! : fileNameOf(src) };
+          return { src, id, name: f ? String(f.rel_path).split('/').pop()! : fileNameOf(src), rel: f ? String(f.rel_path) : '' };
         };
         const groupTex = gs.map(g => {
           const mm: any = matOf(g.meshes[0]);
@@ -1401,7 +1636,16 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
             const s2 = t?.image?.src || t?.userData?.src;
             if (!s2 || seen.has(s2)) return;
             seen.add(s2);
-            rows.push({ k, ...texInfo(s2) });
+            const info = texInfo(s2);
+            const rel = (t?.userData?.rel as string) || info.rel;
+            // 打包图（粗糙=金属=同一张贴图）没记过 swizzle 时按通道推断，免得 RGBA 显示成未选
+            let swz = (t?.userData?.swz as string) || '';
+            if (!swz) {
+              if (k === 'roughness' && mm?.roughnessMap && mm.roughnessMap === mm.metalnessMap) swz = 'g';
+              else if (k === 'metallic' && mm?.metalnessMap && mm.metalnessMap === mm.roughnessMap) swz = 'b';
+              else if (k === 'ao' && mm?.aoMap && (mm.aoMap === mm.roughnessMap || mm.aoMap === mm.metalnessMap)) swz = 'r';
+            }
+            rows.push({ k, ...info, name: rel ? String(rel).split('/').pop()! : info.name, rel, swz: swz || 'rgb' });
           };
           add('baseColor', mm?.map); add('normal', mm?.normalMap); add('roughness', mm?.roughnessMap);
           add('metallic', mm?.metalnessMap); add('ao', mm?.aoMap); add('emissive', mm?.emissiveMap);
@@ -1443,7 +1687,9 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
             else c.mesh.material = own;
             continue;
           }
-          setMatOf(c, channelMaterial(ch, own, channelSwz(own, ch)));
+          const cm: any = channelMaterial(ch, own, channelSwz(own, ch));
+          cm.side = viewerDoubleSided ? THREE.DoubleSide : THREE.FrontSide;
+          setMatOf(c, cm);
         }
       };
       api.current.restoreMaterials = () => {
@@ -1483,14 +1729,22 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     return () => {
       disposed = true;
       cancelAnimationFrame(raf);
+      try { disposeSceneResources(scene); } catch { /* ignore */ }
+      try { (scene as any).environment = null; } catch { /* ignore */ }
+      try { api.current.roomEnv?.dispose?.(); } catch { /* ignore */ }
+      try { pmrem.dispose(); } catch { /* ignore */ }
+      try { renderer.renderLists?.dispose?.(); } catch { /* ignore */ }
       ro.disconnect();
       canvas.removeEventListener('pointerdown', onDown);
       canvas.removeEventListener('pointermove', onMove);
       canvas.removeEventListener('pointerup', onUp);
       canvas.removeEventListener('wheel', onWheel);
       window.removeEventListener('keydown', onKey);
-      renderer.dispose();
-      el.innerHTML = '';
+      // 不销毁 renderer（共用上下文），只把它从 DOM 里摘掉
+      // 只摘掉自己的 canvas；绝不 el.innerHTML = ''（.vx-3d 里还有 React 管的 vloading / verror，
+      // 清空会让 React 之后 removeChild 找不到节点 → NotFoundError）
+      try { if (renderer.domElement.parentElement === el) el.removeChild(renderer.domElement); } catch { /* ignore */ }
+      try { el.querySelectorAll('canvas').forEach(c => { if (c.parentElement === el) el.removeChild(c); }); } catch { /* ignore */ }
     };
   }, [asset.id, ovVersion]);
 
@@ -1529,6 +1783,22 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       c.wire.material.color.set(wire === 2 ? 0xffffff : 0x000000);
     }
   }, [wire, meshList]);
+
+  // 双面渲染：模型材质与通道预览材质都跟着切
+  useEffect(() => {
+    const ds = doubleSided;
+    api.current.doubleSided = ds;
+    viewerDoubleSided = ds;
+    const side = ds ? THREE.DoubleSide : THREE.FrontSide;
+    for (const g of (api.current.groups || []) as any[]) {
+      for (const c of g.meshes || []) {
+        const own: any = c.ownSlot || matOf(c);
+        if (own) { own.side = side; own.needsUpdate = true; }
+        const cur: any = matOf(c);
+        if (cur && cur !== own) { cur.side = side; cur.needsUpdate = true; }
+      }
+    }
+  }, [doubleSided, meshList, ovVersion]);
 
   // hdri list
   useEffect(() => {
@@ -1722,10 +1992,18 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     }
     return undefined;
   };
-  const TEX_ROWS = ['baseColor', 'normal', 'roughness', 'metallic', ...extraChans].map((ch: string) => {
+  // 材质里已有的通道（AO / 自发光 / 不透明 / 置换…）自动出现在贴图行里，不用手动加
+  const presentChans = new Set((shownTex || []).map((r: any) => r.k));
+  const autoChans = (['ao', 'height', 'emissive', 'opacity'] as string[])
+    .filter(k => presentChans.has(k) || !!ovOf(k)?.rel);
+  const rowChans: string[] = [];
+  for (const k of ['baseColor', 'normal', 'roughness', 'metallic', ...autoChans, ...extraChans]) {
+    if (!rowChans.includes(k)) rowChans.push(k);
+  }
+  const TEX_ROWS = rowChans.map((ch: string) => {
     const hit: any = shownTex.find((r: any) => r.k === ch);
     const ov: any = ovOf(ch);
-    const rel = ov?.rel || (hit?.id ? relOf(hit.id) : '');
+    const rel = ov?.rel || hit?.rel || (hit?.id ? relOf(hit.id) : '');
     const f = rel ? asset.files.find((x: any) => String(x.rel_path) === rel) : null;
     // 手动指定的贴图（还没写进素材目录时走 override-file）也要有缩略图
     const src = ov?.rel
@@ -1737,7 +2015,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       name: rel ? String(rel).split('/').pop() : (hit?.name || ''),
       id: hit?.id || 0,
       rel,
-      swz: ov?.swizzle || 'rgb'
+      swz: ov?.swizzle || hit?.swz || 'rgb'
     };
   });
 
@@ -1752,6 +2030,90 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       body: JSON.stringify({ material, channel: ch, fileRel: rel, swizzle: swz || 'rgb', replaceFileId: rel ? (targetId || 0) : 0 })
     });
     setOvVersion((v: number) => v + 1);
+  }
+
+  /** 把某个通道的贴图去掉（不指定） */
+  async function clearChannel(ch: string) {
+    const gi = activeMat >= 0 ? activeMat : 0;
+    const g: any = (api.current.groups || [])[gi];
+    if (!g?.meshes?.length) return;
+    const own: any = matOf(g.meshes[0]);
+    if (!own) return;
+    const m: any = own.clone();
+    m.side = viewerDoubleSided ? THREE.DoubleSide : THREE.FrontSide;
+    if (ch === 'baseColor') { m.map = null; m.color?.setRGB(1, 1, 1); }
+    else if (ch === 'normal') m.normalMap = null;
+    else if (ch === 'roughness') { m.roughnessMap = null; m.roughness = 1; }
+    else if (ch === 'metallic') { m.metalnessMap = null; m.metalness = 0; }
+    else if (ch === 'ao') m.aoMap = null;
+    else if (ch === 'emissive') { m.emissiveMap = null; m.emissive = new THREE.Color(0x000000); }
+    else if (ch === 'opacity') { m.alphaMap = null; m.transparent = false; m.opacity = 1; }
+    else if (ch === 'height') { m.displacementMap = null; m.bumpMap = null; }
+    m.needsUpdate = true;
+    for (const cc of g.meshes) { setMatOf(cc, m); cc.ownSlot = m; cc.ownMat = cc.mesh.material; }
+    const material = String(g.name || '').replace(/\s+\(\d+\)$/, '');
+    try {
+      await fetch(`/api/model/${asset.id}/overrides`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ material, channel: ch, fileRel: '', swizzle: 'rgb' })
+      });
+    } catch { /* 本地已生效，忽略持久化失败 */ }
+    const rows = (api.current.groups || []).map((gg: any) => {
+      const mm: any = matOf(gg.meshes[0]);
+      const out: any[] = [];
+      const add = (k: string, t: any) => { const src = t?.image?.src || t?.userData?.src; if (src) out.push({ k, src, name: String(src).split('/').pop(), rel: t?.userData?.rel || '', swz: t?.userData?.swz || 'rgb' }); };
+      add('baseColor', mm?.map); add('normal', mm?.normalMap); add('roughness', mm?.roughnessMap);
+      add('metallic', mm?.metalnessMap); add('ao', mm?.aoMap); add('emissive', mm?.emissiveMap);
+      return out;
+    });
+    api.current.groupTex = rows;
+    setGroupTex(rows);
+  }
+
+  /** 手动配置贴图：按「材质名 + 贴图名 + FBX 自带顺序」给每个材质槽位补图 */
+  async function rematchTextures() {
+    if (matchBusy) return;
+    setMatchBusy(true);
+    setStatus('匹配贴图…');
+    try {
+      const res = await autoMatchSlotTextures((api.current.groups || []) as any[], asset.files);
+      const n = res.changed;
+      // 把匹配结果写进覆盖表，关闭再打开预览时会重新应用（否则只存在内存里）
+      for (const a of res.assigns) {
+        try {
+          await fetch(`/api/model/${asset.id}/overrides`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ material: a.material, channel: a.channel, fileRel: a.rel, swizzle: a.swizzle })
+          });
+        } catch { /* ignore */ }
+      }
+      const rows = (api.current.groups || []).map((g: any) => {
+        const mm: any = matOf(g.meshes[0]);
+        const out: any[] = [];
+        const add = (k: string, t: any) => {
+          const src = t?.image?.src || t?.userData?.src;
+          if (!src) return;
+          const rel = (t?.userData?.rel as string) || '';
+          let swz = (t?.userData?.swz as string) || '';
+          if (!swz) {
+            if (k === 'roughness' && mm?.roughnessMap && mm.roughnessMap === mm.metalnessMap) swz = 'g';
+            else if (k === 'metallic' && mm?.metalnessMap && mm.metalnessMap === mm.roughnessMap) swz = 'b';
+            else if (k === 'ao' && mm?.aoMap && (mm.aoMap === mm.roughnessMap || mm.aoMap === mm.metalnessMap)) swz = 'r';
+          }
+          out.push({ k, src, name: rel ? String(rel).split('/').pop()! : String(src).split('/').pop(), rel, swz: swz || 'rgb' });
+        };
+        add('baseColor', mm?.map); add('normal', mm?.normalMap); add('roughness', mm?.roughnessMap);
+        add('metallic', mm?.metalnessMap); add('ao', mm?.aoMap); add('emissive', mm?.emissiveMap);
+        return out;
+      });
+      api.current.groupTex = rows;
+      setGroupTex(rows);
+      setOvVersion(v => v + 1);
+      setStatus(n ? `已匹配 ${n} 个材质` : '没有可补的贴图');
+      setTimeout(() => setStatus(''), 1600);
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    } finally { setMatchBusy(false); }
   }
 
   return (
@@ -1980,6 +2342,9 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
                     {m.name}<span className="vp-cnt">{m.count}</span>
                   </button>
                 ))}
+                <button className="btn tiny" style={{ marginTop: 6 }} disabled={matchBusy}
+                  title="按材质球名字 / 贴图名字 / FBX 自带顺序匹配各通道（含打包图拆通道）"
+                  onClick={rematchTextures}>{matchBusy ? '匹配中…' : '自动匹配贴图'}</button>
 
               </>
             ) : (
@@ -2016,9 +2381,15 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
                   ? <img src={r.src} alt="" loading="lazy" onClick={() => setTexPreview({ src: r.src, name: r.name })} title="点击放大预览" />
                   : <span className="vp-texph" title="这一路还没有贴图">无</span>}
                 <span>{CH_LABEL[r.k] || r.k}</span>
-                <select className="sortsel vp-texsel" value={r.rel || ''} title="替换这一路的贴图"
-                  onChange={e => setTexFor(r.k, e.target.value, undefined, r.id)}>
-                  <option value="">{r.rel ? (r.name || '（当前）') : '选择贴图…'}</option>
+                <select className="sortsel vp-texsel" value={r.src ? '__cur' : ''} title="替换这一路的贴图"
+                  onChange={e => {
+                    const v = e.target.value;
+                    if (v === '__none') { clearChannel(r.k); return; }
+                    if (v === '__cur' || !v) return;
+                    setTexFor(r.k, v, undefined, r.id);
+                  }}>
+                  <option value="__none">不指定</option>
+                  <option value="__cur">{r.rel ? (r.name || '（当前）') : '选择贴图…'}</option>
                   {imgFiles.map((f: any) => (
                     <option key={f.id} value={f.rel_path}>{String(f.rel_path).split('/').pop()}</option>
                   ))}
@@ -2039,6 +2410,10 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               <button className="btn tiny" onClick={() => setWire(w => (w + 1) % 3)}>
                 {wire === 0 ? '关闭' : wire === 1 ? '黑色' : '白色'}
               </button>
+            </div>
+            <div className="vp-row"><span>双面</span>
+              <button className={'btn tiny' + (doubleSided ? ' primary' : '')} title="显示面片背面（单面模型/布料/叶子很有用）"
+                onClick={() => setDoubleSided(v => !v)}>{doubleSided ? '开' : '关'}</button>
             </div>
             <div className="vp-row"><span>视图</span>
               <button className={'btn tiny' + (uvMode ? ' primary' : '')} onClick={() => setUvMode(v => !v)}>UV 分屏</button>
