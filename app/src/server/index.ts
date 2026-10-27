@@ -14,7 +14,7 @@ import {
   pluginTargets, applyPluginTarget, maxPluginFileName,
   installForBlender, blenderSeries, blenderUserDirs,
   installForSu, suSeries as suPluginSeries, suUserDirs, suInstallInfo,
-  installForUe, ueSeries as uePluginSeries, ueProjects, ueInstallInfo,
+  installForUe, ueSeries as uePluginSeries, ueProjects, ueInstallInfo, addUeExtraProjects,
   installForMaya, mayaSeries as mayaPluginSeries, mayaUserDirs, mayaInstallInfo,
   resolvePath, assetInfo, writeDropScript,
   suConvertCheck,
@@ -1086,11 +1086,19 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
 
   // 统一插件安装/卸载：列出本机每个 DCC 的每个版本（勾选=安装，取消=卸载）
   if (p === '/api/bridge/plugin-targets') {
-    return json(res, 200, { targets: pluginTargets(APP_ROOT), maxFile: maxPluginFileName() });
+    return json(res, 200, { targets: pluginTargets(APP_ROOT, DATA_DIR), maxFile: maxPluginFileName() });
   }
   if (p === '/api/bridge/plugin-target' && req.method === 'POST') {
     const b = await body(req);
-    return json(res, 200, applyPluginTarget(APP_ROOT, String(b.key || ''), !!b.install));
+    return json(res, 200, applyPluginTarget(APP_ROOT, String(b.key || ''), !!b.install, DATA_DIR));
+  }
+  // UE：把「手动选择」的工程记下来，之后它就和最近打开的工程一样出现在勾选列表里
+  if (p === '/api/bridge/ue-add-project' && req.method === 'POST') {
+    const b = await body(req);
+    const files = Array.isArray(b.files) ? b.files.map(String) : [];
+    if (!files.length) return json(res, 400, { error: 'files required（.uproject 绝对路径）' });
+    const kept = addUeExtraProjects(DATA_DIR, files);
+    return json(res, 200, { ok: true, saved: kept, targets: pluginTargets(APP_ROOT, DATA_DIR) });
   }
 
   if (p === '/api/bridge/install' && req.method === 'POST') {

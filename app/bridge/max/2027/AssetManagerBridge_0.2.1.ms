@@ -1,7 +1,7 @@
 /*
 ================================================================================
  AssetManager · 3ds Max 桥接插件
- 版本：0.2.1        协议：1        目标：3ds Max 2018+（2026 / 2027 实测）
+ 版本：0.2.1        协议：1        目标：3ds Max 2018+（2023 / 2024 / 2025 / 2026 / 2027 实测）
 --------------------------------------------------------------------------------
  作用：
    1. 常驻轮询器：从 AssetManager 本地服务取任务，导入模型 / 创建材质 / 发送贴图，
@@ -13,7 +13,7 @@
 
  安装：
    把本文件复制到 3ds Max 的 startup 目录，例如
-     %LOCALAPPDATA%\Autodesk\3dsMax\2026 - 64bit\CHS\scripts\startup\
+     %LOCALAPPDATA%\Autodesk\3dsMax\2027 - 64bit\CHS\scripts\startup\
    重启 Max 即可（AssetManager 的「插件」面板可以一键安装）。
    也可以手动执行：  fileIn @"...\AssetManagerBridge.ms"
 

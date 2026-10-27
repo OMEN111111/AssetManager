@@ -1169,69 +1169,7 @@ export default function App() {
     } finally { setBridgeBusy(false); }
   }
 
-  /** UE 插件安装：先让用户勾选工程，再装（不默认装到所有工程） */
-  const [uePick, setUePick] = useState<{
-    items: { name: string; file: string; engine: string; installed?: boolean; version?: string; upToDate?: boolean }[];
-    sel: string[];
-  } | null>(null);
-
-  /** 打开「安装 UE 插件」选择框：列出本机最近打开的工程 */
-  async function openUeInstall() {
-    setBridgeBusy(true);
-    try {
-      const r = await api('/api/bridge/ue-where');
-      setUePick({ items: (r?.items || []).map((x: any) => ({ ...x })), sel: [] });
-    } catch (e: any) {
-      showToast('读取 UE 工程失败：' + String(e?.message || e), 'err');
-    } finally { setBridgeBusy(false); }
-  }
-
-  /** 手动挑 .uproject（不在「最近打开」列表里的工程也能装） */
-  async function addUeProjectsManually() {
-    const am = (window as any).amApi;
-    if (!am?.pickFiles) { showToast('当前环境不支持文件选择（浏览器里打开时）', 'err'); return; }
-    const files: string[] = await am.pickFiles([{ name: 'UE 工程', extensions: ['uproject'] }]) || [];
-    if (!files.length) return;
-    setUePick(cur => {
-      if (!cur) return cur;
-      const items = [...cur.items];
-      const sel = new Set(cur.sel);
-      for (const f of files) {
-        if (!items.some(i => i.file.toLowerCase() === f.toLowerCase())) {
-          const name = (f.split(/[\\/]/).pop() || f).replace(/\.uproject$/i, '');
-          items.push({ name, file: f, engine: '' });
-        }
-        sel.add(f);
-      }
-      return { items, sel: [...sel] };
-    });
-  }
-
-  /** 把插件装进勾选的工程 */
-  async function installUeSelected() {
-    const sel = uePick?.sel || [];
-    if (!sel.length) { showToast('先勾选要安装的 UE 工程', 'err'); return; }
-    setBridgeBusy(true);
-    try {
-      const r = await api('/api/bridge/install-ue', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ projects: sel })
-      });
-      if (!r?.ok) {
-        const why = r?.error || r?.failed?.[0]?.error || '未知原因';
-        showToast('安装失败：' + why, 'err');
-        return;
-      }
-      const list = (r.installed || []).map((x: any) => `${x.project}（UE ${x.engine} · ${x.series} 系列 v${x.version}）`);
-      const bad = (r.failed || []).map((x: any) => `${x.project}：${x.error}`);
-      showToast(`已装到 ${list.length} 个工程：${list.join('；')}。重启 UE 编辑器生效${bad.length ? '；失败：' + bad.join('；') : ''}`,
-        bad.length ? 'info' : 'ok');
-      setUePick(null);
-      await loadBridge();
-    } catch (e: any) {
-      showToast('安装失败：' + String(e?.message || e), 'err');
-    } finally { setBridgeBusy(false); }
-  }
+  /** UE 插件安装：走统一的「按工程勾选」弹窗（勾选=装、取消=卸），见 openPlugins('ue') */
 
   /** 一键装 SketchUp 插件：后端按各 SketchUp 版本挑对应系列，写进它的 Plugins 目录 */
   async function installSuPlugin() {
@@ -1282,16 +1220,16 @@ export default function App() {
     }
   }
 
-  // ---- 统一插件安装/卸载（按 DCC 版本勾选） ----
+  // ---- 统一插件安装/卸载（按 DCC 版本勾选；UE 按工程勾选） ----
   const [plugTargets, setPlugTargets] = useState<any[]>([]);
-  const [plugMaxFile, setPlugMaxFile] = useState('');
   const [plugBusy, setPlugBusy] = useState('');
-  const [plugFilter, setPlugFilter] = useState<'' | 'max' | 'blender' | 'su' | 'maya'>('');
+  const [plugFilter, setPlugFilter] = useState<'' | 'max' | 'blender' | 'su' | 'maya' | 'ue'>('');
   const [plugPick, setPlugPick] = useState(false);       // 安装/卸载插件弹窗
 
   async function openPlugins(dccRaw?: any) {
-    // 每个软件的按钮只看自己：弹窗只列这个 DCC 的版本
-    const dcc = (['max', 'blender', 'su', 'maya'] as const).includes(dccRaw) ? dccRaw as 'max' | 'blender' | 'su' | 'maya' : 'max';
+    // 每个软件的按钮只看自己：弹窗只列这个 DCC 的版本（UE 只列工程）
+    const dcc = (['max', 'blender', 'su', 'maya', 'ue'] as const).includes(dccRaw)
+      ? dccRaw as 'max' | 'blender' | 'su' | 'maya' | 'ue' : 'max';
     setPlugPick(true);
     setPlugFilter(dcc);
     setPlugBusy('scan');
@@ -1299,11 +1237,12 @@ export default function App() {
       const r = await api('/api/bridge/plugin-targets');
       const list = r?.targets || [];
       setPlugTargets(list);
-      setPlugMaxFile(r?.maxFile || '');
       const mine = list.filter((t: any) => t.dcc === dcc);
-      const name = ({ max: '3ds Max', blender: 'Blender', su: 'SketchUp', maya: 'Maya' } as any)[dcc];
-      if (!mine.length) showToast(`${name}：没检测到可安装的版本（先启动一次该软件，让它生成用户配置目录）`, 'err');
-      else showToast(`${name}：检测到 ${mine.length} 个版本` +
+      const name = ({ max: '3ds Max', blender: 'Blender', su: 'SketchUp', maya: 'Maya', ue: 'Unreal Engine' } as any)[dcc];
+      if (!mine.length) showToast(dcc === 'ue'
+        ? 'UE：没找到工程（先在 UE 里打开一次工程，或用「＋ 手动选择 .uproject…」）'
+        : `${name}：没检测到可安装的版本（先启动一次该软件，让它生成用户配置目录）`, 'err');
+      else showToast(`${name}：检测到 ${mine.length} 个${dcc === 'ue' ? '工程' : '版本'}` +
         (mine.some((t: any) => !t.installed) ? `（未安装 ${mine.filter((t: any) => !t.installed).length} 个）` : '') +
         (mine.some((t: any) => t.installed && !t.upToDate) ? '，其中 ' + mine.filter((t: any) => t.installed && !t.upToDate).length + ' 个需更新' : '') +
         '；勾选=安装，取消勾选=卸载', 'ok');
@@ -1324,11 +1263,30 @@ export default function App() {
         body: JSON.stringify({ key: t.key, install: !t.installed })
       });
       if (!r?.ok) showToast((t.installed ? '卸载失败：' : '安装失败：') + (r?.error || '未知原因'), 'err');
-      else showToast(`${t.installed ? '已卸载' : '已安装'}：${t.label}`, 'ok');
+      else showToast(`${t.installed ? '已卸载' : '已安装'}：${t.label}${t.dcc === 'ue' ? '（重启 UE 编辑器生效）' : ''}`, 'ok');
       const r2 = await api('/api/bridge/plugin-targets');
       setPlugTargets(r2?.targets || []);
-      setPlugMaxFile(r2?.maxFile || '');
       await loadBridge();
+    } finally { setPlugBusy(''); }
+  }
+
+  /** UE：手动挑 .uproject，记下来后它就出现在勾选列表里 */
+  async function addUeProjectTargets() {
+    const am = (window as any).amApi;
+    if (!am?.pickFiles) { showToast('当前环境不支持文件选择（浏览器里打开时）', 'err'); return; }
+    const files: string[] = await am.pickFiles([{ name: 'UE 工程', extensions: ['uproject'] }]) || [];
+    if (!files.length) return;
+    setPlugBusy('scan');
+    try {
+      const r = await api('/api/bridge/ue-add-project', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ files })
+      });
+      if (!r?.ok) { showToast('加入列表失败：' + (r?.error || '未知原因'), 'err'); return; }
+      setPlugTargets(r?.targets || []);
+      showToast(`已加入 ${files.length} 个工程，勾选即安装`, 'ok');
+    } catch (e: any) {
+      showToast('加入列表失败：' + (e?.message || e), 'err');
     } finally { setPlugBusy(''); }
   }
 
@@ -2747,8 +2705,8 @@ export default function App() {
                   </div>
                 )}
                 <div className="uvrow" style={{ marginTop: 8 }}>
-                  <button className="btn primary" disabled={bridgeBusy} onClick={openUeInstall}>
-                    安装/更新插件到 UE 工程…
+                  <button className="btn primary" disabled={bridgeBusy} onClick={() => openPlugins('ue')}>
+                    安装 / 卸载插件（UE 工程）
                   </button>
                   <button className="btn" onClick={async () => {
                     const r = await api('/api/bridge/open-folder', {
@@ -2760,7 +2718,7 @@ export default function App() {
                 </div>
                 <div className="hint">
                   插件是纯 Python 编辑器插件（<b>bridge/ue/5.7/AssetManagerBridge</b>），不用编译。
-                  点「安装/更新插件到 UE 工程…」后<b>先勾选工程</b>（或手动选 .uproject），只装你选的那些：
+                  点「安装 / 卸载插件（UE 工程）」后按工程<b>勾选=装、取消勾选=卸</b>（工程不在列表里就手动选 .uproject）：
                   写进工程 <b>Plugins\AssetManagerBridge</b> 并在 .uproject 里启用它和 PythonScriptPlugin，
                   <b>重启 UE 编辑器生效</b>。装好后菜单 <b>工具 → AssetManager</b> 看连接状态。
                   支持：模型导入（FBX/GLB/OBJ…）、PBR 材质重建、贴图、HDRI（天空球 + SkyLight 反射）、
@@ -2845,99 +2803,56 @@ export default function App() {
         <div className="modal-mask" onMouseDown={() => setPlugPick(false)}>
           <div className="modal wide" onMouseDown={e => e.stopPropagation()}>
             <div className="modal-t">
-              安装 / 卸载插件 · {({ max: '3ds Max', blender: 'Blender', su: 'SketchUp', maya: 'Maya' } as any)[plugFilter || 'max']}
+              安装 / 卸载插件 · {({ max: '3ds Max', blender: 'Blender', su: 'SketchUp', maya: 'Maya', ue: 'Unreal Engine' } as any)[plugFilter || 'max']}
               <span className="hint" style={{ marginLeft: 8, fontWeight: 400 }}>
                 勾选=安装，取消勾选=卸载；装完需重启该软件
               </span>
             </div>
             <div className="plg-list">
-              {plugBusy === 'scan' && <div className="hint">正在检测可安装的版本…</div>}
-              {plugBusy !== 'scan' && plugTargets.length === 0 && (
-                <div className="hint">没有检测到这个软件的可用版本（先启动一次该软件，让它生成用户配置目录）</div>
+              {plugBusy === 'scan' && <div className="hint">正在检测可安装的{plugFilter === 'ue' ? '工程' : '版本'}…</div>}
+              {plugBusy !== 'scan' && plugTargets.filter((t: any) => t.dcc === plugFilter).length === 0 && (
+                <div className="hint">
+                  {plugFilter === 'ue'
+                    ? '没找到 UE 工程（先在 UE 里打开一次工程，或点下面的「＋ 手动选择 .uproject…」）'
+                    : '没有检测到这个软件的可用版本（先启动一次该软件，让它生成用户配置目录）'}
+                </div>
               )}
               {[plugFilter].filter(Boolean).map(dcc => {
                 const rows = plugTargets.filter((t: any) => t.dcc === dcc);
                 if (!rows.length) return null;
-                const title = ({ max: '3ds Max', blender: 'Blender', su: 'SketchUp', maya: 'Maya' } as any)[dcc as string];
+                const title = ({ max: '3ds Max', blender: 'Blender', su: 'SketchUp', maya: 'Maya', ue: 'Unreal Engine' } as any)[dcc as string];
                 return (
                   <div className="plg-grp" key={dcc}>
-                    <div className="plg-grp-t">{title}（{rows.length} 个版本）</div>
+                    <div className="plg-grp-t">{title}（{rows.length} 个{String(dcc) === 'ue' ? '工程' : '版本'}）</div>
                     {rows.map((t: any) => (
-                      <label className={'plg-row' + (t.installed ? ' on' : '')} key={t.key}>
+                      <label className={'plg-row' + (t.installed ? ' on' : '')} key={t.key} title={t.dir}>
                         <input type="checkbox" checked={!!t.installed}
-                          disabled={plugBusy === t.key || (!t.series && t.dcc === 'max')}
+                          disabled={plugBusy === t.key || (!t.series && (t.dcc === 'max' || t.dcc === 'ue'))}
                           onChange={() => toggleTarget(t)} />
                         <span className="plg-name">{t.label}</span>
                         <span className="plg-meta">
-                          {t.dcc === 'max'
+                          {t.dcc === 'max' || t.dcc === 'ue'
                             ? (t.series ? `将安装：系列 ${t.series} · v${t.pluginVersion}` : '没有适用于该版本的插件系列')
                             : (t.series ? `系列 ${t.series}` : '无可用系列')}
-                          {t.dcc !== 'max' && t.pluginVersion ? ` · v${t.pluginVersion}` : ''}
-                          {t.installed ? (t.upToDate ? ' · 已安装' : ' · 需更新') : (t.dcc === 'max' && !t.series ? '' : ' · 未安装')}
+                          {t.dcc !== 'max' && t.dcc !== 'ue' && t.pluginVersion ? ` · v${t.pluginVersion}` : ''}
+                          {t.installed ? (t.upToDate ? ' · 已安装' : ' · 需更新') : ((t.dcc === 'max' || t.dcc === 'ue') && !t.series ? '' : ' · 未安装')}
                         </span>
                       </label>
                     ))}
+                    {String(dcc) === 'ue' && (
+                      <div className="uvrow" style={{ marginTop: 6 }}>
+                        <button className="btn" disabled={plugBusy === 'scan'} onClick={addUeProjectTargets}>
+                          ＋ 手动选择 .uproject…
+                        </button>
+                        <span className="hint">装进 工程\Plugins\AssetManagerBridge，并在 .uproject 里启用它和 PythonScriptPlugin</span>
+                      </div>
+                    )}
                   </div>
                 );
               })}
-              <div className="hint" style={{ marginTop: 8 }}>
-                UE 插件按工程安装，用插件面板里的「安装/更新插件到 UE 工程…」勾选工程。
-                {plugMaxFile ? ` 3ds Max 插件文件名：${plugMaxFile}` : ''}
-              </div>
             </div>
             <div className="modal-b">
               <button className="btn" onClick={() => setPlugPick(false)}>关闭</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {uePick && (
-        <div className="modal-mask" onMouseDown={() => setUePick(null)}>
-          <div className="modal wide" onMouseDown={e => e.stopPropagation()}>
-            <div className="modal-t">安装 UE 插件 · 选择工程</div>
-            <div className="hint">
-              只会装到你勾选的工程：写进 <b>工程\Plugins\AssetManagerBridge</b>，并在 <b>.uproject</b> 里启用它和
-              PythonScriptPlugin；<b>重启 UE 编辑器生效</b>。没装插件的工程不会被改动。
-            </div>
-            <div className="issues">
-              {uePick.items.length === 0 && (
-                <div className="hint" style={{ padding: 8 }}>
-                  没读到最近打开的 UE 工程（先在 UE 里打开一次工程，或用下面的「手动选择 .uproject…」）。
-                </div>
-              )}
-              {uePick.items.map(it => {
-                const on = uePick.sel.includes(it.file);
-                return (
-                  <label className="issue" key={it.file} style={{ cursor: 'pointer' }}
-                    title={it.file}>
-                    <input type="checkbox" checked={on} onChange={() => setUePick(cur => {
-                      if (!cur) return cur;
-                      const s = new Set(cur.sel);
-                      if (s.has(it.file)) s.delete(it.file); else s.add(it.file);
-                      return { ...cur, sel: [...s] };
-                    })} />
-                    <span className="iname">{it.name}</span>
-                    <span className="idetail">UE {it.engine || '?'}</span>
-                    <span className={it.installed ? 'plug-on' : 'plug-off'}>
-                      {it.installed ? (it.upToDate ? '已装·最新' : `已装 v${it.version || '?'}·待更新`) : '未安装'}
-                    </span>
-                  </label>
-                );
-              })}
-            </div>
-            <div className="uvrow">
-              <button className="btn" onClick={() => setUePick(cur => cur && ({ ...cur, sel: cur.items.map(i => i.file) }))}>
-                全选
-              </button>
-              <button className="btn" onClick={() => setUePick(cur => cur && ({ ...cur, sel: [] }))}>全不选</button>
-              <button className="btn" onClick={addUeProjectsManually}>＋ 手动选择 .uproject…</button>
-            </div>
-            <div className="modal-b">
-              <button className="btn" onClick={() => setUePick(null)}>取消</button>
-              <button className="btn primary" disabled={bridgeBusy || !uePick.sel.length} onClick={installUeSelected}>
-                安装到选中的 {uePick.sel.length} 个工程
-              </button>
             </div>
           </div>
         </div>

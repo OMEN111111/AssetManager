@@ -63,3 +63,7 @@ devtest/disp/*.js
 devtest/disp/out-*.png
 
 devtest/disp/*.css
+
+# 3ds Max 测试：临时服务数据 + 测试产物（插件本身在 app/bridge/max/）
+devtest/max/.data/
+devtest/max/work/

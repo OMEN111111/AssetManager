@@ -1,5 +1,21 @@
 # 3ds Max 插件 · 变更记录
 
+## 系列扩展：2023 / 2024 / 2025（2026-10-27 · 插件版本仍 0.2.1）
+
+- `bridge/max/` 新增 `2023/`、`2024/`、`2025/` 三个系列，内容与 `2026/`、`2027/` 完全一致
+  （`node tools/sync-max-bridge.mjs --check` 通过），插件版本继续沿用 **0.2.1**（不另立版本号）。
+- **实测**（`devtest\max\run-test.ps1`，各 30 项断言全绿）：3ds Max **2024 / 2025 / 2026 / 2027**。
+  测试项在原 17 项之上新增「真实材质构建」13 项：生成 PNG → `amb_build_material`
+  建 PhysicalMaterial，逐个核对 `base_color_map` / `roughness_map` / `metalness_map` /
+  `bump_map`(Normal_Bump) / `displacement_map` / `transparency_map` 六个通道是否接上、
+  UV 平铺是否写进 bitmap 的 `coords`、单通道取色 `monoOutput` 是否正确。
+- 3ds Max **2023**：`3dsmaxbatch` 侧因本机许可未检出（`ADLSKDK_STATUS_LICENSE_NOT_CHECKED_OUT`，需要交互登录）
+  没能跑那 30 项；改为在**真机 GUI 2023** 里验证——插件已从 `scripts\startup` 正常加载、
+  心跳上报 **version 2023**（20 次采样里 2023 与 2026 各 10 次，说明 2023 实例在线），
+  插件代码与 2024 系列逐字节相同。
+- `tools/test_max.ms`：新增 13 项材质断言（共 30 项）；版本年份下限从 2024 放宽到 2023。
+- 新增 `devtest\max\run-test.ps1`（一键：临时服务 8790 + 装进各 Max 的 startup + `3dsmaxbatch` 跑测试）。
+
 ## 0.2.1（2026-10-27）
 
 - `macroScript AssetManagerToolbar` 宏体加保护：插件未安装/已卸载时只打印提示，不再抛

@@ -37,7 +37,7 @@
     local loaded = (AMB_SCRIPT_VERSION != undefined)
     ambt_ok "插件已加载（AMB_SCRIPT_VERSION）" loaded
     if not loaded do (
-      ambt_log "      提示：先把 2026/ 或 2027/AssetManagerBridge.ms 放进 startup 目录，或先 fileIn 它"
+      ambt_log "      提示：先把对应年份的 bridge/max/<年份>/AssetManagerBridge_*.ms 放进 Max 的 startup 目录（软件「安装到 3ds Max」会做）"
       return false
     )
     ambt_info "AMB_SCRIPT_VERSION" AMB_SCRIPT_VERSION
@@ -45,7 +45,7 @@
 
     -- 1) Max 版本识别
     local mv = amb_max_version()          -- #(年份, build)
-    ambt_ok "amb_max_version 返回年份" ((mv.count >= 2) and ((mv[1] as integer) >= 2024))
+    ambt_ok "amb_max_version 返回年份" ((mv.count >= 2) and ((mv[1] as integer) >= 2023))
     ambt_info "amb_max_version" mv
 
     -- 2) 关键函数都在
@@ -80,6 +80,51 @@
     local mt = amb_maps_target tmp                 -- 有 maps 时用它
     ambt_ok "amb_maps_target 有 maps 时用它" ((findString (toLower (mt as string)) "maps") != undefined)
     ambt_ok "amb_sanitize_name 非法字符换下划线" ((amb_sanitize_name "a:b?c*d") == "a_b_c_d")
+
+    -- 5b) 真实材质构建：PhysicalMaterial + 各通道贴图 + UV 平铺 + 单通道输出
+    --     （移植到新版本时这块最能暴露版本差异）
+    local tex = tmp + "\\amb_tex.png"
+    local texOk = false
+    try (
+      local bmm = bitmap 32 32 color:red
+      bmm.filename = tex
+      save bmm
+      close bmm
+      texOk = doesFileExist tex
+    ) catch ( texOk = false )
+    ambt_ok "生成测试贴图 png" texOk
+    if texOk do (
+      local tp = "\"" + (amb_esc tex) + "\""
+      local specTxt = "{\"name\":\"AMB_TEST_MAT\",\"uv\":{\"repeatU\":2,\"repeatV\":3},\"maps\":{" \
+        + "\"baseColor\":{\"path\":" + tp + ",\"channel\":\"rgb\"}," \
+        + "\"roughness\":{\"path\":" + tp + ",\"channel\":\"r\"}," \
+        + "\"metallic\":{\"path\":" + tp + ",\"channel\":\"g\"}," \
+        + "\"normal\":{\"path\":" + tp + ",\"channel\":\"rgb\",\"normalSpace\":\"dx\"}," \
+        + "\"height\":{\"path\":" + tp + ",\"channel\":\"b\"}," \
+        + "\"opacity\":{\"path\":" + tp + ",\"channel\":\"a\"}" \
+        + "}}"
+      local sp = amb_parse specTxt
+      ambt_ok "材质 spec 能解析" (sp != undefined)
+      local built = undefined
+      try ( built = amb_build_material sp ) catch ( ambt_log ("      构建异常：" + (getCurrentException() as string)) )
+      ambt_ok "amb_build_material 有返回" (built != undefined and (built.count >= 3))
+      if built != undefined do (
+        local m = built[1]
+        ambt_info "贴图接入数" built[2]
+        if built[3].count > 0 do ambt_info "未用通道" built[3]
+        ambt_ok "材质母版是 PhysicalMaterial" ((classof m) == PhysicalMaterial)
+        ambt_ok ("贴图接入 6 个通道（实际 " + (built[2] as string) + "）") (built[2] >= 6)
+        ambt_ok "base_color_map 已接" ((try (m.base_color_map != undefined) catch false))
+        ambt_ok "roughness_map 已接" ((try (m.roughness_map != undefined) catch false))
+        ambt_ok "metalness_map 已接" ((try (m.metalness_map != undefined) catch false))
+        ambt_ok "bump_map 是 Normal_Bump" ((try ((classof m.bump_map) == Normal_Bump) catch false))
+        ambt_ok "displacement_map 已接" ((try (m.displacement_map != undefined) catch false))
+        ambt_ok "transparency_map 已接" ((try (m.transparency_map != undefined) catch false))
+        ambt_ok "UV 平铺写进 coords" ((try ((m.base_color_map.coords.U_Tiling == 2) and (m.base_color_map.coords.V_Tiling == 3)) catch false))
+        ambt_ok "单通道输出 r → monoOutput=2" ((try (m.roughness_map.monoOutput == 2) catch false))
+        try ( m = undefined ) catch ()
+      )
+    )
 
     -- 6) 网络：有本地服务时验证心跳
     local testUrl = ""

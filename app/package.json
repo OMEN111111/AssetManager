@@ -1,7 +1,7 @@
 {
   "name": "assetmanager-app",
   "private": true,
-  "version": "0.5.3",
+  "version": "0.5.5",
   "type": "module",
   "scripts": {
     "dev:api": "tsx src/server/index.ts",

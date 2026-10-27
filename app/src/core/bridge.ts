@@ -1081,8 +1081,7 @@ function uePluginVersionOf(file: string): string {
 /**
  * 在 .uproject 里启用插件（保留原有缩进与顺序，只在缺失时追加）。
  * 需要 PythonScriptPlugin 才会执行插件的 init_unreal.py。
- */
-export function enableUePlugins(projectFile: string, names: string[]): { ok: boolean; added: string[]; error?: string } {
+ */export function enableUePlugins(projectFile: string, names: string[]): { ok: boolean; added: string[]; error?: string } {
   let raw = '';
   try { raw = fs.readFileSync(projectFile, 'utf8'); } catch (e: any) {
     return { ok: false, added: [], error: String(e?.message || e) };
@@ -1111,6 +1110,64 @@ export function enableUePlugins(projectFile: string, names: string[]): { ok: boo
     return { ok: false, added: [], error: String(e?.message || e) };
   }
   return { ok: true, added };
+}
+
+/**
+ * 从 .uproject 里移除插件条目（卸载用；只动传进来的名字，别的插件一行不改）
+ */
+export function disableUePlugins(projectFile: string, names: string[]): { ok: boolean; removed: string[]; error?: string } {
+  let raw = '';
+  try { raw = fs.readFileSync(projectFile, 'utf8'); } catch (e: any) {
+    return { ok: false, removed: [], error: String(e?.message || e) };
+  }
+  let j: any;
+  try { j = JSON.parse(raw); } catch (e: any) {
+    return { ok: false, removed: [], error: '解析 .uproject 失败：' + String(e?.message || e) };
+  }
+  const list: any[] = Array.isArray(j.Plugins) ? j.Plugins : [];
+  const lower = names.map(n => n.toLowerCase());
+  const kept: any[] = [];
+  const removed: string[] = [];
+  for (const p of list) {
+    const nm = String(p?.Name || '');
+    if (lower.includes(nm.toLowerCase())) { removed.push(nm); continue; }
+    kept.push(p);
+  }
+  if (!removed.length) return { ok: true, removed };
+  j.Plugins = kept;
+  try {
+    fs.writeFileSync(projectFile, JSON.stringify(j, null, '\t') + '\n', 'utf8');
+  } catch (e: any) {
+    return { ok: false, removed: [], error: String(e?.message || e) };
+  }
+  return { ok: true, removed };
+}
+
+/** 手动挑过的 UE 工程（不在「最近打开」列表里的也能一直勾选/卸载）：存数据目录 ue-projects.json */
+function ueExtraFile(dataDir: string) { return path.join(dataDir, 'ue-projects.json'); }
+
+export function ueExtraProjects(dataDir: string): string[] {
+  if (!dataDir) return [];
+  try {
+    const arr = JSON.parse(fs.readFileSync(ueExtraFile(dataDir), 'utf8'));
+    return Array.isArray(arr) ? arr.map(String).filter(f => fs.existsSync(f)) : [];
+  } catch { return []; }
+}
+
+/** 记住手动选的工程（返回去重后的完整列表） */
+export function addUeExtraProjects(dataDir: string, files: string[]): string[] {
+  if (!dataDir) return [];
+  const next = ueExtraProjects(dataDir);
+  for (const f of files || []) {
+    const p = ueProjectFromFile(f);
+    if (!p) continue;
+    if (!next.some(x => x.toLowerCase() === p.file.toLowerCase())) next.push(p.file);
+  }
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(ueExtraFile(dataDir), JSON.stringify(next, null, 2), 'utf8');
+  } catch { /* ignore */ }
+  return next;
 }
 
 /**
@@ -1397,14 +1454,14 @@ export function writeLocator(port: number, appRoot: string, version: string) {
 // 「安装插件」弹窗用：列出本机每个 DCC 的每个版本，勾选=安装、取消=卸载。
 // UE 是「按工程」安装的，不走这套（面板里单独有工程选择框）。
 
-export type PluginDcc = 'max' | 'blender' | 'su' | 'maya';
+export type PluginDcc = 'max' | 'blender' | 'su' | 'maya' | 'ue';
 
 export type PluginTarget = {
   dcc: PluginDcc;
-  key: string;          // dcc + 版本，前端勾选状态用
-  label: string;        // 3ds Max 2027（CHS）
+  key: string;          // dcc + 版本（UE 是工程路径），前端勾选状态用
+  label: string;        // 3ds Max 2027（CHS）／UE 工程名（UE 5.7）
   dir: string;          // 安装目录（给人看）
-  series: string;       // 用的插件系列（2027 / 5.2 / 2026 / 2025）
+  series: string;       // 用的插件系列（2027 / 5.2 / 2026 / 2025 / 5.7）
   pluginVersion: string;// 源码里的插件版本
   installed: boolean;
   upToDate: boolean;    // 已装且与源码一致
@@ -1414,8 +1471,8 @@ function readVer(file: string, re: RegExp): string {
   try { return (fs.readFileSync(file, 'utf8').match(re) || [])[1] || ''; } catch { return ''; }
 }
 
-/** 本机所有可安装的「DCC + 版本」目标 */
-export function pluginTargets(appRoot: string): PluginTarget[] {
+/** 本机所有可安装的「DCC + 版本」目标（UE 按工程算，一行一个工程） */
+export function pluginTargets(appRoot: string, dataDir = ''): PluginTarget[] {
   const out: PluginTarget[] = [];
 
   // --- 3ds Max ---
@@ -1511,12 +1568,51 @@ export function pluginTargets(appRoot: string): PluginTarget[] {
     });
   }
 
+  // --- Unreal Engine（按工程：一行一个工程，勾选=装进该工程、取消=从该工程移除） ---
+  const ueSeriesAll = ueSeries(appRoot);
+  const ueSeen = new Set<string>();
+  const ueProjList: UeProject[] = [];
+  for (const p of ueProjects()) { ueProjList.push(p); ueSeen.add(p.file.toLowerCase()); }
+  for (const f of ueExtraProjects(dataDir)) {
+    if (ueSeen.has(f.toLowerCase())) continue;
+    const p = ueProjectFromFile(f);
+    if (p) { ueProjList.push(p); ueSeen.add(p.file.toLowerCase()); }
+  }
+  for (const p of ueProjList) {
+    const fallback = ueSeriesAll[ueSeriesAll.length - 1] || '';
+    const pick = pickUeSeries(ueSeriesAll, p.engine || fallback) || '';
+    const srcDir = pick ? path.join(appRoot, 'bridge', 'ue', pick, UE_PLUGIN_DIR) : '';
+    const dstDir = path.join(p.pluginsDir, UE_PLUGIN_DIR);
+    const uplugin = UE_PLUGIN_DIR + '.uplugin';
+    const has = fs.existsSync(path.join(dstDir, uplugin));
+    let same = false;
+    try {
+      same = has && !!srcDir
+        && fs.readFileSync(path.join(srcDir, 'Content', 'Python', 'assetmanager_ue.py'), 'utf8')
+           === fs.readFileSync(path.join(dstDir, 'Content', 'Python', 'assetmanager_ue.py'), 'utf8')
+        && fs.readFileSync(path.join(srcDir, uplugin), 'utf8')
+           === fs.readFileSync(path.join(dstDir, uplugin), 'utf8');
+    } catch { /* 读不到就当不是最新 */ }
+    out.push({
+      dcc: 'ue',
+      key: `ue:${p.file}`,
+      label: `${p.name}（${p.engine ? 'UE ' + p.engine : 'UE 版本未知'}）`,
+      dir: dstDir,
+      series: pick,
+      pluginVersion: uePluginVersionOf(has ? path.join(dstDir, uplugin) : (srcDir ? path.join(srcDir, uplugin) : '')),
+      installed: has,
+      upToDate: same
+    });
+  }
+
   return out.sort((a, b) => (a.dcc === b.dcc ? a.label.localeCompare(b.label) : a.dcc.localeCompare(b.dcc)));
 }
 
 /** 安装 / 卸载某个具体目标（key 来自 pluginTargets） */
-export function applyPluginTarget(appRoot: string, key: string, install: boolean): { ok: boolean; error?: string; file?: string } {
-  const t = pluginTargets(appRoot).find(x => x.key === key);
+export function applyPluginTarget(
+  appRoot: string, key: string, install: boolean, dataDir = ''
+): { ok: boolean; error?: string; file?: string; note?: string } {
+  const t = pluginTargets(appRoot, dataDir).find(x => x.key === key);
   if (!t) return { ok: false, error: '目标不存在（可能已卸载 DCC 或重启过）' };
 
   try {
@@ -1581,6 +1677,33 @@ export function applyPluginTarget(appRoot: string, key: string, install: boolean
       try { if (fs.existsSync(dstLoader)) { fs.unlinkSync(dstLoader); removed++; } } catch { /* ignore */ }
       try { if (fs.existsSync(dstDir)) { fs.rmSync(dstDir, { recursive: true, force: true }); removed++; } } catch { /* ignore */ }
       return removed ? { ok: true } : { ok: false, error: '没有安装记录' };
+    }
+
+    if (t.dcc === 'ue') {
+      // key = `ue:<.uproject 绝对路径>`
+      const p = ueProjectFromFile(t.key.slice(3));
+      if (!p) return { ok: false, error: '这个工程文件已不存在（被移动或删除了？）' };
+      const dst = path.join(p.pluginsDir, UE_PLUGIN_DIR);
+      const uplugin = UE_PLUGIN_DIR + '.uplugin';
+      if (install) {
+        if (!t.series) return { ok: false, error: `没有适用于 UE ${p.engine || '(未知版本)'} 的插件系列` };
+        const src = path.join(appRoot, 'bridge', 'ue', t.series, UE_PLUGIN_DIR);
+        if (!fs.existsSync(src)) return { ok: false, error: `缺少 bridge/ue/${t.series}/${UE_PLUGIN_DIR}` };
+        fs.rmSync(dst, { recursive: true, force: true });
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        copyTreeSafe(src, dst);
+        if (!fs.existsSync(path.join(dst, uplugin))) {
+          return { ok: false, error: '插件文件没拷出来（安装包里的 bridge/ue 不完整）' };
+        }
+        const en = enableUePlugins(p.file, [UE_PLUGIN_DIR, 'PythonScriptPlugin', 'EditorScriptingUtilities']);
+        if (!en.ok) return { ok: false, error: en.error || '启用插件失败' };
+        return { ok: true, file: path.join(dst, uplugin) };
+      }
+      let removed = 0;
+      try { if (fs.existsSync(dst)) { fs.rmSync(dst, { recursive: true, force: true }); removed++; } } catch { /* ignore */ }
+      const dis = disableUePlugins(p.file, [UE_PLUGIN_DIR]);
+      if (removed || dis.removed.length) return { ok: true };
+      return { ok: false, error: '这个工程里没有装插件' };
     }
 
     // maya

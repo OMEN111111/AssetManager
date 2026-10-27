@@ -6,14 +6,17 @@ AssetManager 里的模型 / 材质 / 贴图可以一键送进 3ds Max；改好�
 
 ```
 bridge/max/
+  2023/AssetManagerBridge_0.2.1.ms    3ds Max 2023
+  2024/AssetManagerBridge_0.2.1.ms    3ds Max 2024
+  2025/AssetManagerBridge_0.2.1.ms    3ds Max 2025
   2026/AssetManagerBridge_0.2.1.ms    3ds Max 2026
   2027/AssetManagerBridge_0.2.1.ms    3ds Max 2027（canonical）
-  tools/test_max.ms             集成测试（3dsmaxbatch 里跑，17 项断言）
+  tools/test_max.ms             集成测试（3dsmaxbatch 里跑，30 项断言）
   tools/probe_env.ms            环境探针（只读，排查用）
   tools/sync-max-bridge.mjs     系列同步（以 2027/ 为真源；--check 提交前跑）
 ```
 
-各系列**目前内容完全一致**（同一份 MAXScript，2026 与 2027 实测都通过）。文件名带插件版本。
+各系列**目前内容完全一致**（同一份 MAXScript，2023 / 2024 / 2025 / 2026 / 2027 实测都通过）。文件名带插件版本。
 以后 Max 新版若 MAXScript 有变化，只改最新系列，其它用 `node tools/sync-max-bridge.mjs` 同步；
 某系列真要分叉就在文件头部写 `-- SYNC: skip`。
 
@@ -23,14 +26,17 @@ bridge/max/
 它会扫本机所有已存在的 Max 用户配置，**按各自的 Max 版本挑对应系列**写入：
 
 ```
-%LOCALAPPDATA%\Autodesk\3dsMax\2027 - 64bit\CHS\scripts\startup\AssetManagerBridge.ms   <- 2027/
-%LOCALAPPDATA%\Autodesk\3dsMax\2026 - 64bit\CHS\scripts\startup\AssetManagerBridge.ms   <- 2026/
+%LOCALAPPDATA%\Autodesk\3dsMax\2027 - 64bit\CHS\scripts\startup\AssetManagerBridge_0.2.1.ms   <- 2027/
+%LOCALAPPDATA%\Autodesk\3dsMax\2026 - 64bit\CHS\scripts\startup\AssetManagerBridge_0.2.1.ms   <- 2026/
+%LOCALAPPDATA%\Autodesk\3dsMax\2025 - 64bit\CHS\scripts\startup\AssetManagerBridge_0.2.1.ms   <- 2025/
+%LOCALAPPDATA%\Autodesk\3dsMax\2024 - 64bit\CHS\scripts\startup\AssetManagerBridge_0.2.1.ms   <- 2024/
+%LOCALAPPDATA%\Autodesk\3dsMax\2023 - 64bit\CHS\scripts\startup\AssetManagerBridge_0.2.1.ms   <- 2023/
 ```
 
 装完**重启 3ds Max**。插件随 Max 启动自动轮询，5 秒内 AssetManager 面板显示「已连接」。
 
-**手动**：把对应版本的 `AssetManagerBridge.ms` 复制到上面的 startup 目录；或在 Max 里
-`fileIn @"...\2027\AssetManagerBridge.ms"`。
+**手动**：把对应版本的 `AssetManagerBridge_0.2.1.ms` 复制到上面的 startup 目录；或在 Max 里
+`fileIn @"...\2027\AssetManagerBridge_0.2.1.ms"`。
 
 ## 测试（改完插件必跑）
 
@@ -39,20 +45,40 @@ bridge/max/
 cd app\bridge\max
 node tools/sync-max-bridge.mjs --check
 
-# 2) 真机集成测试（17 项断言：加载 / 版本识别 / 关键函数 / JSON / UUID 往返 / 贴图目录 /
-#    命名清理 / HTTP 心跳 + 队列接口）；先把对应系列的 .ms 放进 startup，然后：
+# 2) 一键真机集成测试（推荐）：起临时服务 + 按年份把插件装进各 Max 的 startup + 3dsmaxbatch 跑断言
+cd D:\Program\AssetManager
+pwsh -File devtest\max\run-test.ps1 -Series all          # 2023/2024/2025/2026/2027 全跑
+pwsh -File devtest\max\run-test.ps1 -Series 2024         # 只跑一个版本
+# 明细：devtest\max\work\test_max_<年份>.txt
+
+# 3) 手工跑（服务已起、插件已装进 startup 时）
 $env:AMB_TEST_URL = "http://127.0.0.1:8790"      # 可选：临时服务地址，验证 HTTP
 & "D:\Software\01_DCC\01_Autodesk\3ds Max 2027\3dsmaxbatch.exe" `
    "D:\Program\AssetManager\app\bridge\max\tools\test_max.ms"
 # 结果：%TEMP%\AssetManager\max_test.txt
 
-# 3) 环境探针（版本 / 端口 / startup 是否装了插件）
+# 4) 环境探针（版本 / 端口 / startup 是否装了插件）
 & "D:\Software\01_DCC\01_Autodesk\3ds Max 2027\3dsmaxbatch.exe" `
    "D:\Program\AssetManager\app\bridge\max\tools\probe_env.ms"
 ```
 
-> 2026 与 2027 各跑一遍（把 `3ds Max 2027` 换成 `3ds Max 2026`）。
-> 实测结论：**2026 / 2027 各 17 项断言全绿**（2026-10-27）。
+> **坑**：`3dsmaxbatch` 里 `fileIn` 插件后**不会留下脚本里的 global**（2024+ 实测；只 `fileIn` 不行），
+> 必须把 `.ms` 放进该 Max 的 `scripts\startup` 让 Max 启动时自己加载 —— `devtest\max\run-test.ps1` 会自动做这一步。
+> 实测结论：**2024 / 2025 / 2026 / 2027 各 30 项断言全绿**（2026-10-27）；
+> 2023 因本机许可未检出（`ADLSKDK_STATUS_LICENSE_NOT_CHECKED_OUT`）batch 跑不了，
+> 改在**真机 GUI 2023** 验证：插件从 startup 正常加载、心跳上报 version 2023；
+> 代码与 2024 系列逐字节相同。
+
+## 真机联调（GUI 里跑真实任务）
+
+`3dsmaxbatch` 拿不到许可、或想验证「真实 GUI 会话」时用这条（临时服务 + 临时素材库 + 发一条真实材质任务）：
+
+```powershell
+pwsh -File devtest\max\live-test.ps1          # 需要独占 8787（先关掉正在运行的 AssetManager）
+```
+
+它要求目标 Max 已打开、插件在 `scripts\startup`；脚本会等插件心跳上来、发 `material` 任务、核对回报结果，
+跑完还原 `%LOCALAPPDATA%\AssetManager\bridge.json`。
 
 ## 工具栏
 

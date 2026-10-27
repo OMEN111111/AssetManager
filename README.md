@@ -47,7 +47,7 @@
 
 | 目标 | 插件 | 能做的事 |
 | --- | --- | --- |
-| 3ds Max | `bridge/max/<Max 版本>/AssetManagerBridge_<插件版本>.ms`（MaxScript 0.2.1，2026 / 2027 实测） | 拖放导入放置、打包选中、材质重建、HDRI（环境贴图 / 视口背景）、**导回源目录（按 UUID 覆盖模型+贴图）** |
+| 3ds Max | `bridge/max/<Max 版本>/AssetManagerBridge_<插件版本>.ms`（MaxScript 0.2.1，2023 / 2024 / 2025 / 2026 / 2027 系列，2024–2027 实测） | 拖放导入放置、打包选中、材质重建、HDRI（环境贴图 / 视口背景）、**导回源目录（按 UUID 覆盖模型+贴图）** |
 | Blender | `bridge/blender/<版本>/`（Python 0.1.5，5.2 / 4.0 / 3.6） | 模型导入、PBR 材质重建、贴图、HDRI 世界环境 |
 | SketchUp | `bridge/su/2026/`（Ruby 0.1.2） | 模型导入（FBX/OBJ/PLY 自动转 GLB）、原生 PBR 材质、贴图、HDRI 环境 |
 | Unreal Engine | `bridge/ue/<引擎版本>/`（Python 编辑器插件 0.1.7，5.6 / 5.7 / 5.8） | 模型导入（静态 / 骨骼 / 物理资产）、PBR 材质（可指定父材质建实例）、贴图、HDRI 天空球 + SkyLight、**IES 灯光** |
