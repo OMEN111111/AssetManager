@@ -728,3 +728,17 @@ input,textarea,select,pre,code,.path,.dpath,.dvalue,.selectable{user-select:text
 .hdri-row img{width:26px;height:26px;object-fit:cover;border-radius:4px;background:#0b0c0e;flex:none}
 .hdri-row em{font-style:normal;font-size:10.5px;color:#b9c0cb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hdri-none.sm{width:26px;height:26px;flex:none;display:grid;place-items:center;background:#15181d;border-radius:4px;color:#6b7280;font-size:9px}
+
+/* 0.5.2：插件按版本安装/卸载（plg- 前缀，避免与已有 .plug-* 功能开关样式冲突） */
+.plg-box{margin:8px 0 4px;padding:10px;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,.02);max-height:34vh;overflow:auto}
+.plg-h{font-size:12px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;flex-wrap:wrap;gap:4px}
+.plg-grp{margin-bottom:8px}
+.plg-grp-t{font-size:11px;color:#7b828f;margin:6px 0 4px}
+.plg-row{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;cursor:pointer;font-size:12px}
+.plg-row:hover{background:rgba(255,255,255,.05)}
+.plg-row.on{background:rgba(77,135,199,.14)}
+.plg-name{min-width:150px}
+.plg-meta{color:#7b828f;font-size:11px}
+
+/* 0.5.2 修复：安装/卸载插件独立弹窗的列表区 */
+.plg-list{max-height:52vh;overflow:auto;padding:4px 2px;display:flex;flex-direction:column;gap:2px}

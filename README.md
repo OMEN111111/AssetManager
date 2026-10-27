@@ -47,7 +47,7 @@
 
 | 目标 | 插件 | 能做的事 |
 | --- | --- | --- |
-| 3ds Max | `bridge/max/`（MaxScript 0.2.0） | 拖放导入放置、打包选中、材质重建、HDRI（环境贴图 / 视口背景）、**导回源目录（按 UUID 覆盖模型+贴图）** |
+| 3ds Max | `bridge/max/<Max 版本>/AssetManagerBridge_<插件版本>.ms`（MaxScript 0.2.1，2026 / 2027 实测） | 拖放导入放置、打包选中、材质重建、HDRI（环境贴图 / 视口背景）、**导回源目录（按 UUID 覆盖模型+贴图）** |
 | Blender | `bridge/blender/<版本>/`（Python 0.1.5，5.2 / 4.0 / 3.6） | 模型导入、PBR 材质重建、贴图、HDRI 世界环境 |
 | SketchUp | `bridge/su/2026/`（Ruby 0.1.2） | 模型导入（FBX/OBJ/PLY 自动转 GLB）、原生 PBR 材质、贴图、HDRI 环境 |
 | Unreal Engine | `bridge/ue/<引擎版本>/`（Python 编辑器插件 0.1.7，5.6 / 5.7 / 5.8） | 模型导入（静态 / 骨骼 / 物理资产）、PBR 材质（可指定父材质建实例）、贴图、HDRI 天空球 + SkyLight、**IES 灯光** |
@@ -99,7 +99,7 @@
 | `app/src/renderer/geometries.ts` | 程序化几何 + 自定义基本体 UV 重算 |
 | `app/src/renderer/thumbnailer.ts` | 缩略图离屏渲染（材质球 / 模型 / IES 洗墙场景） |
 | `app/src/renderer/glbconvert.ts` | FBX/OBJ/PLY → GLB（给 SketchUp 用） |
-| `app/bridge/max/` | 3ds Max 插件（MaxScript） |
+| `app/bridge/max/<版本>/` | 3ds Max 插件（MaxScript，按 3ds Max 版本分系列；`tools/` 有集成测试与系列同步） |
 | `app/bridge/blender/<系列>/` | Blender 插件（Python，3D 视图侧栏面板） |
 | `app/bridge/su/<系列>/` | SketchUp 插件（Ruby，扩展菜单 + HtmlDialog） |
 | `app/bridge/ue/<引擎版本>/AssetManagerBridge/` | UE Python 编辑器插件（工具 → AssetManager） |
@@ -113,7 +113,7 @@ app/               应用本体
   src/server/      本地 HTTP API + 静态服务
   src/core/        数据库、扫描器、桥接队列、MCP
   src/renderer/    React 界面（App / Viewer / Assembler / matlib / geometries / glbconvert）
-  bridge/          DCC 插件：max/（MaxScript）、blender/<版本>/、su/<版本>/、ue/<引擎版本>/、maya/<Maya 年份>/
+  bridge/          DCC 插件：max/<Max 版本>/（MaxScript）、blender/<版本>/、su/<版本>/、ue/<引擎版本>/、maya/<Maya 年份>/
   build/           构建产物与图标（server.mjs 由构建生成）
 prototype/         界面截图（README 配图）
 devtest/           开发期 CDP 验证脚本与测试页

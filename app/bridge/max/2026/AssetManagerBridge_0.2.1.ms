@@ -1,7 +1,7 @@
 /*
 ================================================================================
  AssetManager · 3ds Max 桥接插件
- 版本：0.1.7        协议：1        目标：3ds Max 2018+（2024/2025/2026 实测）
+ 版本：0.2.1        协议：1        目标：3ds Max 2018+（2026 / 2027 实测）
 --------------------------------------------------------------------------------
  作用：
    1. 常驻轮询器：从 AssetManager 本地服务取任务，导入模型 / 创建材质 / 发送贴图，
@@ -34,7 +34,7 @@
 */
 
 
-global AMB_SCRIPT_VERSION = "0.2.0"
+global AMB_SCRIPT_VERSION = "0.2.1"
 global AMB_PROTOCOL = 1
 global AMB_LOADED = undefined
 global AMB_PORT = 0
@@ -1821,7 +1821,16 @@ macroScript AssetManagerToolbar
   buttonText:"AssetManager"
   tooltip:"打开 AssetManager 桥接工具栏"
 (
-  on execute do (AssetManagerBridge_Toolbar())
+  -- 插件被卸载/未加载时这里会变成 undefined：只提示，不抛脚本错误。
+  -- （Max 会把这段宏持久化到 usermacros\AssetManager-AssetManagerToolbar.mcr，卸载后仍会被加载）
+  on execute do (
+    if (classOf AssetManagerBridge_Toolbar) == MAXScriptFunction then (
+      try ( AssetManagerBridge_Toolbar() )
+      catch ( format "[AssetManager] 工具栏打开失败: %\n" (getCurrentException()) )
+    ) else (
+      format "[AssetManager] 3ds Max 插件未安装或已卸载；请在 AssetManager 的「插件」面板里勾选安装后重启 Max。\n"
+    )
+  )
 )
 
 /** 在主菜单栏加一个 AssetManager 菜单（只加一次） */

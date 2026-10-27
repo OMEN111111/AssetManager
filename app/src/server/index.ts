@@ -10,7 +10,8 @@ import { scanLibrary, scanState } from '../core/scan.ts';
 import { MCP_TOOLS, callTool } from '../core/mcp.ts';
 import {
   bridgeStatus, sendJob, nextJob, finishJob, heartbeat, touchClient, recentJobs, jobById,
-  installForMax, installInfo, maxStartupDirs, bridgeScriptPath, writeLocator,
+  installForMax, installInfo, maxStartupDirs, bridgeScriptPath, maxSeries as maxPluginSeries, writeLocator,
+  pluginTargets, applyPluginTarget, maxPluginFileName,
   installForBlender, blenderSeries, blenderUserDirs,
   installForSu, suSeries as suPluginSeries, suUserDirs, suInstallInfo,
   installForUe, ueSeries as uePluginSeries, ueProjects, ueInstallInfo,
@@ -1083,8 +1084,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     }
   }
 
+  // 统一插件安装/卸载：列出本机每个 DCC 的每个版本（勾选=安装，取消=卸载）
+  if (p === '/api/bridge/plugin-targets') {
+    return json(res, 200, { targets: pluginTargets(APP_ROOT), maxFile: maxPluginFileName() });
+  }
+  if (p === '/api/bridge/plugin-target' && req.method === 'POST') {
+    const b = await body(req);
+    return json(res, 200, applyPluginTarget(APP_ROOT, String(b.key || ''), !!b.install));
+  }
+
   if (p === '/api/bridge/install' && req.method === 'POST') {
-    return json(res, 200, installForMax(APP_ROOT));
+    return json(res, 200, { ...installForMax(APP_ROOT), series: maxPluginSeries(APP_ROOT) });
   }
 
   // 一键把 Blender 插件装进本机所有 Blender 用户目录（按各版本挑对应系列）
@@ -1152,11 +1162,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     if (which === 'script') {
       dir = fs.existsSync(scriptPath) ? path.dirname(scriptPath) : '';
     } else if (which === 'copy') {
-      // 复制一份到数据目录，便于用户手动安装（asar 里的路径资源管理器打不开）
+      // Max 插件按 Max 版本分目录（2026/ 2027/ …）：整份复制，用户按自己的版本取文件
       const outDir = path.join(DATA_DIR, 'plugins', '3dsmax');
       try {
-        fs.mkdirSync(outDir, { recursive: true });
-        if (fs.existsSync(scriptPath)) fs.copyFileSync(scriptPath, path.join(outDir, 'AssetManagerBridge.ms'));
+        copyTree(path.join(APP_ROOT, 'bridge', 'max'), outDir, new Set(['tools']));
       } catch { /* ignore */ }
       dir = outDir;
     } else if (which === 'blender') {

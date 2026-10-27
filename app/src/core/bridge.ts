@@ -14,7 +14,7 @@ import type { DB } from './db.ts';
 /** 插件协议版本（服务端 + .ms 一起改） */
 export const BRIDGE_PROTOCOL = 1;
 /** 插件脚本版本（面板显示；与应用版本保持一致，第三位递增） */
-export const BRIDGE_SCRIPT_VERSION = '0.2.0';
+export const BRIDGE_SCRIPT_VERSION = '0.2.1';
 
 const LEASE_MS = 90_000;
 const CONNECTED_MS = 6000;
@@ -813,14 +813,88 @@ export function suInstallInfo(appRoot: string) {
 
 // ---------------------------------------------------------------- 3ds Max 安装
 
-const SCRIPT_NAME = 'AssetManagerBridge.ms';
+const SCRIPT_BASE = 'AssetManagerBridge';
 
-export function bridgeScriptPath(appRoot: string) {
-  return path.join(appRoot, 'bridge', 'max', SCRIPT_NAME);
+/** 安装到 Max 的文件名：AssetManagerBridge_0.2.0.ms（便于多个版本共存与识别） */
+export function maxPluginFileName(): string {
+  return `${SCRIPT_BASE}_${BRIDGE_SCRIPT_VERSION}.ms`;
 }
 
-export function readBridgeScript(appRoot: string): string | null {
-  try { return fs.readFileSync(bridgeScriptPath(appRoot), 'utf8'); } catch { return null; }
+/** 目录里已存在的本插件文件名（新版带版本号，旧版不带） */
+function maxInstalledFile(dir: string): string {
+  let ents: string[] = [];
+  try { ents = fs.readdirSync(dir); } catch { return ''; }
+  const re = new RegExp('^' + SCRIPT_BASE + '.*\\.ms$', 'i');
+  const hits = ents.filter(f => re.test(f));
+  if (!hits.length) return '';
+  const versioned = maxPluginFileName();
+  return hits.includes(versioned) ? versioned : hits.sort().reverse()[0];
+}
+
+/** 安装包里有哪些 3ds Max 系列目录（2026 / 2027 …，升序） */
+
+/** Max 会把脚本里的 macroScript 持久化到 <语言>\usermacros\<类别>-<宏名>.mcr，
+ *  插件删了这份文件还在，启动时会去调已不存在的函数 → 报「类型错误…undefined」。
+ *  安装/卸载都要清掉它（安装时清掉是为了让 Max 用新脚本重新生成）。 */
+function maxUsermacrosDir(startupDir: string): string {
+  // …\3dsMax\2027 - 64bit\CHS\scripts\startup → …\CHS\usermacros
+  const langDir = path.dirname(path.dirname(startupDir));
+  return path.join(langDir, 'usermacros');
+}
+
+function removeMaxMacroFiles(startupDir: string): string[] {
+  const out: string[] = [];
+  const dir = maxUsermacrosDir(startupDir);
+  let ents: string[] = [];
+  try { ents = fs.readdirSync(dir); } catch { return out; }
+  for (const f of ents) {
+    if (!/\.mcr$/i.test(f)) continue;
+    if (!/assetmanager/i.test(f)) continue;
+    try { fs.unlinkSync(path.join(dir, f)); out.push(path.join(dir, f)); } catch { /* ignore */ }
+  }
+  return out;
+}
+
+export function maxSeries(appRoot: string): string[] {
+  const dir = path.join(appRoot, 'bridge', 'max');
+  let ents: fs.Dirent[] = [];
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  return ents.filter(e => e.isDirectory() && /^\d{4}$/.test(e.name))
+    .map(e => e.name)
+    .sort((a, b) => Number(a) - Number(b));
+}
+
+/** 给某个 Max 版本挑系列：必须「同版本」或「不高于该版本的最新系列」；
+ *  比所有已有系列都老的目标（例如本机 2025 配置而只有 2026/2027 系列）返回 ''，
+ *  由上层提示「没有适用于该版本的插件」，避免把不匹配的脚本塞进去。 */
+export function pickMaxSeries(series: string[], maxYear: string): string | null {
+  if (!series.length || !maxYear) return null;
+  if (series.includes(maxYear)) return maxYear;
+  const le = series.filter(s => Number(s) <= Number(maxYear));
+  if (le.length) return le[le.length - 1];
+  return '';
+}
+
+/** 某个 Max 系列脚本的路径；不传系列时取最新系列（面板上「插件来源」显示用） */
+export function bridgeScriptPath(appRoot: string, series?: string) {
+  const all = maxSeries(appRoot);
+  const pick = series && all.includes(series) ? series : (all[all.length - 1] || '');
+  const base = pick ? path.join(appRoot, 'bridge', 'max', pick) : path.join(appRoot, 'bridge', 'max');
+  const versioned = path.join(base, maxPluginFileName());
+  if (fs.existsSync(versioned)) return versioned;
+  const legacy = path.join(base, `${SCRIPT_BASE}.ms`);   // 兼容旧布局 / 旧安装包
+  if (fs.existsSync(legacy)) return legacy;
+  return versioned;
+}
+
+export function readBridgeScript(appRoot: string, series?: string): string | null {
+  try { return fs.readFileSync(bridgeScriptPath(appRoot, series), 'utf8'); } catch { return null; }
+}
+
+/** 从 startup 路径里取 Max 年份（…\3dsMax\2027 - 64bit\CHS\scripts\startup → 2027） */
+export function maxYearOfStartupDir(dir: string): string {
+  const m = String(dir).match(/3dsMax[\\/](\d{4})/i);
+  return m ? m[1] : '';
 }
 
 /** 已存在的 3ds Max 用户配置目录下的 startup 目录 */
@@ -846,43 +920,63 @@ export function maxStartupDirs(): string[] {
   return out;
 }
 
+/** 一键装进本机所有 3ds Max 用户目录（按各自的 Max 版本挑对应系列） */
 export function installForMax(appRoot: string) {
-  const src = readBridgeScript(appRoot);
-  if (!src) return { ok: false, error: '找不到 bridge/max/AssetManagerBridge.ms（安装包缺少 bridge 目录）' };
+  const series = maxSeries(appRoot);
+  if (!series.length) return { ok: false, error: '找不到 bridge/max/<Max 版本>/AssetManagerBridge_<插件版本>.ms（安装包缺少 bridge 目录）' };
   const dirs = maxStartupDirs();
   if (!dirs.length) return { ok: false, error: '没有找到 3ds Max 的用户配置目录（%LOCALAPPDATA%\\Autodesk\\3dsMax），请先启动一次 3ds Max' };
   const installed: string[] = [];
+  const detail: { dir: string; year: string; series: string }[] = [];
   const failed: { dir: string; error: string }[] = [];
   for (const d of dirs) {
+    const year = maxYearOfStartupDir(d);
+    const pick = pickMaxSeries(series, year);
+    if (!pick) { failed.push({ dir: d, error: `没有适用于 3ds Max ${year} 的插件系列（本机只有 ${series.join(' / ')}）` }); continue; }
+    const src = readBridgeScript(appRoot, pick);
+    if (!src) { failed.push({ dir: d, error: `读不到 bridge/max/${pick}/${maxPluginFileName()}` }); continue; }
     try {
       fs.mkdirSync(d, { recursive: true });
-      const dst = path.join(d, SCRIPT_NAME);
+      // 清掉该目录里其它版本的插件文件，避免 Max 同时加载两份
+      const dst = path.join(d, maxPluginFileName());
+      try {
+        for (const f of fs.readdirSync(d)) {
+          if (/^AssetManagerBridge.*\.ms$/i.test(f) && f !== path.basename(dst)) fs.unlinkSync(path.join(d, f));
+        }
+      } catch { /* ignore */ }
       fs.writeFileSync(dst, src, 'utf8');
+      removeMaxMacroFiles(d);           // 让 Max 下次启动用新脚本重新注册宏（旧宏体可能引用已改名的函数）
       installed.push(dst);
+      detail.push({ dir: d, year, series: pick });
     } catch (e: any) {
       failed.push({ dir: d, error: String(e?.message || e) });
     }
   }
-  return { ok: installed.length > 0, installed, failed, dirs, version: BRIDGE_SCRIPT_VERSION };
+  return { ok: installed.length > 0, installed, detail, failed, dirs, series, version: BRIDGE_SCRIPT_VERSION };
 }
 
-/** 面板用：脚本是否存在、已装到哪些 Max、startup 目录 */
+/** 面板用：脚本是否存在、已装到哪些 Max、startup 目录（按各版本挑系列比对） */
 export function installInfo(appRoot: string) {
-  const script = bridgeScriptPath(appRoot);
-  const exists = fs.existsSync(script);
+  const series = maxSeries(appRoot);
+  const newest = series[series.length - 1] || '';
+  const script = newest ? bridgeScriptPath(appRoot, newest) : '';
+  const exists = !!script && fs.existsSync(script);
   const dirs = maxStartupDirs();
   const installedAt: string[] = [];
   for (const d of dirs) {
-    const p = path.join(d, SCRIPT_NAME);
-    if (fs.existsSync(p)) {
-      let same = false;
-      try { same = fs.readFileSync(p, 'utf8') === fs.readFileSync(script, 'utf8'); } catch { /* ignore */ }
-      installedAt.push(p + (same ? '' : ' (版本不同)'));
-    }
+    const name = maxInstalledFile(d);
+    if (!name) continue;
+    const p = path.join(d, name);
+    const pick = pickMaxSeries(series, maxYearOfStartupDir(d));
+    const src = pick ? readBridgeScript(appRoot, pick) : null;
+    let same = false;
+    try { same = !!src && fs.readFileSync(p, 'utf8') === src; } catch { /* ignore */ }
+    installedAt.push(p + (same ? '' : ' (版本不同)'));
   }
   return {
     script: exists ? script : null,
     scriptVersion: BRIDGE_SCRIPT_VERSION,
+    series,
     startupDirs: dirs,
     installedAt,
     installed: installedAt.length > 0
@@ -1295,5 +1389,217 @@ export function writeLocator(port: number, appRoot: string, version: string) {
     return file;
   } catch {
     return null;
+  }
+}
+
+// ---------------------------------------------------------------- 统一插件安装/卸载（按 DCC 版本）
+//
+// 「安装插件」弹窗用：列出本机每个 DCC 的每个版本，勾选=安装、取消=卸载。
+// UE 是「按工程」安装的，不走这套（面板里单独有工程选择框）。
+
+export type PluginDcc = 'max' | 'blender' | 'su' | 'maya';
+
+export type PluginTarget = {
+  dcc: PluginDcc;
+  key: string;          // dcc + 版本，前端勾选状态用
+  label: string;        // 3ds Max 2027（CHS）
+  dir: string;          // 安装目录（给人看）
+  series: string;       // 用的插件系列（2027 / 5.2 / 2026 / 2025）
+  pluginVersion: string;// 源码里的插件版本
+  installed: boolean;
+  upToDate: boolean;    // 已装且与源码一致
+};
+
+function readVer(file: string, re: RegExp): string {
+  try { return (fs.readFileSync(file, 'utf8').match(re) || [])[1] || ''; } catch { return ''; }
+}
+
+/** 本机所有可安装的「DCC + 版本」目标 */
+export function pluginTargets(appRoot: string): PluginTarget[] {
+  const out: PluginTarget[] = [];
+
+  // --- 3ds Max ---
+  const mxSeries = maxSeries(appRoot);
+  for (const dir of maxStartupDirs()) {
+    const year = maxYearOfStartupDir(dir);
+    // 严格按目标版本挑系列：pick === '' 表示「没有适用于该 Max 版本的插件」
+    const pick = pickMaxSeries(mxSeries, year) || '';
+    const src = pick ? readBridgeScript(appRoot, pick) : null;
+    const name = maxInstalledFile(dir);
+    let same = false;
+    try { same = !!src && !!name && fs.readFileSync(path.join(dir, name), 'utf8') === src; } catch { /* ignore */ }
+    const lang = (dir.match(/\\([A-Z]{3})\\scripts\\/i) || [])[1] || '';
+    out.push({
+      dcc: 'max',
+      key: `max:${year}:${lang}`,
+      label: `3ds Max ${year}${lang ? `（${lang}）` : ''}`,
+      dir,
+      series: pick,
+      pluginVersion: BRIDGE_SCRIPT_VERSION,
+      installed: !!name,
+      upToDate: same
+    });
+  }
+
+  // --- Blender ---
+  const blSeries = blenderSeries(appRoot);
+  for (const d of blenderUserDirs()) {
+    const pick = pickBlenderSeries(blSeries, d.version) || '';
+    const srcFile = pick ? path.join(appRoot, 'bridge', 'blender', pick, BLENDER_PLUGIN_FILE) : '';
+    const dst = path.join(d.addons, BLENDER_PLUGIN_FILE);
+    const has = fs.existsSync(dst);
+    let same = false;
+    try { same = has && fs.readFileSync(dst, 'utf8') === fs.readFileSync(srcFile, 'utf8'); } catch { /* ignore */ }
+    out.push({
+      dcc: 'blender',
+      key: `blender:${d.version}`,
+      label: `Blender ${d.version}`,
+      dir: d.addons,
+      series: pick,
+      pluginVersion: readVer(has ? dst : srcFile, /(?:BL_VERSION|AM_PLUGIN_VERSION)\s*=\s*['"]([^'"]+)['"]/),
+      installed: has,
+      upToDate: same
+    });
+  }
+
+  // --- SketchUp ---
+  const suSeriesAll = suSeries(appRoot);
+  for (const d of suUserDirs()) {
+    const pick = pickSuSeries(suSeriesAll, d.version) || '';
+    const srcLoader = pick ? path.join(appRoot, 'bridge', 'su', pick, SU_LOADER) : '';
+    const dst = path.join(d.plugins, SU_LOADER);
+    const has = fs.existsSync(dst);
+    let same = false;
+    try {
+      same = has && fs.readFileSync(dst, 'utf8') === fs.readFileSync(srcLoader, 'utf8')
+        && fs.readFileSync(path.join(d.plugins, SU_DIR, 'main.rb'), 'utf8')
+           === fs.readFileSync(path.join(appRoot, 'bridge', 'su', pick, SU_DIR, 'main.rb'), 'utf8');
+    } catch { /* ignore */ }
+    out.push({
+      dcc: 'su',
+      key: `su:${d.version}`,
+      label: `SketchUp ${d.version}`,
+      dir: d.plugins,
+      series: pick,
+      pluginVersion: has ? readVer(dst, /AM_PLUGIN_VERSION\s*=\s*['"]([^'"]+)['"]/) : readVer(srcLoader, /AM_PLUGIN_VERSION\s*=\s*['"]([^'"]+)['"]/),
+      installed: has,
+      upToDate: same
+    });
+  }
+
+  // --- Maya ---
+  const mySeries = mayaSeries(appRoot);
+  for (const d of mayaUserDirs()) {
+    const pick = pickMayaSeries(mySeries, d.version) || '';
+    const dstMod = path.join(d.modules, MAYA_MODULE + '.mod');
+    const has = fs.existsSync(dstMod);
+    let same = false;
+    try {
+      // .mod 是安装时按版本生成的，只比对插件本体（.mod 内部内容由生成逻辑保证）
+      same = has && fs.readFileSync(path.join(d.modules, MAYA_MODULE, MAYA_PY), 'utf8')
+        === fs.readFileSync(path.join(appRoot, 'bridge', 'maya', pick, MAYA_PY), 'utf8');
+    } catch { /* ignore */ }
+    out.push({
+      dcc: 'maya',
+      key: `maya:${d.version}`,
+      label: `Maya ${d.version}`,
+      dir: d.modules,
+      series: pick,
+      pluginVersion: has ? readVer(dstMod, /AssetManagerBridge\s+([0-9.]+)/) : readVer(path.join(appRoot, 'bridge', 'maya', pick, MAYA_MODULE + '.mod'), /AssetManagerBridge\s+([0-9.]+)/),
+      installed: has,
+      upToDate: same
+    });
+  }
+
+  return out.sort((a, b) => (a.dcc === b.dcc ? a.label.localeCompare(b.label) : a.dcc.localeCompare(b.dcc)));
+}
+
+/** 安装 / 卸载某个具体目标（key 来自 pluginTargets） */
+export function applyPluginTarget(appRoot: string, key: string, install: boolean): { ok: boolean; error?: string; file?: string } {
+  const t = pluginTargets(appRoot).find(x => x.key === key);
+  if (!t) return { ok: false, error: '目标不存在（可能已卸载 DCC 或重启过）' };
+
+  try {
+    if (t.dcc === 'max') {
+      if (install && !t.series) {
+        return { ok: false, error: `没有适用于 ${t.label} 的插件系列（应用里只有 bridge/max/${maxSeries(appRoot).join('、') || '（空）'}）` };
+      }
+      if (install) {
+        const src = readBridgeScript(appRoot, t.series);
+        if (!src) return { ok: false, error: `读不到系列 ${t.series} 的脚本` };
+        fs.mkdirSync(t.dir, { recursive: true });
+        const dst = path.join(t.dir, maxPluginFileName());
+        for (const f of fs.readdirSync(t.dir)) {
+          if (/^AssetManagerBridge.*\.ms$/i.test(f) && f !== path.basename(dst)) fs.unlinkSync(path.join(t.dir, f));
+        }
+        fs.writeFileSync(dst, src, 'utf8');
+        removeMaxMacroFiles(t.dir);      // 让 Max 用新脚本重新生成宏（旧宏体可能已过时）
+        return { ok: true, file: dst };
+      }
+      let removed = 0;
+      for (const f of fs.readdirSync(t.dir)) {
+        if (/^AssetManagerBridge.*\.ms$/i.test(f)) { fs.unlinkSync(path.join(t.dir, f)); removed++; }
+      }
+      // 关键：清掉 usermacros 里由插件注册的宏，否则 Max 启动会报
+      // 「MAXScript MacroScript 错误…类型错误: 调用需要函数或类，得到的是: undefined」
+      const macros = removeMaxMacroFiles(t.dir);
+      removed += macros.length;
+      return removed
+        ? { ok: true, note: macros.length ? `已同时清理残留宏 ${macros.length} 个` : '' }
+        : { ok: false, error: '这个 Max 目录里没有插件文件' };
+    }
+
+    if (t.dcc === 'blender') {
+      const dst = path.join(t.dir, BLENDER_PLUGIN_FILE);
+      if (install) {
+        const src = path.join(appRoot, 'bridge', 'blender', t.series, BLENDER_PLUGIN_FILE);
+        if (!fs.existsSync(src)) return { ok: false, error: `缺少 ${t.series}/${BLENDER_PLUGIN_FILE}` };
+        fs.mkdirSync(t.dir, { recursive: true });
+        fs.copyFileSync(src, dst);
+        try { fs.rmSync(path.join(t.dir, '__pycache__'), { recursive: true, force: true }); } catch { /* ignore */ }
+        return { ok: true, file: dst };
+      }
+      if (!fs.existsSync(dst)) return { ok: false, error: '没有安装记录' };
+      fs.unlinkSync(dst);
+      try { fs.rmSync(path.join(t.dir, '__pycache__'), { recursive: true, force: true }); } catch { /* ignore */ }
+      return { ok: true };
+    }
+
+    if (t.dcc === 'su') {
+      const dstLoader = path.join(t.dir, SU_LOADER);
+      const dstDir = path.join(t.dir, SU_DIR);
+      if (install) {
+        const srcLoader = path.join(appRoot, 'bridge', 'su', t.series, SU_LOADER);
+        const srcMain = path.join(appRoot, 'bridge', 'su', t.series, SU_DIR, 'main.rb');
+        if (!fs.existsSync(srcLoader) || !fs.existsSync(srcMain)) return { ok: false, error: `缺少 ${t.series}/${SU_LOADER} 或 ${SU_DIR}/main.rb` };
+        fs.mkdirSync(dstDir, { recursive: true });
+        fs.copyFileSync(srcLoader, dstLoader);
+        fs.copyFileSync(srcMain, path.join(dstDir, 'main.rb'));
+        return { ok: true, file: dstLoader };
+      }
+      let removed = 0;
+      try { if (fs.existsSync(dstLoader)) { fs.unlinkSync(dstLoader); removed++; } } catch { /* ignore */ }
+      try { if (fs.existsSync(dstDir)) { fs.rmSync(dstDir, { recursive: true, force: true }); removed++; } } catch { /* ignore */ }
+      return removed ? { ok: true } : { ok: false, error: '没有安装记录' };
+    }
+
+    // maya
+    const dstMod = path.join(t.dir, MAYA_MODULE + '.mod');
+    const dstDir = path.join(t.dir, MAYA_MODULE);
+    if (install) {
+      const srcMod = path.join(appRoot, 'bridge', 'maya', t.series, MAYA_MODULE + '.mod');
+      const srcPy = path.join(appRoot, 'bridge', 'maya', t.series, MAYA_PY);
+      if (!fs.existsSync(srcMod) || !fs.existsSync(srcPy)) return { ok: false, error: `缺少 ${t.series}/${MAYA_MODULE}.mod 或 ${MAYA_PY}` };
+      fs.mkdirSync(path.join(dstDir, 'scripts'), { recursive: true });
+      fs.copyFileSync(srcMod, dstMod);
+      fs.copyFileSync(srcPy, path.join(dstDir, MAYA_PY));
+      return { ok: true, file: dstMod };
+    }
+    let removed = 0;
+    try { if (fs.existsSync(dstMod)) { fs.unlinkSync(dstMod); removed++; } } catch { /* ignore */ }
+    try { if (fs.existsSync(dstDir)) { fs.rmSync(dstDir, { recursive: true, force: true }); removed++; } } catch { /* ignore */ }
+    return removed ? { ok: true } : { ok: false, error: '没有安装记录' };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e) };
   }
 }

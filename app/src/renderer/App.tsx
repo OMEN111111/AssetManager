@@ -1282,6 +1282,56 @@ export default function App() {
     }
   }
 
+  // ---- 统一插件安装/卸载（按 DCC 版本勾选） ----
+  const [plugTargets, setPlugTargets] = useState<any[]>([]);
+  const [plugMaxFile, setPlugMaxFile] = useState('');
+  const [plugBusy, setPlugBusy] = useState('');
+  const [plugFilter, setPlugFilter] = useState<'' | 'max' | 'blender' | 'su' | 'maya'>('');
+  const [plugPick, setPlugPick] = useState(false);       // 安装/卸载插件弹窗
+
+  async function openPlugins(dccRaw?: any) {
+    // 每个软件的按钮只看自己：弹窗只列这个 DCC 的版本
+    const dcc = (['max', 'blender', 'su', 'maya'] as const).includes(dccRaw) ? dccRaw as 'max' | 'blender' | 'su' | 'maya' : 'max';
+    setPlugPick(true);
+    setPlugFilter(dcc);
+    setPlugBusy('scan');
+    try {
+      const r = await api('/api/bridge/plugin-targets');
+      const list = r?.targets || [];
+      setPlugTargets(list);
+      setPlugMaxFile(r?.maxFile || '');
+      const mine = list.filter((t: any) => t.dcc === dcc);
+      const name = ({ max: '3ds Max', blender: 'Blender', su: 'SketchUp', maya: 'Maya' } as any)[dcc];
+      if (!mine.length) showToast(`${name}：没检测到可安装的版本（先启动一次该软件，让它生成用户配置目录）`, 'err');
+      else showToast(`${name}：检测到 ${mine.length} 个版本` +
+        (mine.some((t: any) => !t.installed) ? `（未安装 ${mine.filter((t: any) => !t.installed).length} 个）` : '') +
+        (mine.some((t: any) => t.installed && !t.upToDate) ? '，其中 ' + mine.filter((t: any) => t.installed && !t.upToDate).length + ' 个需更新' : '') +
+        '；勾选=安装，取消勾选=卸载', 'ok');
+      setTimeout(() => {
+        const el = document.querySelector('.plg-list');
+        if (el && (el as any).scrollIntoView) (el as any).scrollIntoView({ block: 'nearest' });
+      }, 120);
+    } catch (e: any) {
+      showToast('检测可安装版本失败：' + (e?.message || e), 'err');
+    } finally { setPlugBusy(''); }
+  }
+
+  async function toggleTarget(t: any) {
+    setPlugBusy(t.key);
+    try {
+      const r = await api('/api/bridge/plugin-target', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: t.key, install: !t.installed })
+      });
+      if (!r?.ok) showToast((t.installed ? '卸载失败：' : '安装失败：') + (r?.error || '未知原因'), 'err');
+      else showToast(`${t.installed ? '已卸载' : '已安装'}：${t.label}`, 'ok');
+      const r2 = await api('/api/bridge/plugin-targets');
+      setPlugTargets(r2?.targets || []);
+      setPlugMaxFile(r2?.maxFile || '');
+      await loadBridge();
+    } finally { setPlugBusy(''); }
+  }
+
   async function installMaxPlugin() {
     setBridgeBusy(true);
     try {
@@ -2585,7 +2635,7 @@ export default function App() {
                   </div>
                 )}
                 <div className="uvrow" style={{ marginTop: 8 }}>
-                  <button className="btn primary" disabled={bridgeBusy} onClick={installMaxPlugin}>安装到 3ds Max</button>
+                  <button className="btn primary" disabled={bridgeBusy} onClick={() => openPlugins('max')}>安装 / 卸载插件（3ds Max）</button>
                   <button className="btn" onClick={() => openMaxFolder('startup')}>打开 startup 目录</button>
                   <button className="btn" onClick={() => openMaxFolder('copy')} title="复制插件文件到数据目录并打开，便于手动安装">打开插件文件夹</button>
                   <button className="btn" disabled={bridgeBusy} onClick={testBridge}>测试连接</button>
@@ -2621,7 +2671,7 @@ export default function App() {
                   </div>
                 )}
                 <div className="uvrow" style={{ marginTop: 8 }}>
-                  <button className="btn primary" disabled={bridgeBusy} onClick={installBlenderPlugin}>
+                  <button className="btn primary" disabled={bridgeBusy} onClick={() => openPlugins('blender')}>
                     安装/更新插件到 Blender
                   </button>
                   <button className="btn" onClick={async () => {
@@ -2658,7 +2708,7 @@ export default function App() {
                   </div>
                 )}
                 <div className="uvrow" style={{ marginTop: 8 }}>
-                  <button className="btn primary" disabled={bridgeBusy} onClick={installSuPlugin}>
+                  <button className="btn primary" disabled={bridgeBusy} onClick={() => openPlugins('su')}>
                     安装/更新插件到 SketchUp
                   </button>
                   <button className="btn" onClick={async () => {
@@ -2736,7 +2786,7 @@ export default function App() {
                   </div>
                 )}
                 <div className="uvrow" style={{ marginTop: 8 }}>
-                  <button className="btn primary" disabled={bridgeBusy} onClick={installMayaPlugin}>
+                  <button className="btn primary" disabled={bridgeBusy} onClick={() => openPlugins('maya')}>
                     安装/更新插件到 Maya
                   </button>
                   <button className="btn" onClick={async () => {
@@ -2783,9 +2833,60 @@ export default function App() {
                 </div>
               </div>
             )}
-            <div className="hint">插件来源：应用目录下的 bridge/max/AssetManagerBridge.ms（安装时复制到 3ds Max 的 scripts\startup）；Blender 插件在 bridge/blender/&lt;Blender 版本&gt;/ 下；SketchUp 插件在 bridge/su/&lt;SketchUp 版本&gt;/ 下；UE 插件在 bridge/ue/&lt;引擎版本&gt;/AssetManagerBridge/ 下（装进工程的 Plugins）；Maya 插件在 bridge/maya/&lt;Maya 年份&gt;/ 下（装进 Documents\maya\&lt;年份&gt;\modules）。</div>
+            <div className="hint">插件来源：应用目录下的 bridge/max/&lt;3ds Max 版本&gt;/AssetManagerBridge.ms（安装时按各 Max 版本挑对应系列，复制到 scripts\startup）；Blender 插件在 bridge/blender/&lt;Blender 版本&gt;/ 下；SketchUp 插件在 bridge/su/&lt;SketchUp 版本&gt;/ 下；UE 插件在 bridge/ue/&lt;引擎版本&gt;/AssetManagerBridge/ 下（装进工程的 Plugins）；Maya 插件在 bridge/maya/&lt;Maya 年份&gt;/ 下（装进 Documents\maya\&lt;年份&gt;\modules）。</div>
             <div className="modal-b">
               <button className="btn" onClick={() => setPluginsOpen(false)}>关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {plugPick && (
+        <div className="modal-mask" onMouseDown={() => setPlugPick(false)}>
+          <div className="modal wide" onMouseDown={e => e.stopPropagation()}>
+            <div className="modal-t">
+              安装 / 卸载插件 · {({ max: '3ds Max', blender: 'Blender', su: 'SketchUp', maya: 'Maya' } as any)[plugFilter || 'max']}
+              <span className="hint" style={{ marginLeft: 8, fontWeight: 400 }}>
+                勾选=安装，取消勾选=卸载；装完需重启该软件
+              </span>
+            </div>
+            <div className="plg-list">
+              {plugBusy === 'scan' && <div className="hint">正在检测可安装的版本…</div>}
+              {plugBusy !== 'scan' && plugTargets.length === 0 && (
+                <div className="hint">没有检测到这个软件的可用版本（先启动一次该软件，让它生成用户配置目录）</div>
+              )}
+              {[plugFilter].filter(Boolean).map(dcc => {
+                const rows = plugTargets.filter((t: any) => t.dcc === dcc);
+                if (!rows.length) return null;
+                const title = ({ max: '3ds Max', blender: 'Blender', su: 'SketchUp', maya: 'Maya' } as any)[dcc as string];
+                return (
+                  <div className="plg-grp" key={dcc}>
+                    <div className="plg-grp-t">{title}（{rows.length} 个版本）</div>
+                    {rows.map((t: any) => (
+                      <label className={'plg-row' + (t.installed ? ' on' : '')} key={t.key}>
+                        <input type="checkbox" checked={!!t.installed}
+                          disabled={plugBusy === t.key || (!t.series && t.dcc === 'max')}
+                          onChange={() => toggleTarget(t)} />
+                        <span className="plg-name">{t.label}</span>
+                        <span className="plg-meta">
+                          {t.dcc === 'max'
+                            ? (t.series ? `将安装：系列 ${t.series} · v${t.pluginVersion}` : '没有适用于该版本的插件系列')
+                            : (t.series ? `系列 ${t.series}` : '无可用系列')}
+                          {t.dcc !== 'max' && t.pluginVersion ? ` · v${t.pluginVersion}` : ''}
+                          {t.installed ? (t.upToDate ? ' · 已安装' : ' · 需更新') : (t.dcc === 'max' && !t.series ? '' : ' · 未安装')}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                );
+              })}
+              <div className="hint" style={{ marginTop: 8 }}>
+                UE 插件按工程安装，用插件面板里的「安装/更新插件到 UE 工程…」勾选工程。
+                {plugMaxFile ? ` 3ds Max 插件文件名：${plugMaxFile}` : ''}
+              </div>
+            </div>
+            <div className="modal-b">
+              <button className="btn" onClick={() => setPlugPick(false)}>关闭</button>
             </div>
           </div>
         </div>
