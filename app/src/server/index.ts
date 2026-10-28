@@ -594,7 +594,7 @@ function undoOrganize(lib: number) {
 function detectTypeByName(name: string): string | null {
   const ext = path.extname(name).toLowerCase();
   if (ext === '.mtlx') return '02_Materials';
-  if (['.fbx', '.obj', '.glb', '.gltf', '.blend', '.max', '.usdz', '.stl', '.3ds', '.abc'].includes(ext)) return '05_Models';
+  if (['.fbx', '.obj', '.glb', '.gltf', '.blend', '.max', '.usdz', '.usd', '.usda', '.usdc', '.stl', '.3ds', '.abc'].includes(ext)) return '05_Models';
   if (['.dwg', '.dxf'].includes(ext)) return '07_CAD';
   if (['.exr', '.hdr'].includes(ext)) return '04_HDRI';
   if (['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.webp', '.tga', '.psd'].includes(ext)) return '01_Texture';
@@ -606,7 +606,7 @@ function detectFolderType(dir: string): string {
     const entries = fs.readdirSync(dir, { withFileTypes: true }).slice(0, 200);
     const names = entries.filter(e => e.isFile()).map(e => e.name);
     if (names.some(n => n.toLowerCase().endsWith('.mtlx'))) return '02_Materials';
-    if (names.some(n => /\.(fbx|obj|blend|max|glb|gltf|usdz)$/i.test(n))) return '05_Models';
+    if (names.some(n => /\.(fbx|obj|blend|max|glb|gltf|usdz|usd|usda|usdc)$/i.test(n))) return '05_Models';
     if (names.some(n => /\.(dwg|dxf)$/i.test(n))) return '07_CAD';
     if (names.some(n => /\.(exr|hdr)$/i.test(n))) return '04_HDRI';
     if (names.filter(n => IMG_EXT_RE.test(n)).length >= 2) return '01_Texture';
@@ -1377,6 +1377,43 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     return fs.createReadStream(file).pipe(res);
   }
 
+  // 素材目录内的相对文件：USD 的 payload/reference 层、../Textures 下的贴图都靠它取
+  // 例：/api/assetsrc/12/payloads/instances.usda 、 /api/assetsrc/12/payloads/../Textures/a.png
+  const mAssetSrc = p.match(/^\/api\/assetsrc\/(\d+)\/(.*)$/);
+  if (mAssetSrc) {
+    const id = Number(mAssetSrc[1]);
+    let rel = mAssetSrc[2];
+    try { rel = decodeURIComponent(rel); } catch { /* keep raw */ }
+    const a = db.prepare(`SELECT a.rel_dir, l.root FROM assets a
+      JOIN libraries l ON l.id=a.library_id WHERE a.id=?`).get(id) as any;
+    if (!a) return json(res, 404, { error: 'not found' });
+    const libRoot = path.resolve(String(a.root));
+    const assetDir = path.resolve(libRoot, String(a.rel_dir || ''));
+    const abs = path.resolve(assetDir, String(rel).replace(/\\/g, '/'));
+    // 只放行 3D/贴图类文件，且必须落在素材库根内（USD 常写 ../Textures/x.png，不能锁死在素材目录里）
+    const okExt = /\.(usd|usda|usdc|usdz|png|jpe?g|webp|bmp|tga|tiff?|exr|hdr|mdl|mtlx)$/i.test(abs);
+    if (!okExt || (abs !== libRoot && !abs.startsWith(libRoot + path.sep))) {
+      return json(res, 403, { error: 'forbidden' });
+    }
+    let st: fs.Stats | null = null;
+    try { st = fs.statSync(abs); } catch { /* missing */ }
+    if (!st || !st.isFile()) return json(res, 404, { error: 'missing' });
+    const ext2 = path.extname(abs).toLowerCase();
+    const mime2: Record<string, string> = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+      '.bmp': 'image/bmp', '.tga': 'image/x-tga', '.tif': 'image/tiff', '.tiff': 'image/tiff',
+      '.exr': 'image/x-exr', '.hdr': 'image/vnd.radiance',
+      '.usd': 'application/octet-stream', '.usda': 'text/plain; charset=utf-8',
+      '.usdc': 'application/octet-stream', '.usdz': 'model/vnd.usdz+zip'
+    };
+    res.writeHead(200, {
+      'content-type': mime2[ext2] || 'application/octet-stream',
+      'content-length': st.size,
+      'cache-control': 'public, max-age=600'
+    });
+    return fs.createReadStream(abs).pipe(res);
+  }
+
   if (p === '/api/texture/export' && req.method === 'POST') {
     const b = await body(req);
     const f = db.prepare(`SELECT f.rel_path, l.root, l.id AS lib FROM files f
@@ -1698,7 +1735,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const limit = Math.min(Number(url.searchParams.get('limit') || 300), 1000);
     const fileKind = (rel: string) => {
       const p = String(rel).toLowerCase();
-      if (/\.(fbx|obj|glb|gltf|stl|3ds|abc|usdz|blend|max)$/.test(p)) return 'model';
+      if (/\.(fbx|obj|glb|gltf|stl|3ds|abc|usdz|usd|usda|usdc|blend|max)$/.test(p)) return 'model';
       if (/\.(hdr|exr)$/.test(p)) return 'hdri';
       if (/\.ies$/.test(p)) return 'ies';
       if (/\.(dwg|dxf)$/.test(p)) return 'drawing';

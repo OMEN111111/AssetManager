@@ -697,6 +697,11 @@ export default function App() {
       localStorage.setItem('am-ex-types', JSON.stringify([...s]));
       return s;
     });
+    // Alt+左键「只显示该类型」时，把之前的隐藏格式一起清掉，否则看起来还是不完整
+    if (only) {
+      setHiddenExts(new Set());
+      localStorage.setItem('am-ex-exts', '[]');
+    }
   }
 
   function toggleExt(ext: string) {
@@ -706,6 +711,18 @@ export default function App() {
       localStorage.setItem('am-ex-exts', JSON.stringify([...s]));
       return s;
     });
+  }
+
+  /**
+   * 「只看这一种格式」：把库里其它格式全部隐藏，同时清掉类型排除
+   * （和标签的交互一致 —— 左键=只留这一项，只是这里换成了 Alt+左键）。
+   */
+  function onlyExt(ext: string) {
+    const others = exts.map(x => x.ext).filter(e => e !== ext);
+    setHiddenExts(new Set(others));
+    setExcludedTypes(new Set());
+    localStorage.setItem('am-ex-exts', JSON.stringify(others));
+    localStorage.setItem('am-ex-types', '[]');
   }
 
   function clearTypeFilters() {
@@ -2132,9 +2149,8 @@ export default function App() {
               <button key={t.key}
                 className={'chip' + (excludedTypes.has(t.key) ? ' off' : '')}
                 onClick={(e) => toggleType(t.key, e.altKey)}
-                title="左键隐藏/显示该类型；Alt+左键只显示该类型；右键选择要隐藏的格式"
                 onContextMenu={e => { e.preventDefault(); setExtMenu({ type: t.key, x: e.clientX, y: e.clientY }); }}
-                title="左键隐藏/显示该类型，右键选择要隐藏的格式">
+                title="左键 隐藏/显示该类型；Alt+左键 只显示该类型；右键 选择要隐藏的格式（菜单里 Alt+左键 = 只看这一种格式）">
                 {t.label}<span className="n">{counts[t.key] ?? 0}</span>
               </button>
             ))}
@@ -2449,9 +2465,19 @@ export default function App() {
           <div className="menu-mask" onMouseDown={() => setExtMenu(null)} />
           <div className="extmenu" style={{ left: Math.min(extMenu.x, window.innerWidth - 220), top: extMenu.y }}
             onMouseDown={e => e.stopPropagation()}>
-            <div className="em-t">{TYPES.find(t => t.key === extMenu.type)?.label} · 隐藏格式</div>
+            <div className="em-t">{TYPES.find(t => t.key === extMenu.type)?.label} · 隐藏格式
+              <span className="em-hint">Alt+左键只看这一种</span>
+            </div>
             {exts.filter(x => x.type === extMenu.type).map(x => (
-              <label key={x.ext} className="em-row">
+              <label key={x.ext} className={'em-row' + (hiddenExts.has(x.ext) ? ' off' : '')}
+                title="左键 隐藏/显示该格式；Alt+左键 只看这一种格式"
+                onMouseDown={e => {
+                  if (!e.altKey) return;
+                  e.preventDefault();          // 别让复选框自己再切一次
+                  e.stopPropagation();
+                  onlyExt(x.ext);
+                  setExtMenu(null);
+                }}>
                 <input type="checkbox" checked={hiddenExts.has(x.ext)} onChange={() => toggleExt(x.ext)} />
                 <span>{x.ext.replace('.', '').toUpperCase()}</span>
                 <span className="em-n">{x.c}</span>

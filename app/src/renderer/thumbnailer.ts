@@ -7,7 +7,8 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { buildMaterial, detectConfig } from './matlib';
 import type { AssetDetail } from './types';
 import { assertBinaryFbx } from './fbxcheck';
-import { parseIesFull, ies360Texture, iesMaterial } from './Viewer';
+import { loadUsdModel, isUsdPath } from './usd/usdload';
+import { parseIesFull, ies360Texture, iesMaterial, capTexturesForVram } from './Viewer';
 
 let renderer: THREE.WebGLRenderer | null = null;
 let envTex: THREE.Texture | null = null;
@@ -114,9 +115,11 @@ export async function renderThumb(detail: AssetDetail): Promise<string> {
   }
 
   if (detail.type === 'model' || detail.type === 'scene') {
-    const f = detail.files.find(x => /\.(fbx|obj|glb|gltf)$/i.test(x.rel_path));
+    const f = detail.files.find(x => /\.(fbx|obj|glb|gltf|usd|usda|usdc|usdz)$/i.test(x.rel_path));
     if (!f) throw new Error('no model file');
     const ext = (String(f.rel_path).match(/\.[a-z0-9]+$/i)?.[0] || '').toLowerCase();
+    // USD：材质/贴图由文件自己描述，不能再拿素材目录里的贴图去覆盖（会串材质）
+    const isUsd = isUsdPath(ext);
     const byName = new Map<string, number>();
     for (const it of detail.files) {
       const bn = String(it.rel_path).split('/').pop();
@@ -132,7 +135,17 @@ export async function renderThumb(detail: AssetDetail): Promise<string> {
       return id ? `/api/file/${id}` : url;
     });
     let obj: THREE.Object3D;
-    if (ext === '.fbx') {
+    if (isUsd) {
+      const usd = await loadUsdModel({
+        assetId: Number(detail.id),
+        fileId: Number(f.id),
+        relPath: f.rel_path,
+        assetRelDir: String(detail.rel_dir || '')
+      });
+      obj = usd.object;
+      // 缩略图也走一次显存保护：USD 素材常有 4K/8K 贴图
+      try { await capTexturesForVram(obj); } catch { /* ignore */ }
+    } else if (ext === '.fbx') {
       await assertBinaryFbx(f.id, f.rel_path);
       obj = await new Promise<THREE.Group>((res, rej) => new FBXLoader(manager).load(`/api/file/${f.id}`, res, undefined, rej));
     } else if (ext === '.obj') {
@@ -149,12 +162,12 @@ export async function renderThumb(detail: AssetDetail): Promise<string> {
       const gl: any = await new Promise((res, rej) => new GLTFLoader(manager).load(`/api/file/${f.id}`, res, undefined, rej));
       obj = gl.scene || gl.scenes?.[0];
     }
-    const mat = await buildMaterial(detail.files, detectConfig(detail.files, detail.slotMap));
+    const mat = isUsd ? null : await buildMaterial(detail.files, detectConfig(detail.files, detail.slotMap));
     obj.traverse((o: any) => {
       if (o.isMesh) {
         if (o.geometry?.attributes?.uv) o.geometry.setAttribute('uv1', o.geometry.attributes.uv);
         const own = Array.isArray(o.material) ? o.material[0] : o.material;
-        if (!own || !(own.map || own.emissiveMap)) o.material = mat;
+        if (!isUsd && mat && (!own || !(own.map || own.emissiveMap))) o.material = mat;
       }
     });
     const box = new THREE.Box3().setFromObject(obj);

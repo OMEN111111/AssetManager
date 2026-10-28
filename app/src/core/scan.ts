@@ -3,9 +3,12 @@ import path from 'node:path';
 import type { DB } from './db.ts';
 import type { AssetType, ScanState } from './types.ts';
 
-const SKIP_DIRS = new Set(['_meta', '99_Temp', '99_Trash', '99_Unsorted', '.git', 'node_modules', '.fbm', '00_INBOX', 'renders', 'render']);
+const SKIP_DIRS = new Set(['_meta', '99_Temp', '99_Trash', '99_Unsorted', '.git', 'node_modules', '.fbm', '00_INBOX', 'renders', 'render',
+  // USD 素材（Omniverse / Isaac Sim 导出的）把几何层、材质层都放在 payloads/ 里，
+  // 那是「配套文件」而不是独立素材；不跳过的话每个变体目录都会变成一个模型素材。
+  'payloads']);
 
-const MODEL_EXT = new Set(['.fbx', '.obj', '.glb', '.gltf', '.blend', '.max', '.usdz', '.stl', '.3ds', '.abc']);
+const MODEL_EXT = new Set(['.fbx', '.obj', '.glb', '.gltf', '.blend', '.max', '.usdz', '.usd', '.usda', '.usdc', '.stl', '.3ds', '.abc']);
 const DRAW_EXT = new Set(['.dwg', '.dxf']);
 const IMG_EXT = new Set(['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.webp', '.tga', '.psd']);
 const IES_EXT = new Set(['.ies', '.ldt']);

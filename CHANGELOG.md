@@ -6,6 +6,53 @@
 > **SketchUp 插件同样独立编号**（首版 `0.1.0`，只递增第三位），按 SketchUp 版本分目录（`bridge/su/2026/`…）。
 > **UE 插件同样独立编号**（首版 `0.1.0`），按引擎版本分目录（`bridge/ue/5.7/`…）。
 
+## 0.5.8（2026-10-28 · 本地打包，未发布）
+
+### 新增
+- **USD 模型支持（`.usd` / `.usda` / `.usdc` / `.usdz`）**：扫描入库、网格缩略图、3D 预览、发送到 DCC 全链路接通。
+  预览走软件自带的 USD 组合加载器（`src/renderer/usd/`，基于 three 的解析器打了补丁），
+  **认 references / payload / over 图元 / 变体选择**，跨层引用、`../Textures` 里的外部贴图都能取到。
+- 新增服务端路由 `/api/assetsrc/<素材id>/<素材内相对路径>`：USD 的层与贴图按素材目录解析
+  （限定在素材库根内、只放行 3D/贴图类扩展名）。
+- **预览器左上角无底色信息层**：常显 面数 / 顶点数 / 网格数 / 材质数 / 贴图数 / 原始包围盒尺寸
+  （透明背景、不吃鼠标事件，贴图缺失时单独标红）；USD 的网格不索引，顶点数按位置去重后显示真实点数。
+- 信息层的**尺寸统一换算成「米」**：FBX 按文件里的 `UnitScaleFactor` 折算（1 单位 = factor 厘米），
+  glTF/GLB 规范即米，USD 组合时已乘过 `metersPerUnit`，OBJ 无单位信息按米处理。
+- **过滤条格式清单支持 Alt+左键「只看这一种格式」**：右键类型（模型/材质/贴图…）弹出的格式列表里，
+  左键仍是隐藏/显示该格式，**Alt+左键**把其它格式全部隐藏、只留这一种（与标签「左键=只看这一项」一致）；
+  Alt+左键类型本身也会清掉遗留的隐藏格式，避免"只显示了类型却还是缺格式"。
+
+### 修复（都是「不串材质 / 贴图正确 / 不丢贴图」的关键）
+- **crate（二进制 .usd）的 references / payload 解析不了**：上游直接返回 null，Omniverse / Isaac Sim
+  导出的资产组合出来是空场景。现在能解 `ReferenceListOp` / `PayloadListOp`。
+- **压缩路径表把第二个 u64 当成 numPaths**：16/17、20/21 这类跨码表字节边界的文件，整个路径表解成乱码
+  （Toaster、CoffeeMachine 就属于这类）。
+- **`.usda` 只认 `prepend references`**：`references = @x@</Prim>`、`payload = ...`、`over` 图元、
+  `prepend rel material:binding`、`prepend color3f inputs:diffuseColor.connect` 全都不认 ——
+  材质绑定和贴图连线因此整段丢失。
+- **带 `<primPath>` 的引用会把被引用层的整份几何塞进来**：网格成倍重复、材质对不上。
+- **没有材质绑定时拿「根目录第一个材质」套给所有网格**：多材质资产直接串材质；现在只有整层唯一材质时才兜底。
+- **法线贴图强度翻倍**：USD 常写 `scale=(2,2,2,2) bias=(-1,-1,-1,-1)`（[0,1]→[-1,1] 解码），
+  上游把 scale 直接当 `normalScale`，等于把法线强度乘 2；现在取 `scale/2`。
+- **ORM 打包图的 AO 丢了**：USD 材质常常不单独连 `inputs:occlusion`，现在 R 通道（=AO）自动补给 `aoMap`。
+- 预览器对 USD 素材**不再跑 FBX 那套修补**（按文件名猜通道、补缺省贴图、UDIM 重设 repeat），
+  材质与平铺（`UsdTransform2d` 的 scale）保持文件原样。
+
+### 变更
+- 扫描跳过 `payloads/` 目录（USD 的配套层目录，不当独立素材）；素材体积统计只算素材目录里的文件。
+- 发送到 DCC 时，USD 素材**不再附带按文件名匹配出来的材质**（USD 自带材质，DCC 直接导入即可，
+  免得插件用匹配材质覆盖导致串材质）。
+- 插件版本未变（Max 0.2.1 / Blender 0.1.5 / SketchUp 0.1.3 / UE 0.1.7 / Maya 0.1.0）。
+
+### 实测
+- 素材库 12 个 Isaac Sim / Omniverse USD 资产（`F:\02AssetLibrary\Asset\05_Models\Appliance\*`）
+  全部组合成功：材质按 prim 绑定、贴图（albedo / normal / ORM）全部落地、无缺失。
+  典型：BeverageStation 2 网格 / 67k 三角 / 8 张贴图，加载 2.4 s；Dishwasher 6 网格 / 1.46M 三角；
+  VendingMachine 44 网格 / 994k 三角 / 33 张贴图。
+- 预览器截图核对：木纹桌面 + 黑色金属框架，材质列表 3 项（`m_opaque__metal__aluminiumBrushed_a01` /
+  `m_opaque__wood__oak_b01` / `m_opaque__metal__painted_black_a05`），无紫黑格子 / 纯色块。
+- `.usdz` 自造样本（ascii 层 + 包内 png）通过：1 网格、材质 `Mat`、贴图以 blob 加载成功。
+
 ## 0.5.7（2026-10-27 · 本地打包，未发布）
 
 ### 修复

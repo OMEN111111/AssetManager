@@ -13,6 +13,7 @@ import { IESLoader } from 'three/examples/jsm/loaders/IESLoader.js';
 import NumField from './NumField';
 import { detectConfig, loadTexture } from './matlib';
 import { makeGeometry } from './geometries';
+import { loadUsdModel, isUsdPath } from './usd/usdload';
 import type { AssetDetail, AssetFile } from './types';
 
 type Preset = 'maya' | 'max' | 'blender';
@@ -28,7 +29,7 @@ const TEX_MAPS = ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', '
   'alphaMap', 'displacementMap', 'bumpMap', 'specularMap', 'lightMap'];
 
 /** 把模型里所有贴图按显存预算降采样（在加入场景、第一次上传前调用） */
-async function capTexturesForVram(root: any, timeoutMs = 15000): Promise<{ capped: number; max: number; total: number }> {
+export async function capTexturesForVram(root: any, timeoutMs = 15000): Promise<{ capped: number; max: number; total: number }> {
   const seen = new Set<any>();
   const list: any[] = [];
   root.traverse((o: any) => {
@@ -594,6 +595,8 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
   });
   const [status, setStatus] = useState('准备中…');
   const [error, setError] = useState<string | null>(null);
+  /** 左上角无底色信息层：面数 / 顶点 / 网格 / 材质 / 贴图 / 尺寸（模型才有） */
+  const [meshInfo, setMeshInfo] = useState<string[]>([]);
 
   const ui = useRef({ exposure, envI, keyI, az, el, wire, hdriId, hdriRot, hdriBright, hdriVisible });
   ui.current = { exposure, envI, keyI, az, el, wire, hdriId, hdriRot, hdriBright, hdriVisible };
@@ -808,6 +811,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     const el = stageRef.current;
     if (!el) return;
     let disposed = false;
+    setMeshInfo([]);
     let renderer: THREE.WebGLRenderer;
     const ctxLost = (r: THREE.WebGLRenderer | null) => {
       try { return !!(r?.getContext?.() as any)?.isContextLost?.(); } catch { return true; }
@@ -1154,10 +1158,13 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
 
       if (isModel) {
         const extOf = (p: string) => (String(p).match(/\.[a-z0-9]+$/i)?.[0] || '').toLowerCase();
-        const modelFile = files.find(f => /\.(fbx|obj|glb|gltf)$/i.test(f.rel_path) && f.role === 'model')
-          || files.find(f => /\.(fbx|obj|glb|gltf)$/i.test(f.rel_path));
+        const modelFile = files.find(f => /\.(fbx|obj|glb|gltf|usd|usda|usdc|usdz)$/i.test(f.rel_path) && f.role === 'model')
+          || files.find(f => /\.(fbx|obj|glb|gltf|usd|usda|usdc|usdz)$/i.test(f.rel_path));
         if (!modelFile) { setError('没有可预览的模型文件'); setStatus(''); return; }
         const mext = extOf(modelFile.rel_path);
+        // USD 家族：材质与贴图由 USD 自己描述（references/payload/外部 Textures 目录），
+        // 后面那套「按文件名猜通道、补缺省贴图」的 FFbx 修补逻辑一律不能跑，否则会串材质。
+        const isUsd = isUsdPath(mext);
         // F-004：OBJ/GLB/GLTF 的相对资源（mtl、bin、贴图）按同目录文件名映射到 /api/file/:id
         const fileByName = new Map<string, number>();
         for (const f of files) {
@@ -1209,6 +1216,18 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
             loader.setMaterials(mats);
           }
           obj = await new Promise<any>((res, rej) => loader.load(`/api/file/${modelFile.id}`, res, undefined, rej));
+        } else if (isUsd) {
+          // USD / USDA / USDC / USDZ：自带组合加载器（认 references / payload / 外部 Textures）
+          const usd = await loadUsdModel({
+            assetId: asset.id,
+            fileId: modelFile.id,
+            relPath: modelFile.rel_path,
+            assetRelDir: String((asset as any).rel_dir || ''),
+            onStatus: setStatus
+          });
+          obj = usd.object;
+          (globalThis as any).__AMUSD = usd.stats;
+          if (usd.stats.missingTextures.length) (globalThis as any).__AMUSDMISS = usd.stats.missingTextures;
         } else {
           const gl: any = await new Promise((res, rej) => new GLTFLoader(manager).load(`/api/file/${modelFile.id}`, res, undefined, rej));
           obj = gl.scene || gl.scenes?.[0];
@@ -1300,7 +1319,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         // 必须按槽位单独看成"一个材质球"，并且**不能**把数组换成单材质（否则整块模型只剩一个材质）。
         obj.traverse((o: any) => {
           if (o.isMesh) {
-            if (o.material) o.material = normMat(o.material);
+            if (o.material && !isUsd) o.material = normMat(o.material);
             const orig = o.material;
             const first = Array.isArray(orig) ? orig[0] : orig;
             // 只要网格自带材质就保留它（哪怕这个材质暂时没有贴图）：
@@ -1325,7 +1344,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               });
             } else {
               collected.push({
-                mesh: o, key: baseKey(orig), kept: !!(first.map || first.emissiveMap),
+                mesh: o, key: baseKey(orig), kept: isUsd || !!(first.map || first.emissiveMap),
                 matName: slotName(first, 0),
                 ownMat: orig, slot: 0
               });
@@ -1445,7 +1464,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
             return sum / n > 20;
           } catch { return true; }
         };
-        for (const [, list] of gmap) {
+        for (const [, list] of (isUsd ? [] : gmap)) {
           let maxU = 0, maxV = 0;
           for (const c of list) {
             const attr = c.mesh.geometry?.attributes?.uv;
@@ -1626,7 +1645,23 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           const idm = String(src || '').match(/\/api\/file\/(\d+)/);
           const id = idm ? Number(idm[1]) : 0;
           const f = id ? asset.files.find(x => x.id === id) : undefined;
-          return { src, id, name: f ? String(f.rel_path).split('/').pop()! : fileNameOf(src), rel: f ? String(f.rel_path) : '' };
+          if (f) return { src, id, name: String(f.rel_path).split('/').pop()!, rel: String(f.rel_path) };
+          // USD 的贴图走 /api/assetsrc/<assetId>/<素材内相对路径>：反查回文件行，
+          // 右侧贴图面板才能显示文件名，也才能配合「行内替换贴图」写回素材目录
+          const mAs = String(src || '').match(/\/api\/assetsrc\/\d+\/([^?#]+)$/);
+          if (mAs) {
+            let r = mAs[1];
+            try { r = decodeURIComponent(r); } catch { /* keep */ }
+            r = r.replace(/\\/g, '/');
+            const full = `${String((asset as any).rel_dir || '')}/${r}`.replace(/\/{2,}/g, '/');
+            const hit = asset.files.find(x => String(x.rel_path).toLowerCase() === full.toLowerCase());
+            return {
+              src, id: hit ? hit.id : 0,
+              name: String(r).split('/').pop()!,
+              rel: hit ? String(hit.rel_path) : full
+            };
+          }
+          return { src, id: 0, name: fileNameOf(src), rel: '' };
         };
         const groupTex = gs.map(g => {
           const mm: any = matOf(g.meshes[0]);
@@ -1653,6 +1688,64 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         });
         api.current.groupTex = groupTex;
         setGroupTex(groupTex);
+        // 左上角信息层：面数 / 顶点 / 网格 / 材质 / 贴图 / 尺寸（尺寸是缩放前的原始包围盒）
+        try {
+          let tris = 0, rawVerts = 0, meshCount = 0, missing = 0;
+          const geoms = new Set<string>();
+          const texSet = new Set<string>();
+          const vertKeys = new Set<string>();     // 去重后的真实顶点（USD 的网格是不索引的，3 顶点/面）
+          let dedupeOk = true;
+          obj.traverse((o: any) => {
+            if (!o.isMesh) return;
+            meshCount++;
+            const g = o.geometry;
+            if (g) {
+              const n = g.index ? g.index.count : (g.attributes?.position?.count || 0);
+              tris += Math.floor(n / 3);
+              if (!geoms.has(g.uuid)) {
+                geoms.add(g.uuid);
+                const pos = g.attributes?.position;
+                const pn = pos?.count || 0;
+                rawVerts += pn;
+                if (pos && pn <= 600000) {
+                  for (let i = 0; i < pn; i++) {
+                    vertKeys.add(`${pos.getX(i).toFixed(4)},${pos.getY(i).toFixed(4)},${pos.getZ(i).toFixed(4)}`);
+                  }
+                } else if (pn > 600000) {
+                  dedupeOk = false;             // 太大：去重会拖慢打开速度，直接报缓冲里的顶点数
+                }
+              }
+            }
+            for (const mm of (Array.isArray(o.material) ? o.material : [o.material])) {
+              if (!mm) continue;
+              for (const key of TEX_MAPS) {
+                const t: any = (mm as any)[key];
+                if (!t) continue;
+                if (!t.image) { missing++; continue; }
+                texSet.add(String(t.image.src || t.uuid));
+              }
+            }
+          });
+          const verts = dedupeOk ? vertKeys.size : rawVerts;
+          const nf = (v: number) => v.toLocaleString('zh-CN');
+          const usdStats: any = (globalThis as any).__AMUSD;
+          // 尺寸统一显示为「米」：FBX 按 UnitScaleFactor 折算（1 单位 = factor 厘米，默认 1）；
+          // glTF/GLB 规范就是米；USD 组合时已经乘过 metersPerUnit；OBJ 无单位信息，按米处理。
+          const rawUnit = Number((obj as any).userData?.unitScaleFactor);
+          const toMeters = (mext === '.fbx' && Number.isFinite(rawUnit) && rawUnit > 0) ? rawUnit / 100 : 1;
+          const fmtM = (v: number) => (v >= 1 ? v.toFixed(2) : v >= 0.01 ? v.toFixed(3) : v.toFixed(4));
+          const mSize = [size.x * toMeters, size.y * toMeters, size.z * toMeters];
+          const lines = [
+            `面 ${nf(tris)} · 顶点 ${nf(verts)}`,
+            `网格 ${nf(meshCount)} · 材质 ${nf(gs.length)}${texSet.size ? ` · 贴图 ${nf(texSet.size)}` : ''}`,
+            `尺寸 ${mSize.map(fmtM).join(' × ')} 米`
+          ];
+          if (missing) lines.push(`⚠ ${missing} 张贴图未加载`);
+          else if (usdStats && Array.isArray(usdStats.missingTextures) && usdStats.missingTextures.length) {
+            lines.push(`⚠ ${usdStats.missingTextures.length} 张贴图未加载`);
+          }
+          setMeshInfo(lines);
+        } catch { /* 统计失败不影响预览 */ }
         const tset = new Set<string>();
         for (const c of collected) {
           const attr = c.mesh.geometry?.attributes?.uv;
@@ -2155,6 +2248,13 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           <div className="vx-3d" ref={stageRef} style={{ flexBasis: uvMode ? `${split}%` : '100%' }}>
             {status && <div className="vloading">{status}</div>}
             {error && <div className="verror">{error}</div>}
+            {meshInfo.length > 0 && (
+              <div className="vx-info">
+                {meshInfo.map((line, i) => (
+                  <div key={i} className={line.startsWith('⚠') ? 'warn' : undefined}>{line}</div>
+                ))}
+              </div>
+            )}
           </div>
           {uvMode && <>
             <div className="vx-split" onPointerDown={startSplit} />

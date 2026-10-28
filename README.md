@@ -19,14 +19,21 @@
 ## 功能
 
 ### 索引与浏览
-- **本地索引**：扫描素材库目录，识别材质（`.mtlx` / 贴图文件夹）、模型（FBX/OBJ/GLB）、贴图、CAD 图纸、HDRI、IES；写入本地 SQLite。
+- **本地索引**：扫描素材库目录，识别材质（`.mtlx` / 贴图文件夹）、模型（FBX/OBJ/GLB/**USD**）、贴图、CAD 图纸、HDRI、IES；写入本地 SQLite。
 - **按文件后缀分类**：模型就是模型（场景也归模型），筛选不会因为目录名“看起来像场景”而串类型。
 - **增量重扫**：外部增删文件后自动重扫，素材/文件 id 保持稳定，不会出现“预览图消失 / 3D 预览变成别的模型”。
 - **筛选与整理**：类型 / 格式 / 评分 / 收藏 / 标签 / 搜索 / 排除项；分页可直接输入页码跳转。
+  过滤条上**左键**类型（模型/材质/贴图…）= 隐藏/显示该类型，**Alt+左键** = 只显示该类型；
+  **右键**类型弹出格式清单（FBX / USD / PNG…）逐项勾选隐藏，清单里**Alt+左键** = 只看这一种格式。
 - **库维护**：库体检、问题素材标记与忽略、整理（规范化目录，只作用于当前目录子树）、补缩略图。
 
 ### 预览
 - **模型**：PBR 贴图、通道预览（白膜 / 法线 / 粗糙 / 金属 / AO / 颜色 / 自发光 / 棋盘格）、线框、UV 分屏、多材质与 UDIM、HDRI 照明、主光球。
+  左上角常显模型信息（无底色文字层）：面数 / 顶点数 / 网格数 / 材质数 / 贴图数 / 原始包围盒尺寸（**单位：米**，
+  FBX 按 UnitScaleFactor 折算，glTF/GLB 与 USD 本身即米），贴图缺失会单独标红提示。
+- **USD**（`.usd` / `.usda` / `.usdc` / `.usdz`）：自带组合加载器，认 references / payload / over 图元 / 变体，
+  跨层引用与 `../Textures` 外部贴图都能取；材质按 prim 绑定（多材质 GeomSubset 按槽位），ORM 打包图自动拆 R/G/B，
+  `UsdTransform2d` 的平铺与法线强度按文件原样。Omniverse / Isaac Sim 导出的 payloads 结构资产实测可用。
   TIF/TGA 贴图会先解码成 PNG 再上材质；ASCII FBX 会给中文提示（不自动转换）。
 - **材质组装器**：通道拼装、打包图取通道（RGB / R / G / B / A）、整体 UV（平铺 / 旋转 / 位移）、强度（负数反相）、HSL、法线 GL/DX、贴图导出与 `.mtlx` 导出。
 - **HDRI**：全景预览、亮度/旋转、作为环境照明。
@@ -82,6 +89,7 @@
 - Electron 35（`frame: false` 自绘标题栏）+ React 18 + TypeScript
 - Vite 6 构建渲染层，esbuild 打包本地 HTTP 服务（Electron 以 `ELECTRON_RUN_AS_NODE=1` 拉起）
 - three.js r186：PBR、PMREM、HDRI/EXR、IES 逐像素配光、UV/通道预览、FBX→GLB 转换
+- USD 解析：`app/src/renderer/usd/`（three 的 usda/usdc 解析器 + 组合器的补丁版，见 `devtest/usd/make-vendor.mjs`）
 - `node:sqlite`（Node 22 内置 `DatabaseSync`）保存索引，无需额外数据库
 - 桥接：本地 HTTP 队列 + 文件路径传递（大文件不走 HTTP），只监听 `127.0.0.1`
 
@@ -97,6 +105,7 @@
 | `app/src/core/scan.ts` | 目录分类、素材集识别、预览匹配（优先同名） |
 | `app/src/renderer/App.tsx` | 主界面：网格/详情/标签/设置/右键/插件面板/发送到 DCC |
 | `app/src/renderer/Viewer.tsx` | 模型、HDRI、IES 灯光预览器（通道预览、UV、逐像素配光） |
+| `app/src/renderer/usd/` | USD 组合加载器：`usdload.ts` + 打过补丁的 `USDAParser` / `USDCParser` / `USDComposer` |
 | `app/src/renderer/Assembler.tsx` | 材质组装器：混合贴图、UV、强度/HSL、自定义基本体、导出 |
 | `app/src/renderer/matlib.ts` | 材质构建、通道 patch、强度/HSL |
 | `app/src/renderer/geometries.ts` | 程序化几何 + 自定义基本体 UV 重算 |

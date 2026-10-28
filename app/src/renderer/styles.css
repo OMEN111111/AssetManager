@@ -317,6 +317,9 @@ html[data-theme="light"] ::-webkit-scrollbar-thumb{background:rgba(0,0,0,.18);ba
 .em-row:hover{background:var(--surface-2);color:var(--text)}
 .em-row input{accent-color:var(--accent)}
 .em-n{margin-left:auto;color:var(--text-faint);font-size:10.5px}
+/* 隐藏中的格式：整行压暗（Alt+左键 = 只看这一种） */
+.em-row.off{opacity:.45}
+.em-hint{float:right;color:var(--text-faint);opacity:.75;margin-left:8px}
 
 /* ===== frameless titlebar ===== */
 .titlebar{height:32px;flex:none;display:flex;align-items:center;gap:4px;padding:0 6px 0 10px;
@@ -393,6 +396,12 @@ html[data-theme="light"] ::-webkit-scrollbar-thumb{background:rgba(0,0,0,.18);ba
 .vx-stage{flex:1;display:flex;min-width:0;position:relative}
 .vx-3d{position:relative;min-width:0;display:flex;flex-direction:column;flex-grow:1}
 .vx-3d canvas{display:block;width:100%;height:100%}
+/* 预览器左上角无底色信息层：面数/顶点/网格/材质/贴图/尺寸（只是文字，不吃鼠标事件） */
+.vx-info{position:absolute;left:14px;top:12px;z-index:3;pointer-events:none;
+  font:11.5px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.2px;
+  color:rgba(255,255,255,.78);white-space:nowrap;
+  text-shadow:0 1px 2px rgba(0,0,0,.65),0 0 10px rgba(0,0,0,.45)}
+.vx-info .warn{color:#fca5a5}
 .vx-split{width:6px;cursor:col-resize;background:rgba(255,255,255,.05);flex:none;position:relative}
 .vx-split::after{content:'';position:absolute;top:0;bottom:0;left:2px;right:2px;background:rgba(255,255,255,.12)}
 .vx-split:hover::after{background:rgba(76,141,255,.5)}

@@ -187,7 +187,7 @@ function mapsBySlot(spec: MaterialSpec): Record<string, string[]> {
 function modelFile(bundle: AssetBundle): FileRow | null {
   const models = bundle.files.filter(f => f.role === 'model' || f.role === 'main');
   if (!models.length) {
-    const byExt = bundle.files.find(f => /\.(fbx|obj|glb|gltf|stl|3ds|abc|usdz|blend|max)$/i.test(f.rel_path));
+    const byExt = bundle.files.find(f => /\.(fbx|obj|glb|gltf|stl|3ds|abc|usdz|usd|usda|usdc|blend|max)$/i.test(f.rel_path));
     return byExt || null;
   }
   // 多 LOD / 多尺寸：优先 slot 01
@@ -228,6 +228,9 @@ export function buildPayload(db: DB, assetId: number, mode: string, modelOverrid
     if (!m && !override) return { error: '该素材没有可导入的模型文件' as const };
     // 软件临时导出的 GLB（FBX/OBJ 等 SketchUp 读不了的格式）直接用它
     const path2 = override || abs(bundle.root, m!.rel_path);
+    // USD 自带材质与贴图（按 prim 绑定，还可能是跨层引用），DCC 直接导入就是对的；
+    // 这时候再让插件拿「按文件名匹配」的材质去覆盖，反而会把材质串掉 —— 所以不带 material。
+    const isUsd = /\.(usd|usda|usdc|usdz)$/i.test(path2);
     // 导入类型（只有 UE 用得到）：静态网格体 / 骨骼网格体 / 物理资产，默认只静态
     const io = options?.importOptions || {};
     return {
@@ -238,8 +241,8 @@ export function buildPayload(db: DB, assetId: number, mode: string, modelOverrid
         sourceDir,
         modelPath: path2,
         ext: path.extname(path2).toLowerCase(),
-        material: spec,
-        maps: mapsBySlot(spec),
+        material: isUsd ? null : spec,
+        maps: isUsd ? {} : mapsBySlot(spec),
         converted: !!override,
         importOptions: {
           staticMesh: io.staticMesh !== false,
