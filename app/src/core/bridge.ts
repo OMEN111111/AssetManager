@@ -327,6 +327,25 @@ export const SU_IMPORT_EXT = [
 export const SU_CONVERTIBLE_EXT = ['.fbx', '.obj', '.ply'];
 
 /**
+ * 在线的 SketchUp 客户端能不能吃 GLB：
+ * 2024 起才带 glbimporter.dll，2022 / 2023 没有（插件心跳里报 `glb`，没有就按版本号推断）。
+ * 拿不到客户端信息时按「支持」处理，别把正常流程挡住。
+ */
+export function suClientSupportsGlb(db: DB): boolean {
+  try {
+    const row = db.prepare('SELECT info FROM bridge_clients WHERE target=?').get('su') as any;
+    if (!row || !row.info) return true;
+    const info = JSON.parse(String(row.info));
+    if (typeof info.glb === 'boolean') return info.glb;
+    const major = parseInt(String(info.sketchup || '').split('.')[0], 10);
+    if (Number.isFinite(major) && major > 0) return major >= 24;
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * 发给 SketchUp 导入前要不要先转 GLB：
  *   null                       → 不用转（SketchUp 自己能读）
  *   { convertible: false }     → 转不了（比如 .blend/.max），得给用户说清楚
@@ -530,8 +549,7 @@ export function finishJob(db: DB, target: string, id: number, ok: boolean, messa
   return { ok: true, id, status: ok ? 'done' : 'failed' };
 }
 
-export function heartbeat(db: DB, target: string, version?: string, host?: string, info?: any) {
-  const now = Date.now();
+export function heartbeat(db: DB, target: string, version?: string, host?: string, info?: any) {  const now = Date.now();
   db.prepare(`INSERT INTO bridge_clients(target,last_seen,version,host,info) VALUES(?,?,?,?,?)
     ON CONFLICT(target) DO UPDATE SET last_seen=excluded.last_seen, version=excluded.version,
       host=excluded.host, info=excluded.info`)

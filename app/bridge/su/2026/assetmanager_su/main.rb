@@ -35,8 +35,103 @@ module AssetManager
     SERIES  = (defined?(AssetManager::AM_SERIES) ? AssetManager::AM_SERIES : '2026').dup.freeze
     SU_VERSION = Sketchup.version.to_s
 
-    # SketchUp 2026 自带的导入器（见安装目录 Importers/*.dll）；FBX/OBJ 不在其中
-    SUPPORTED_IMPORT = %w[.skp .skp .dae .dwg .dxf .3ds .glb .gltf .stl .ifc .kmz .usdz .trb].uniq.freeze
+    # ---------------------------------------------------------------- 各版本能力探测
+    # SketchUp 2022 / 2023 / 2024 没有 PBR 材质槽，也没有「环境」（environments）；
+    # 2025 起才有。2022 / 2023 还缺 GLB / GLTF / TRB / USDZ 导入器。
+    # 各系列共用同一份实现，差异全部在这里按「有没有这个方法 / 有没有这个导入器」判断。
+    #
+    # **必须在主线程探测并缓存**：心跳在后台线程里发，而 `Sketchup.active_model` /
+    # `Sketchup.find_support_file` 都是 SketchUp API，后台线程调用会抛异常
+    # （2024 / 2025 实测：心跳永远发不出去 → 界面「刚连上几秒就断开」）。
+    # 现在 `detect_caps!` 只在主线程（pump_once / 面板）里调，心跳只读 `caps` 里的缓存。
+    IMPORT_EXT_BY_DLL = {
+      '.skp' => nil, '.dae' => 'daeimporter', '.dwg' => 'dwgimporter', '.dxf' => 'dwgimporter',
+      '.3ds' => '3dsimporter', '.ifc' => 'ifcimporter', '.kmz' => 'kmzimporter',
+      '.stl' => 'stlimporter', '.glb' => 'glbimporter', '.gltf' => 'glbimporter',
+      '.usdz' => 'usdzimporter', '.trb' => 'trbimporter'
+    }.freeze
+
+    SUPPORTED_IMPORT = %w[.skp .dae .dwg .dxf .3ds .glb .gltf .stl .ifc .kmz .usdz .trb].freeze
+
+    # 兜底：还没探测过时按「保守」报（不调任何 SketchUp API，任何线程都安全）
+    CAPS_FALLBACK = { pbr: false, env: false, glb: false, import: SUPPORTED_IMPORT, importers_dir: nil }.freeze
+
+    # 主线程用：能力缓存过期（没算过 / 换了模型）就重探一次
+    def self.ensure_caps!
+      model = begin
+        Sketchup.active_model
+      rescue StandardError
+        nil
+      end
+      key = model ? model.object_id : nil
+      return if @caps && @caps_key == key
+      @caps_key = key
+      detect_caps!
+    end
+
+    def self.caps
+      @caps || CAPS_FALLBACK
+    end
+
+    def self.pbr?
+      caps[:pbr]
+    end
+
+    def self.env?
+      caps[:env]
+    end
+
+    def self.importers_dir
+      caps[:importers_dir]
+    end
+
+    def self.importer_present?(dll)
+      return true if dll.nil?
+      dir = caps[:importers_dir]
+      return true if dir.nil? # 探不到安装目录就按支持处理，别把能用的格式藏起来
+      File.exist?(File.join(dir, "#{dll}.dll")) || File.exist?(File.join(dir, "#{dll}.so"))
+    end
+
+    # 本版本实际能吃哪些扩展名
+    def self.supported_import_exts
+      caps[:import]
+    end
+
+    # **只在主线程调用**（pump_once / 面板 / 菜单）。探测结果缓存进 @caps。
+    def self.detect_caps!
+      dir = begin
+        d = Sketchup.find_support_file('Importers')
+        (d.is_a?(String) && File.directory?(d)) ? d : nil
+      rescue StandardError
+        nil
+      end
+      model = begin
+        Sketchup.active_model
+      rescue StandardError
+        nil
+      end
+      exts = IMPORT_EXT_BY_DLL.select do |_ext, dll|
+        dll.nil? || dir.nil? ||
+          File.exist?(File.join(dir, "#{dll}.dll")) || File.exist?(File.join(dir, "#{dll}.so"))
+      end.keys.freeze
+      @caps = {
+        pbr: begin
+          Sketchup::Material.instance_methods.include?(:metallic_texture=)
+        rescue StandardError
+          false
+        end,
+        env: begin
+          model ? model.respond_to?(:environments) : false
+        rescue StandardError
+          false
+        end,
+        glb: !dir.nil? && File.exist?(File.join(dir, 'glbimporter.dll')),
+        import: exts,
+        importers_dir: dir
+      }.freeze
+    rescue StandardError
+      @caps = CAPS_FALLBACK
+    end
     TEXTURE_EXT = %w[.png .jpg .jpeg .bmp .tif .tiff .psd].freeze
     HDR_EXT = %w[.hdr .exr].freeze
     MAP_MAX_PX = 1024 # 通道抽取时的最大边长（越大越慢，1024 够用）
@@ -49,7 +144,7 @@ module AssetManager
 
     @state = {
       connected: false, port: DEFAULT_PORT, last: '', job: '', error: '',
-      events: [], thread: nil, stop: false, dialog: nil, enabled: true
+      events: [], thread: nil, stop: false, dialog: nil, enabled: true, last_hb_at: 0.0
     }
     @jobs = Queue.new
     @timer_on = false
@@ -64,6 +159,16 @@ module AssetManager
         st << { at: Time.now.strftime('%H:%M:%S'), text: text.to_s[0, 180], kind: kind.to_s }
         st.shift while st.length > 8
         puts "[AssetManager] #{text}"
+        # 排查用：设环境变量 AM_SU_LOG=1 后把事件写进 %TEMP%\am-su-debug.log
+        if ENV['AM_SU_LOG'].to_s != ''
+          begin
+            File.open(File.join(ENV['TEMP'] || '.', 'am-su-debug.log'), 'a') do |f|
+              f.write("#{Time.now.strftime('%H:%M:%S')} [#{Thread.current.object_id}] #{kind}: #{text}\n")
+            end
+          rescue StandardError
+            nil
+          end
+        end
       rescue StandardError
         nil
       end
@@ -89,6 +194,48 @@ module AssetManager
         body.empty? ? nil : JSON.parse(body)
       end
 
+      # 心跳内容（后台线程与主线程共用；只读 caps 缓存，不调 SketchUp API）
+      def heartbeat_body
+        {
+          'version' => VERSION,
+          'plugin' => VERSION,
+          'series' => SERIES,
+          'sketchup' => SU_VERSION,
+          'host' => ENV['COMPUTERNAME'].to_s,
+          'info' => { 'plugin' => VERSION, 'series' => SERIES, 'sketchup' => SU_VERSION,
+                      'pbr' => pbr?, 'env' => env?, 'glb' => importer_present?('glbimporter'),
+                      'import' => supported_import_exts }
+        }
+      end
+
+      # 主线程兜底心跳
+      #
+      # SketchUp 2024 / 2025 上后台线程会被严重节流（实测心跳 30–40 秒才轮到一次，
+      # 服务端 15 秒就判离线 → 界面「刚连上几秒就断开」）。主线程的 UI.start_timer 不受影响，
+      # 所以在这里按需补发一次心跳；后台线程正常时它什么都不做。
+      def main_heartbeat_if_stale
+        port = @state[:port].to_i
+        return if port <= 0
+        return if @state[:stop] # 用户点了「暂停」就不再发心跳
+        return if Time.now.to_f - @state[:last_hb_at].to_f < 6.0
+        begin
+          http(port, "/api/bridge/#{TARGET}/heartbeat", heartbeat_body, 1.5)
+          @state[:last_hb_at] = Time.now.to_f
+          unless @state[:connected]
+            @state[:connected] = true
+            @state[:error] = ''
+            event("已连接 AssetManager（端口 #{port}）", :ok)
+          end
+        rescue StandardError => e
+          # 先记时间再报错：否则主线程每 0.3 秒重试一次，界面会一直卡在 1.5 秒超时上
+          @state[:last_hb_at] = Time.now.to_f
+          if @state[:connected]
+            @state[:connected] = false
+            @state[:error] = e.message.to_s
+            event("与 AssetManager 断开：#{e.message}", :err)
+          end
+        end
+      end
       def locator_port
         base = ENV['LOCALAPPDATA'] || Dir.home
         path = File.join(base, 'AssetManager', 'bridge.json')
@@ -142,18 +289,12 @@ module AssetManager
           port = @state[:port]
           if Time.now.to_f - last_hb > HEARTBEAT_INTERVAL
             begin
-              http(port, "/api/bridge/#{TARGET}/heartbeat", {
-                     'version' => VERSION,
-                     'plugin' => VERSION,
-                     'series' => SERIES,
-                     'sketchup' => SU_VERSION,
-                     'host' => ENV['COMPUTERNAME'].to_s,
-                     'info' => { 'plugin' => VERSION, 'series' => SERIES, 'sketchup' => SU_VERSION }
-                   })
+              http(port, "/api/bridge/#{TARGET}/heartbeat", heartbeat_body)
               event("已连接 AssetManager（端口 #{port}）", :ok) unless @state[:connected]
               @state[:connected] = true
               @state[:error] = ''
               last_hb = Time.now.to_f
+              @state[:last_hb_at] = last_hb
             rescue StandardError => e
               event("与 AssetManager 断开：#{e.message}", :err) if @state[:connected]
               @state[:connected] = false
@@ -189,6 +330,16 @@ module AssetManager
         end
       rescue StandardError => e
         event("取任务线程异常：#{e.class}: #{e.message}", :err)
+        if ENV['AM_SU_LOG'].to_s != ''
+          begin
+            File.open(File.join(ENV['TEMP'] || '.', 'am-su-debug.log'), 'a') do |f|
+              f.write("#{Time.now.strftime('%H:%M:%S')} WORKER DEAD #{e.class}: #{e.message}\n")
+              Array(e.backtrace).first(12).each { |l| f.write("    #{l}\n") }
+            end
+          rescue StandardError
+            nil
+          end
+        end
       end
 
       def start_loop
@@ -234,6 +385,8 @@ module AssetManager
       end
 
       def pump
+        ensure_caps!        # 主线程探测能力（换了模型时重探，比如新开/切换文档后 environments 才有）
+        main_heartbeat_if_stale # 后台线程被节流时由主线程补心跳（2024/2025 必需）
         loop do
           job = begin
             @jobs.pop(true)
@@ -315,10 +468,17 @@ module AssetManager
         raise "找不到模型文件：#{path}" unless File.exist?(path)
 
         ext = File.extname(path).downcase
-        unless SUPPORTED_IMPORT.include?(ext)
-          raise "SketchUp #{SU_VERSION} 不支持 #{ext.delete('.')} 导入（它自带：#{SUPPORTED_IMPORT.map { |e| e.delete('.') }.join('/')}）。" \
-                'FBX/OBJ 不是 SketchUp 能直接读的格式：请发 GLB/DAE/STL 版本的模型，' \
-                '或者先用 Blender / 3ds Max 桥接打开再另存。'
+        exts = supported_import_exts
+        unless exts.include?(ext)
+          hint = if %w[.glb .gltf].include?(ext) && importer_present?('glbimporter') == false
+                   "SketchUp #{SU_VERSION} 没有 GLB/GLTF 导入器（2024 起才有）：请把素材换成 DAE/STL/SKP 版本，" \
+                   '或升级到 SketchUp 2024 及以上再发送。'
+                 else
+                   'FBX/OBJ 不是 SketchUp 能直接读的格式：请发 GLB/DAE/STL 版本的模型，' \
+                   '或者先用 Blender / 3ds Max 桥接打开再另存。'
+                 end
+          raise "SketchUp #{SU_VERSION} 不支持 #{ext.delete('.')} 导入" \
+                "（本版本自带：#{exts.map { |e| e.delete('.') }.join('/')}）。#{hint}"
         end
 
         name = (payload['name'] || File.basename(path, ext)).to_s
@@ -389,18 +549,32 @@ module AssetManager
             end
           end
           n = added.size.to_i
+          # 一个对象都没进来就是失败（以前一律报成功，DAE 空导入会被当成"还在后台完成"骗过去）
           msg = if n.zero?
-                  "已导入 #{name}（#{ext}，SketchUp 还在后台完成，稍后看视口 · #{secs}s）"
+                  "SketchUp 没有导入任何对象（#{ext}）：#{import_hint(ext)}"
                 else
                   "已导入 #{name}（#{n} 个对象 · #{secs}s）"
                 end
           msg += '，无材质的面已套用素材的基础色贴图' if textured
-          report(job, true, msg)
+          report(job, n.positive?, msg)
           refresh_dialog if @state[:dialog]
         rescue StandardError => e
           report(job, false, "导入收尾失败：#{e.message}")
         end
         UI.start_timer(0.4, false) { tick.call }
+      end
+
+      # 导入失败/空导入时给用户看的原因与下一步
+      def import_hint(ext)
+        case ext.to_s.downcase
+        when '.dae'
+          '本机 SketchUp 的 DAE 导入器不稳定（实测 2022 连它自己导出的 DAE 都会空导入或崩溃）。' \
+          '请改用 STL / SKP 版本的素材，或升级到 SketchUp 2024 及以上（那边走 GLB，实测正常）。'
+        when '.glb', '.gltf'
+          'GLB 文件可能损坏，或 SketchUp 导入器中途失败；可先在本机用其他软件打开确认文件完好。'
+        else
+          '文件可能损坏，或格式版本高于当前 SketchUp 能读的范围。'
+        end
       end
 
       def new_since(model, before)
@@ -501,38 +675,48 @@ module AssetManager
           p = prepare_map(e, notes, 'baseColor')
           mat.texture = p if p
         end
-        # 法线：normal_style 决定 GL/DX（SketchUp 默认 DIRECTX）
-        if (e = maps['normal'])
-          p = prepare_map(e, notes, 'normal')
-          if p
-            mat.normal_texture = p
-            mat.normal_style = (e['normalSpace'].to_s == 'gl' ? Sketchup::Material::NORMAL_STYLE_OPENGL : Sketchup::Material::NORMAL_STYLE_DIRECTX)
-            s = (e['intensity'] || 1).to_f
-            mat.normal_scale = (s.zero? ? 1.0 : s) rescue nil
+        # PBR 槽（法线 / 粗糙度 / 金属度 / AO）只有 SketchUp 2025 起才有；
+        # 2022–2024 只套基础色，其余通道在结果里说清楚
+        if pbr?
+          # 法线：normal_style 决定 GL/DX（SketchUp 默认 DIRECTX）
+          if (e = maps['normal'])
+            p = prepare_map(e, notes, 'normal')
+            if p
+              mat.normal_texture = p
+              mat.normal_style = (e['normalSpace'].to_s == 'gl' ? Sketchup::Material::NORMAL_STYLE_OPENGL : Sketchup::Material::NORMAL_STYLE_DIRECTX)
+              s = (e['intensity'] || 1).to_f
+              mat.normal_scale = (s.zero? ? 1.0 : s) rescue nil
+            end
           end
-        end
-        # 粗糙度 / 金属度 / AO：单通道贴图，通道抽取后塞进 SketchUp 的原生 PBR 槽
-        if (e = maps['roughness'])
-          p = prepare_map(e, notes, 'roughness')
-          if p
-            mat.roughness_texture = p
-            k = (e['intensity'] || 1).to_f
-            mat.roughness_factor = (k > 1.0 ? 1.0 : k) rescue nil
+          # 粗糙度 / 金属度 / AO：单通道贴图，通道抽取后塞进 SketchUp 的原生 PBR 槽
+          if (e = maps['roughness'])
+            p = prepare_map(e, notes, 'roughness')
+            if p
+              mat.roughness_texture = p
+              k = (e['intensity'] || 1).to_f
+              mat.roughness_factor = (k > 1.0 ? 1.0 : k) rescue nil
+            end
           end
-        end
-        if (e = maps['metallic'])
-          p = prepare_map(e, notes, 'metallic')
-          if p
-            mat.metallic_texture = p
-            k = (e['intensity'] || 1).to_f
-            mat.metallic_factor = (k > 1.0 ? 1.0 : k) rescue nil
+          if (e = maps['metallic'])
+            p = prepare_map(e, notes, 'metallic')
+            if p
+              mat.metallic_texture = p
+              k = (e['intensity'] || 1).to_f
+              mat.metallic_factor = (k > 1.0 ? 1.0 : k) rescue nil
+            end
           end
-        end
-        if (e = maps['ao'])
-          p = prepare_map(e, notes, 'ao')
-          if p
-            mat.ao_texture = p
-            mat.ao_strength = (e['intensity'] || 1).to_f rescue nil
+          if (e = maps['ao'])
+            p = prepare_map(e, notes, 'ao')
+            if p
+              mat.ao_texture = p
+              mat.ao_strength = (e['intensity'] || 1).to_f rescue nil
+            end
+          end
+        else
+          dropped = %w[normal roughness metallic ao].select { |k| maps[k] }
+          unless dropped.empty?
+            notes << "本版本 SketchUp（#{SU_VERSION}）没有 PBR 材质槽，" \
+                     "#{dropped.map { |k| MAP_LABEL[k] || k }.join('/')} 未套用（需要 2025 及以上）"
           end
         end
         # SketchUp 材质没有的槽：只提示，不假装做了
@@ -694,9 +878,14 @@ module AssetManager
       def apply_hdri(payload)
         model = Sketchup.active_model
         raise '没有打开的 SketchUp 模型' unless model
+        unless env?
+          raise "SketchUp #{SU_VERSION} 没有「环境」（environments），不能应用 HDRI —— " \
+                '这个功能需要 SketchUp 2025 及以上。当前版本可继续用模型 / 材质 / 贴图。'
+        end
         files = Array(payload['files']).map(&:to_s)
         hdr = files.find { |f| HDR_EXT.include?(File.extname(f).downcase) && File.exist?(f) }
         raise 'SketchUp 的环境只认 .hdr / .exr，这个素材里没有' unless hdr
+        name = (payload['name'] || File.basename(hdr, File.extname(hdr))).to_s
 
         envs = model.environments
         # environments.add 每次都新建一个（同一个文件会堆出好几份），先按文件名找现成的复用
@@ -710,12 +899,18 @@ module AssetManager
         env = existing
         unless env
           env = begin
+            # 参数形式各版本不同：2026/2027 是 add(path)；2025 是 add(name, path)
             envs.add(hdr)
+          rescue ArgumentError
+            begin
+              envs.add(name, hdr)
+            rescue StandardError => e
+              raise "HDRI 载入失败：#{e.message}（SketchUp 环境只认 HDR/EXR）"
+            end
           rescue StandardError => e
             raise "HDRI 载入失败：#{e.message}（SketchUp 环境只认 HDR/EXR）"
           end
         end
-        name = (payload['name'] || File.basename(hdr, File.extname(hdr))).to_s
         begin
           env.name = name
         rescue StandardError
@@ -740,6 +935,7 @@ module AssetManager
           version: VERSION, series: SERIES, sketchup: SU_VERSION,
           connected: @state[:connected], port: @state[:port], error: @state[:error],
           job: @state[:job], last: @state[:last],
+          pbr: pbr?, env: env?, import: supported_import_exts,
           queued: begin
             @jobs.size
           rescue StandardError
@@ -747,6 +943,14 @@ module AssetManager
           end,
           events: @state[:events].last(6).reverse
         }
+      end
+
+      # 一行能力说明（面板 / 关于对话框共用）
+      def capability_summary
+        parts = ['模型导入', '贴图']
+        parts << (pbr? ? 'PBR 材质' : '基础色材质')
+        parts << (env? ? 'HDRI 环境' : 'HDRI（需 2025+）')
+        parts.join(' / ')
       end
 
       def show_dialog
@@ -870,7 +1074,7 @@ module AssetManager
           </div>
 
           <div class="hint">素材在 AssetManager 里右键「→ 发送到…」→ SketchUp：<br>
-            模型导入 / 材质重建（含 PBR 通道）/ 贴图 / HDRI 环境。</div>
+            #{capability_summary}。</div>
 
           <script>
             function amCmd(c){ if (window.sketchup && window.sketchup.am_cmd) window.sketchup.am_cmd(c); }
@@ -954,12 +1158,13 @@ module AssetManager
         menu.add_separator
         menu.add_item("插件 v#{VERSION} · SketchUp #{SERIES} 系列") do
           UI.messagebox("AssetManager 桥接插件\n\n版本：#{VERSION}\n系列：SketchUp #{SERIES}（当前 #{SU_VERSION}）\n" \
-                        "支持：模型导入 / 材质重建 / 贴图 / HDRI 环境\n端口：#{@state[:port]}（自动跟随软件）")
+                        "支持：#{capability_summary}\n端口：#{@state[:port]}（自动跟随软件）")
         end
       end
 
       def boot
         return unless @state[:enabled]
+        ensure_caps! # 先在主线程把能力算好，后台线程的心跳只读缓存
         port = detect_port
         @state[:port] = port if port
         start_loop

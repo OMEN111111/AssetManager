@@ -6,12 +6,35 @@
 
 ```
 bridge/su/
-  2026/                          SketchUp 2026（26.x）✅ 本机真机实测（插件 0.1.1）
-    assetmanager_su.rb           加载器（注册扩展 + 读版本号）
-    assetmanager_su/main.rb      实现主体（协议 / 导入 / 材质 / 贴图 / HDRI / 面板）
+  2024/ 2025/ 2026/ 2027/   每个 SketchUp 年份一个系列（插件 0.1.3）
+    assetmanager_su.rb           加载器（注册扩展 + 读版本号 + AM_SERIES）
+    assetmanager_su/main.rb      实现主体（各系列内容一致，能力按版本自适应）
   tools/
-    test_su.rb                   在 SketchUp 里跑的集成测试（见下）
+    test_su.rb                   在 SketchUp 里跑的集成测试（37 / 45 项，见下）
+    sync-su-bridge.mjs           系列同步（2026 是 canonical；--check 只检查；--new 2028 新建系列）
 ```
+
+`2026/` 是 **canonical**：改插件只改它，然后 `node tools/sync-su-bridge.mjs` 同步到其余系列
+（各系列的加载器保留自己的 `AM_SERIES`，只有 `main.rb` 被同步）。
+
+## 各版本能力差异（同一份实现，运行时探测）
+
+| SketchUp | Ruby | PBR 材质槽 | HDRI 环境 | GLB / GLTF 导入 | 断言 |
+|---|---|---|---|---|---|
+| 2024 (24.0.594) | 3.2.2 | ✗ | ✗ | ✔ | 37 |
+| 2025 (25.0.660) | 3.2.2 | ✔ | ✔ | ✔ | 45 |
+| 2026 (26.1.185) | 3.2.2 | ✔ | ✔ | ✔ | 45 |
+| 2027 (27.0.264) | 3.4.9 | ✔ | ✔ | ✔ | 45 |
+
+- **2024**：材质只套基础色（`texture`）+ UV 平铺；法线 / 粗糙度 / 金属度 / AO 没有槽位，
+  结果消息里会写明「本版本没有 PBR 材质槽，X 未套用（需要 2025 及以上）」；HDRI 也会报明确错误
+  （`SketchUp 24.0.594 没有「环境」（environments）…需要 2025 及以上`），不会静默失败。
+- **只支持 2024 及以上**：2024 起才有 GLB 导入器（`glbimporter.dll`），FBX/OBJ/PLY 才能由软件转 GLB 后导入。
+  更老的 2022 / 2023 已不再支持（它们的 DAE 导入器实测不可用：`model.import` 对 DAE 返回 true 却不进对象，
+  连 SketchUp 自己导出的 DAE 都会让 2022 崩溃）。
+- 能力探测都在 `main.rb` 顶部：`Bridge.pbr?` / `Bridge.env?` / `Bridge.supported_import_exts`
+  （后者读安装目录 `Importers/*.dll`），**不按版本号硬编码**，新版本自动继承。
+- 心跳会把 `pbr` / `env` / `glb` / `import` 一起上报，软件据此决定要不要转 GLB。
 
 `assetmanager_su/` 子目录必须与加载器同名 —— 这是 SketchUp 扩展的固定结构：
 加载器 `assetmanager_su.rb` 注册 `SketchupExtension`，指向 `assetmanager_su/main.rb`。
@@ -20,10 +43,10 @@ bridge/su/
 
 **推荐**：AssetManager → 插件面板 → **安装/更新插件到 SketchUp**。
 它会扫 `%APPDATA%\SketchUp\SketchUp <年份>\SketchUp\Plugins`，
-按各 SketchUp 版本挑对应系列（2026 → `2026/`）写进去，然后**重启 SketchUp**。
+按各 SketchUp 版本挑对应系列（2025 → `2025/`、2026 → `2026/`…）写进去，然后**重启 SketchUp**。
 
-手动安装：把 `2026/assetmanager_su.rb` 和 `2026/assetmanager_su/` 一起拷进
-`%APPDATA%\SketchUp\SketchUp 2026\SketchUp\Plugins\`。
+手动安装：把 `<年份>/assetmanager_su.rb` 和 `<年份>/assetmanager_su/` 一起拷进
+`%APPDATA%\SketchUp\SketchUp <年份>\SketchUp\Plugins\`。
 
 装好后：**扩展程序 → AssetManager**（有状态面板 / 重连 / 暂停），工具栏多一组按钮。
 
@@ -33,7 +56,7 @@ bridge/su/
 
 ## 版本规则
 
-- 插件**独立编号**：第一版 `0.1.0`，之后只递增第三位（`0.1.0` → `0.1.1`…），当前 **0.1.1**。
+- 插件**独立编号**：第一版 `0.1.0`，之后只递增第三位（`0.1.0` → `0.1.1`…），当前 **0.1.3**。
 - 只改插件、软件本体没动时**不动软件版本号**；把插件打包进软件时打包产物版本号也不变。
 - 各 SketchUp 系列目录**共用同一个插件版本号**。
 - 版本号只写在加载器 `assetmanager_su.rb` 的 `AM_PLUGIN_VERSION`（安装器也读这一行）。

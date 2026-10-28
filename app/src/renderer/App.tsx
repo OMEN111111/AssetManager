@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { Asset, AssetDetail, Library, ScanState, TagNode, TreeNode } from './types';
 import Viewer from './Viewer';
 import Assembler from './Assembler';
@@ -97,6 +97,50 @@ function Card({ a, active, thumbVer, onSelect, onOpen, onCtx, onZoom, issue, chi
   );
 }
 
+// ---- 应用内确认框 ----
+// Electron 的无边框窗口里 window.confirm 不会弹（直接返回 false），
+// 「最近任务 → 清除」这类破坏性操作就表现为「点了没反应」。统一走自绘确认框。
+let confirmState: { msg: string } | null = null;
+let confirmResolver: ((v: boolean) => void) | null = null;
+const confirmSubs = new Set<() => void>();
+const emitConfirm = () => confirmSubs.forEach(f => f());
+
+function askConfirm(msg: string): Promise<boolean> {
+  confirmResolver?.(false); // 上一个没答完的按取消处理
+  return new Promise<boolean>((res) => {
+    confirmState = { msg };
+    confirmResolver = res;
+    emitConfirm();
+  });
+}
+
+function ConfirmHost() {
+  const st = useSyncExternalStore(
+    (cb) => { confirmSubs.add(cb); return () => { confirmSubs.delete(cb); }; },
+    () => confirmState,
+    () => null
+  );
+  if (!st) return null;
+  const done = (v: boolean) => {
+    const r = confirmResolver;
+    confirmResolver = null;
+    confirmState = null;
+    emitConfirm();
+    r?.(v);
+  };
+  return (
+    <div className="modal-mask" style={{ zIndex: 3000 }}>
+      <div className="modal" style={{ width: 400 }}>
+        <div className="modal-h">请确认</div>
+        <div className="modal-b" style={{ whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{st.msg}</div>
+        <div className="modal-b" style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <button className="btn" onClick={() => done(false)}>取消</button>
+          <button className="btn primary" onClick={() => done(true)}>确定</button>
+        </div>
+      </div>
+    </div>
+  );
+}
 export default function App() {
   const [libs, setLibs] = useState<Library[]>([]);
   const [lib, setLib] = useState<number | null>(null);
@@ -703,7 +747,7 @@ export default function App() {
   }
 
   async function removeLibrary(id: number) {
-    if (!window.confirm('从软件中移除这个库？不会删除磁盘上的任何文件。')) return;
+    if (!(await askConfirm('从软件中移除这个库？不会删除磁盘上的任何文件。'))) return;
     await api(`/api/libraries/${id}`, { method: 'DELETE' });
     lastMeta.current = '';
     await boot();
@@ -1204,7 +1248,7 @@ export default function App() {
   }
 
   async function clearBridgeJobs() {
-    if (!window.confirm('清除最近任务记录？\n同时会删除队列产生的本地临时文件（拖放描述 .ms）。')) return;
+    if (!(await askConfirm('清除最近任务记录？\n同时会删除队列产生的本地临时文件（拖放描述 .ms）。'))) return;
     setBridgeBusy(true);
     try {
       const r = await api('/api/bridge/clear', {
@@ -1645,7 +1689,7 @@ export default function App() {
   }
 
   async function deleteTag(id: number) {
-    if (!window.confirm('删除该标签？只解除关联，不会删除任何素材。')) return;
+    if (!(await askConfirm('删除该标签？只解除关联，不会删除任何素材。'))) return;
     await api(`/api/tags/${id}`, { method: 'DELETE' });
     if (lib) loadMeta(lib);
     refreshDetail();
@@ -1653,7 +1697,7 @@ export default function App() {
 
   async function batchDeleteTags() {
     if (!tagSel.size) return;
-    if (!window.confirm(`删除选中的 ${tagSel.size} 个标签？只解除关联，不会删除素材。`)) return;
+    if (!(await askConfirm(`删除选中的 ${tagSel.size} 个标签？只解除关联，不会删除素材。`))) return;
     for (const id of tagSel) await api(`/api/tags/${id}`, { method: 'DELETE' });
     setTagSel(new Set());
     if (lib) loadMeta(lib);
@@ -1726,7 +1770,7 @@ export default function App() {
 
   async function tagDelete(ids: number[]) {
     if (!ids.length) return;
-    if (!window.confirm(`删除选中的 ${ids.length} 个标签？只解除关联，不会删除素材。`)) return;
+    if (!(await askConfirm(`删除选中的 ${ids.length} 个标签？只解除关联，不会删除素材。`))) return;
     for (const id of ids) await api(`/api/tags/${id}`, { method: 'DELETE' });
     setTagSel(new Set());
     if (lib) loadMeta(lib);
@@ -1922,6 +1966,7 @@ export default function App() {
 
   return (
     <div className="app">
+      <ConfirmHost />
       {isElectron && (
         <div className="titlebar">
           <div className="tb-menu">

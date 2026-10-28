@@ -18,6 +18,7 @@ import {
   installForMaya, mayaSeries as mayaPluginSeries, mayaUserDirs, mayaInstallInfo,
   resolvePath, assetInfo, writeDropScript,
   suConvertCheck,
+  suClientSupportsGlb,
   BRIDGE_PROTOCOL, BRIDGE_SCRIPT_VERSION
 } from '../core/bridge.ts';
 import type { DB } from '../core/db.ts';
@@ -1033,7 +1034,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     // SketchUp 读不了的模型格式（FBX/OBJ/PLY）：先让渲染端用 three 转成 GLB 再发
     if (target === 'su' && mode === 'import' && !modelPath) {
       const conv = suConvertCheck(db, assetId);
-      if (conv && conv.convertible) return json(res, 200, { needsConvert: true, ...conv });
+      if (conv && conv.convertible) {
+        // SketchUp 2024 起才有 GLB 导入器（glbimporter.dll）；更老的版本不再支持
+        if (!suClientSupportsGlb(db)) {
+          return json(res, 400, {
+            error: `目标 SketchUp 没有 GLB 导入器，无法导入 ${conv.ext}。` +
+              '本插件支持 SketchUp 2024 及以上；更老的版本请改用 STL / SKP 版本的素材。'
+          });
+        }
+        return json(res, 200, { needsConvert: true, ...conv });
+      }
       if (conv && !conv.convertible) {
         return json(res, 400, {
           error: `SketchUp 读不了 ${conv.ext}，软件也只能把 FBX/OBJ/PLY 转成 GLB`
@@ -1068,8 +1078,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const assetId = Number(url.searchParams.get('assetId') || 0);
     const raw = String(url.searchParams.get('name') || 'model');
     const safe = raw.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 60) || 'model';
+    const format = (url.searchParams.get('format') || 'glb').toLowerCase();
     const dir = wsPath('cache', 'converted');
     try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+
     const file = path.join(dir, `${assetId || 'x'}-${safe}.glb`);
     try {
       const size = await saveRequestBody(req, file);

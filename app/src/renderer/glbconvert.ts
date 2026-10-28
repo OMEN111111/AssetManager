@@ -176,7 +176,8 @@ function sanitizeTextures(root: THREE.Object3D): number {
  * 把素材里的模型文件读进 three，套上（必要时）AssetManager 材质，导出 GLB。
  * 模型自带贴图的网格保持原样；一个贴图都没有的网格才套素材的材质 —— 与预览逻辑一致。
  */
-export async function exportGlbForSketchUp(detail: DetailLike): Promise<GlbExport> {
+/** 加载模型 + 套材质 + 折单位 + 等贴图解码（GLB / DAE 两条导出共用） */
+async function prepareScene(detail: DetailLike) {
   const files = detail.files || [];
   const cand = files.filter(f => CONVERTIBLE_EXT.has(extOf(f.rel_path)));
   if (!cand.length) throw new Error('这个素材里没有可转换的模型文件（只支持 FBX / OBJ / PLY）');
@@ -261,6 +262,11 @@ export async function exportGlbForSketchUp(detail: DetailLike): Promise<GlbExpor
   const dropped = sanitizeTextures(root);
   if (dropped) note = (note ? note + '；' : '') + `${dropped} 张贴图没加载出来已略过`;
 
+  return { root, note, sizeM, meshes, materials, ext, unitScale };
+}
+
+export async function exportGlbForSketchUp(detail: DetailLike): Promise<GlbExport> {
+  const { root, note, sizeM, meshes, materials, ext, unitScale } = await prepareScene(detail);
   const arrayBuffer = await new Promise<ArrayBuffer>((res, rej) => {
     new GLTFExporter().parse(root, (out: any) => res(out as ArrayBuffer), (e: any) => rej(e), {
       binary: true,
@@ -279,3 +285,4 @@ export async function exportGlbForSketchUp(detail: DetailLike): Promise<GlbExpor
     }
   };
 }
+

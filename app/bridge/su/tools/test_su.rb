@@ -20,6 +20,15 @@ module AMSuTest
     attr_reader :results
 
     def check(name, cond, detail = '')
+      # 进度打点：卡住时能看出停在哪一条（只在测试里用，插件本体不写文件）
+      begin
+        tag = (defined?(AssetManager::AM_SERIES) ? AssetManager::AM_SERIES : "20#{Sketchup.version.split('.')[0]}")
+        File.open(File.join(ENV['TEMP'] || '.', "am-su-progress-#{tag}.txt"), 'w') do |f|
+          f.write(name.to_s)
+        end
+      rescue StandardError
+        nil
+      end
       @results << { name: name, ok: !!cond, detail: detail.to_s }
       puts format('[%s] %s%s', cond ? 'OK' : 'FAIL', name, detail.to_s.empty? ? '' : "  — #{detail}")
       !!cond
@@ -62,13 +71,20 @@ module AMSuTest
       FileUtils.mkdir_p(dir) unless File.directory?(dir)
 
       # ---------------------------------------------------------------- 1. 常量 / 环境
+      pbr = B.pbr?     # SketchUp 2025+ 才有 PBR 材质槽
+      env = B.env?     # 同上，2025+ 才有 environments
       check('插件版本号存在', AssetManager::AM_PLUGIN_VERSION =~ /\A\d+\.\d+\.\d+\z/,
             AssetManager::AM_PLUGIN_VERSION.to_s)
       check('系列号是年份', AssetManager::AM_SERIES.to_s =~ /\A20\d\d\z/, AssetManager::AM_SERIES.to_s)
+      check('系列号与当前 SketchUp 主版本一致',
+            Sketchup.version.to_s.split('.').first.to_i == (AssetManager::AM_SERIES.to_i - 2000),
+            "#{AssetManager::AM_SERIES} vs #{Sketchup.version}")
       check('有打开的模型', !model.nil?)
-      check('SketchUp 版本已知', Sketchup.version.to_s.start_with?('26') || Sketchup.version.to_s.start_with?('2'),
-            Sketchup.version.to_s)
+      check('SketchUp 版本已知', Sketchup.version.to_s =~ /\A2\d\.\d+\.\d+\z/, Sketchup.version.to_s)
       check('HTTP 工具可用（不等服务）', B.respond_to?(:http))
+      check('能力探测有结果（PBR/环境按版本不同）', [true, false].include?(pbr) && [true, false].include?(env),
+            "pbr=#{pbr} env=#{env}")
+      check('导入能力列表非空', B.supported_import_exts.length >= 5, B.supported_import_exts.join(' '))
 
       # ---------------------------------------------------------------- 2. 通道抽取
       packed = make_png(File.join(dir, 'packed.png'), 16, 16, [200, 120, 60])
@@ -116,14 +132,22 @@ module AMSuTest
         check('UV 平铺 2×4 → 尺寸 5×2.5', mat.texture &&
               (mat.texture.width - 5.0).abs < 0.2 && (mat.texture.height - 2.5).abs < 0.2,
               mat.texture ? "#{mat.texture.width.round(2)}×#{mat.texture.height.round(2)}" : 'nil')
-        check('法线贴图已上', !mat.normal_texture.nil?)
-        check('法线空间按素材设成 DirectX',
-              mat.normal_style == Sketchup::Material::NORMAL_STYLE_DIRECTX, mat.normal_style.to_s)
-        check('粗糙度贴图已上（单通道抽取）', !mat.roughness_texture.nil?,
-              mat.roughness_texture ? File.basename(mat.roughness_texture.filename) : 'nil')
-        check('AO 贴图已上', !mat.ao_texture.nil?)
-        check('PBR workflow 已切换', mat.workflow == Sketchup::Material::WORKFLOW_PBR_METALLIC_ROUGHNESS,
-              mat.workflow.to_s)
+        if pbr
+          check('法线贴图已上', !mat.normal_texture.nil?)
+          check('法线空间按素材设成 DirectX',
+                mat.normal_style == Sketchup::Material::NORMAL_STYLE_DIRECTX, mat.normal_style.to_s)
+          check('粗糙度贴图已上（单通道抽取）', !mat.roughness_texture.nil?,
+                mat.roughness_texture ? File.basename(mat.roughness_texture.filename) : 'nil')
+          check('AO 贴图已上', !mat.ao_texture.nil?)
+          check('PBR workflow 已切换', mat.workflow == Sketchup::Material::WORKFLOW_PBR_METALLIC_ROUGHNESS,
+                mat.workflow.to_s)
+        else
+          # 2022–2024 没有 PBR 槽：应只套基础色，并在结果里点名哪些通道没套上
+          check('无 PBR 版本：材质仍建立且只有基础色', !mat.texture.nil? && mat.materialType == Sketchup::Material::MATERIAL_TEXTURED,
+                mat.materialType.to_s)
+          check('无 PBR 版本：结果里说明法线/粗糙/金属/AO 未套用',
+                msg.to_s.include?('PBR') && msg.to_s.include?('未套用'), msg.to_s[-60, 60].to_s)
+        end
         check('打了 assetmanager 标记', mat.get_attribute('assetmanager', 'mine', false) == true)
         check('写入了材质规格', mat.get_attribute('assetmanager', 'spec').to_s.include?('baseColor'))
         check('透明度被明确告知不支持', msg.to_s.include?('透明度'), msg.to_s[-40, 40].to_s)
@@ -190,7 +214,17 @@ module AMSuTest
       # ---------------------------------------------------------------- 6. HDRI（无样本则跳过）
       hdr = ENV['AM_TEST_HDRI'].to_s
       hdr = 'F:/02AssetLibrary/Asset/04_HDRI/Outdoor/Outdoor_Day_4k_002/Outdoor_Day_4k_002_Environment.exr' if hdr.empty?
-      if File.exist?(hdr)
+      if File.exist?(hdr) && !env
+        # 2022–2024 没有 environments：应给出明确提示而不是崩
+        err = begin
+          B.execute({ 'mode' => 'hdri', 'payload' => { 'name' => 'AM_TEST_ENV', 'files' => [hdr] } })
+          ''
+        rescue StandardError => e
+          e.message
+        end
+        check('无环境支持的版本：HDRI 给出明确提示',
+              err.include?('环境') && err.include?('2025'), err[0, 90])
+      elsif File.exist?(hdr)
         before_count = model.environments.length
         msg = safe('应用 HDRI 不报错') do
           B.execute({ 'mode' => 'hdri', 'payload' => { 'name' => 'AM_TEST_ENV', 'files' => [hdr] } })
@@ -219,18 +253,20 @@ module AMSuTest
 
       # ---------------------------------------------------------------- 7. 面板 / 端口
       check('状态 payload 结构完整',
-            %i[version series sketchup connected port queued events].all? { |k| B.status_payload.key?(k) })
+            %i[version series sketchup connected port queued events pbr env import].all? { |k| B.status_payload.key?(k) })
       check('面板 HTML 有 JS 钩子', B.dialog_html.include?('amStatus') && B.dialog_html.include?('am_cmd'))
       check('面板 HTML 是中文', B.dialog_html.include?('已连接') || B.dialog_html.include?('未连接'))
 
       # ---------------------------------------------------------------- 清理测试造出来的东西
-      begin
-        envs = model.environments
-        keep = envs.to_a.find { |e| !e.name.to_s.start_with?('AM_TEST') }
-        envs.current = keep if keep
-        envs.to_a.each { |e| envs.remove(e) if e.name.to_s.start_with?('AM_TEST') }
-      rescue StandardError
-        nil
+      if env
+        begin
+          envs = model.environments
+          keep = envs.to_a.find { |e| !e.name.to_s.start_with?('AM_TEST') }
+          envs.current = keep if keep
+          envs.to_a.each { |e| envs.remove(e) if e.name.to_s.start_with?('AM_TEST') }
+        rescue StandardError
+          nil
+        end
       end
       begin
         model.materials.to_a.each do |mm|

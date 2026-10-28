@@ -49,7 +49,7 @@
 | --- | --- | --- |
 | 3ds Max | `bridge/max/<Max 版本>/AssetManagerBridge_<插件版本>.ms`（MaxScript 0.2.1，2023 / 2024 / 2025 / 2026 / 2027 系列，2024–2027 实测） | 拖放导入放置、打包选中、材质重建、HDRI（环境贴图 / 视口背景）、**导回源目录（按 UUID 覆盖模型+贴图）** |
 | Blender | `bridge/blender/<版本>/`（Python 0.1.5，5.2 / 4.0 / 3.6） | 模型导入、PBR 材质重建、贴图、HDRI 世界环境 |
-| SketchUp | `bridge/su/2026/`（Ruby 0.1.2） | 模型导入（FBX/OBJ/PLY 自动转 GLB）、原生 PBR 材质、贴图、HDRI 环境 |
+| SketchUp | `bridge/su/<SketchUp 年份>/`（Ruby 0.1.3，**2024 / 2025 / 2026 / 2027 四系列，逐版本实测**） | 模型导入（FBX/OBJ/PLY 自动转 GLB）、原生 PBR 材质（2025+）、贴图、HDRI 环境（2025+） |
 | Unreal Engine | `bridge/ue/<引擎版本>/`（Python 编辑器插件 0.1.7，5.6 / 5.7 / 5.8） | 模型导入（静态 / 骨骼 / 物理资产）、PBR 材质（可指定父材质建实例）、贴图、HDRI 天空球 + SkyLight、**IES 灯光** |
 | Maya | `bridge/maya/<Maya 年份>/`（Python 模块 0.1.0，2025） | 模型导入（FBX / OBJ / MA / MB / ABC / USD）、PBR 材质（原生 `standardSurface`）、贴图、HDRI（Arnold 天空穹灯 / 无 Arnold 时环境球）、**IES 灯光**（Arnold） |
 
@@ -58,6 +58,9 @@
   Maya 插件写进 `Documents\maya\<年份>\modules`（只动用户目录，不碰 Maya 安装目录、不改 `Maya.env`），重启 Maya 生效。
 - **FBX/OBJ 自动转 GLB**：SketchUp 没有 FBX 导入器，发这类模型时软件先用 three.js 临时导出成 GLB
   （单位按 FBX `UnitScaleFactor` 折成米、贴图随 GLB 嵌入），只写工作区 `converted\`，素材文件不动。
+- **SketchUp 版本能力差异**（同一份插件实现，运行时探测，不按版本号硬编码）：2024 只套基础色贴图
+  （其余通道在结果里点名未套用）、HDRI 明确报错需要 2025+；2025 起才有 PBR 材质槽与 HDRI 环境。
+  插件只支持 **2024 及以上**（2024 起才有 GLB 导入器）。
 - **材质重建用各 DCC 原生材质**：SketchUp 走原生 PBR，打包图按通道抽灰度；UE 用 `MaterialEditingLibrary` 连节点；
   Maya 用原生 `standardSurface`（不依赖 Arnold，打包图只建一个 file 节点、按 R/G/B 取通道）；
   同名材质原地重建不堆 `.001`，不覆盖用户同名材质。
@@ -101,7 +104,7 @@
 | `app/src/renderer/glbconvert.ts` | FBX/OBJ/PLY → GLB（给 SketchUp 用） |
 | `app/bridge/max/<版本>/` | 3ds Max 插件（MaxScript，按 3ds Max 版本分系列；`tools/` 有集成测试与系列同步） |
 | `app/bridge/blender/<系列>/` | Blender 插件（Python，3D 视图侧栏面板） |
-| `app/bridge/su/<系列>/` | SketchUp 插件（Ruby，扩展菜单 + HtmlDialog） |
+| `app/bridge/su/<年份>/` | SketchUp 插件（Ruby，2024–2027 四系列；扩展菜单 + HtmlDialog；能力按版本自适应） |
 | `app/bridge/ue/<引擎版本>/AssetManagerBridge/` | UE Python 编辑器插件（工具 → AssetManager） |
 | `app/bridge/maya/<Maya 年份>/` | Maya Python 模块插件（主菜单栏 → AssetManager）：`AssetManagerBridge.mod` + `scripts/userSetup.py` + `scripts/assetmanager_maya.py` |
 
@@ -148,8 +151,11 @@ cd app/bridge/blender && node tools/sync-blender-bridge.mjs --check && python to
 # UE：系列同步检查（5.7 → 5.6 / 5.8）；真机测试脚本在 devtest/ue/run-test.ps1
 cd app/bridge/ue && node tools/sync-ue-bridge.mjs --check
 
-# SketchUp：装进 Plugins 后，在 SketchUp 的 Ruby 控制台里
-#   load "<仓库路径>/app/bridge/su/tools/test_su.rb"
+# SketchUp：系列同步检查（2026 是 canonical）
+cd app/bridge/su && node tools/sync-su-bridge.mjs --check
+# 六版本真机自测（自动装插件 + 启动 + 跑断言，结果在 %TEMP%\am-su-selftest-<年份>.json）
+pwsh -File devtest/su/test-all.ps1                      # 全部；-Versions 2025,2026 只跑几个
+# 或在 SketchUp 的 Ruby 控制台里手动跑：load "<仓库>/app/bridge/su/tools/test_su.rb"
 
 # Maya：系列同步检查 + mayapy 集成测试（92 项断言；脚本自带临时服务与临时素材库）
 cd app/bridge/maya && node tools/sync-maya-bridge.mjs --check
@@ -184,6 +190,8 @@ pnpm dist             # electron-builder：NSIS 安装版 + 便携版
 - 多尺寸素材按独立素材显示（不合并），尺寸角标各自显示；标签只有两级。
 - Max 桥接未接 AO（Physical Material 无 AO 槽）；组装器强度/HSL 未传给 Max。
 - SketchUp 原生材质没有透明度 / 自发光 / 高度槽；UV 只做平铺次数，旋转/偏移不支持。
+- SketchUp 2024 没有 PBR 材质槽与 HDRI 环境（2025 起才有）：2024 只套基础色贴图，发 HDRI 会明确报错。
+- SketchUp 2022 / 2023 **不再支持**（没有 GLB 导入器；DAE 导入器实测不可用，2022 甚至会崩）。
 - 几十 MB 的模型转换 + 导入时 SketchUp 会卡 30–50 秒（状态栏有提示，无进度条 API）。
 - 在线更新下载依赖镜像（gh-proxy / ghproxy）。
 
