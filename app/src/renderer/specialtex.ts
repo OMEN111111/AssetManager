@@ -40,9 +40,15 @@ export async function specialTextureUrl(f: AssetFile): Promise<string | null> {
 export async function preloadSpecialTextures(files: AssetFile[]): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   const list = files.filter(f => SPECIAL_TEX.test(f.rel_path));
-  for (const f of list) {
-    const url = await specialTextureUrl(f);
-    if (url) out.set(String(f.rel_path).split('/').pop()!.toLowerCase(), url);
+  // 并行解码（限 4 个并发，避免一次性把内存打满）；原来串行，TIFF/TGA 多时打开会明显卡顿
+  const CONCURRENCY = 4;
+  for (let i = 0; i < list.length; i += CONCURRENCY) {
+    const batch = list.slice(i, i + CONCURRENCY);
+    const urls = await Promise.all(batch.map(f => specialTextureUrl(f).catch(() => null)));
+    batch.forEach((f, j) => {
+      const url = urls[j];
+      if (url) out.set(String(f.rel_path).split('/').pop()!.toLowerCase(), url);
+    });
   }
   return out;
 }

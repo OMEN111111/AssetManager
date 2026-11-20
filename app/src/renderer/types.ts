@@ -38,6 +38,16 @@ export interface TagNode {
   color: string | null;
   depth: number;
   count: number;
+  /** 一级标签所属的组 id（null = 未分组；二级标签恒为 null） */
+  groupId?: number | null;
+}
+
+/** 标签组：只组织一级标签，不能给素材打标签 */
+export interface TagGroup {
+  id: number;
+  name: string;
+  color: string | null;
+  count: number;
 }
 
 export interface AssetDetail extends Asset {

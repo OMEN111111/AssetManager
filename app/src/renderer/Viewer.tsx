@@ -22,14 +22,37 @@ type Preset = 'maya' | 'max' | 'blender';
 // 都会占一个上下文，浏览器上限（~16 个）用完后就会报 "Error creating WebGL context"。
 let sharedRenderer: THREE.WebGLRenderer | null = null;
 let viewerDoubleSided = false;   // 双面渲染（模块级：材质工具函数里也要用）
+// RoomEnvironment 的 PMREM 只生成一次：每次打开预览器都 new PMREMGenerator + fromScene
+// 是「打开卡一下」的主要固定开销之一（RoomEnvironment 场景有几十个几何体）。
+let sharedRoomEnv: THREE.Texture | null = null;
+let sharedRoomEnvRenderer: THREE.WebGLRenderer | null = null;
+function getRoomEnv(renderer: THREE.WebGLRenderer): THREE.Texture {
+  if (sharedRoomEnv && sharedRoomEnvRenderer === renderer) return sharedRoomEnv;
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const tex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+  sharedRoomEnv = tex;
+  sharedRoomEnvRenderer = renderer;
+  return tex;
+}
+/** 预览器像素比：4K 视口再降一档，单帧像素控制在 ~3.5M 以内（用户可接受适当降分辨率） */
+function viewerPixelRatio(w: number, h: number): number {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const px = Math.max(1, w) * Math.max(1, h) * dpr * dpr;
+  return px > 3_500_000 ? Math.min(dpr, 1.25) : Math.min(dpr, 1.5);
+}
 
 /** 递归释放场景里的几何/材质/贴图（换模型时必须做，否则显存只增不减） */
 /** 预览用贴图上限：8K 贴图一张就要 ~350MB 显存（含 mipmap），几个材质就把显卡顶爆 */
 const TEX_MAPS = ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap',
   'alphaMap', 'displacementMap', 'bumpMap', 'specularMap', 'lightMap'];
 
-/** 把模型里所有贴图按显存预算降采样（在加入场景、第一次上传前调用） */
-export async function capTexturesForVram(root: any, timeoutMs = 15000): Promise<{ capped: number; max: number; total: number }> {
+/**
+ * 把模型里所有贴图按显存预算降采样（在加入场景、第一次上传前调用）。
+ * 优化：① 所有贴图**并行**等就绪（原来逐张各等最多 15s，素材一多就卡很久）；
+ *      ② 总预算 6s，超时的不再等（three 后续自己加载，最多显存高一点，不至于开不了）；
+ *      ③ 优先用 createImageBitmap 的 resize（浏览器内部并行解码/缩放），失败回退 canvas。
+ */
+export async function capTexturesForVram(root: any, timeoutMs = 6000): Promise<{ capped: number; max: number; total: number }> {
   const seen = new Set<any>();
   const list: any[] = [];
   root.traverse((o: any) => {
@@ -42,28 +65,67 @@ export async function capTexturesForVram(root: any, timeoutMs = 15000): Promise<
       }
     }
   });
-  const max = list.length > 30 ? 1024 : list.length > 12 ? 1536 : 2048;
+  const max = list.length > 24 ? 1024 : list.length > 10 ? 1536 : 2048;
   const t0 = performance.now();
+  // 只等「已经有 image 对象、但还没解码完」的贴图；根本没有 image 的（加载失败/尚未开始）直接跳过。
+  // 以前把所有贴图都等一遍，只要有一张永远不 ready 就白等到超时（实测 3 张贴图的 FBX 白等 6 秒）。
+  const waitList = list.filter(t => {
+    const im: any = t.image;
+    return !!im && !(im.width || im.naturalWidth);
+  });
+  if (waitList.length) {
+    await Promise.race([
+      Promise.all(waitList.map(t => new Promise<void>(res => {
+        const tick = () => {
+          const im: any = t.image;
+          if (!im || im.width || im.naturalWidth) { res(); return; }
+          if (performance.now() - t0 > timeoutMs) { res(); return; }
+          setTimeout(tick, 25);
+        };
+        tick();
+      }))),
+      new Promise<void>(res => setTimeout(res, timeoutMs))
+    ]);
+  }
   let capped = 0;
-  for (const t of list) {
-    while ((!t.image || !(t.image.width || t.image.naturalWidth)) && performance.now() - t0 < timeoutMs) {
-      await new Promise(r => setTimeout(r, 40));
-    }
-    const img: any = t.image;
-    const w = img?.width || img?.naturalWidth || 0;
-    const h = img?.height || img?.naturalHeight || 0;
-    if (!w || !h || Math.max(w, h) <= max) continue;
-    const sc = max / Math.max(w, h);
-    try {
-      const cv = document.createElement('canvas');
-      cv.width = Math.max(1, Math.round(w * sc));
-      cv.height = Math.max(1, Math.round(h * sc));
-      cv.getContext('2d')!.drawImage(img, 0, 0, cv.width, cv.height);
-      try { (img as any).close?.(); } catch { /* ImageBitmap */ }
-      t.image = cv;
-      t.needsUpdate = true;
-      capped++;
-    } catch { /* 降采样失败就保留原图 */ }
+  // 只处理确实超过上限的（小图直接跳过，不做无谓的 canvas 拷贝）
+  const jobs = list.filter(t => {
+    const im: any = t.image;
+    const w = im?.width || im?.naturalWidth || 0;
+    const h = im?.height || im?.naturalHeight || 0;
+    return w && h && Math.max(w, h) > max;
+  });
+  // 并行降采样：36 张 4K 贴图串行要 10 秒+，4 并发能压到 3 秒左右（createImageBitmap 在浏览器内部并行解码）
+  const CONCURRENCY = 4;
+  for (let i = 0; i < jobs.length; i += CONCURRENCY) {
+    await Promise.all(jobs.slice(i, i + CONCURRENCY).map(async t => {
+      const img: any = t.image;
+      const w = img?.width || img?.naturalWidth || 0;
+      const h = img?.height || img?.naturalHeight || 0;
+      if (!w || !h) return;
+      const sc = max / Math.max(w, h);
+      const tw = Math.max(1, Math.round(w * sc));
+      const th = Math.max(1, Math.round(h * sc));
+      try {
+        let next: any = null;
+        if (typeof createImageBitmap === 'function' && img instanceof HTMLImageElement) {
+          try {
+            next = await createImageBitmap(img, { resizeWidth: tw, resizeHeight: th, resizeQuality: 'low' });
+          } catch { next = null; }
+        }
+        if (!next) {
+          const cv = document.createElement('canvas');
+          cv.width = tw;
+          cv.height = th;
+          cv.getContext('2d')!.drawImage(img, 0, 0, tw, th);
+          next = cv;
+        }
+        try { (img as any).close?.(); } catch { /* ImageBitmap */ }
+        t.image = next;
+        t.needsUpdate = true;
+        capped++;
+      } catch { /* 降采样失败就保留原图 */ }
+    }));
   }
   return { capped, max, total: list.length };
 }
@@ -812,6 +874,11 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     if (!el) return;
     let disposed = false;
     setMeshInfo([]);
+    // 打开耗时埋点（只在内存里，供 devtest 用；不影响界面）
+    const vt: any = { t0: performance.now(), stages: [] as any[] };
+    (globalThis as any).__AMVT = vt;
+    const mark = (k: string) => { try { vt.stages.push({ k, ms: Math.round(performance.now() - vt.t0) }); } catch { /* ignore */ } };
+    mark('effect-start');
     let renderer: THREE.WebGLRenderer;
     const ctxLost = (r: THREE.WebGLRenderer | null) => {
       try { return !!(r?.getContext?.() as any)?.isContextLost?.(); } catch { return true; }
@@ -819,17 +886,19 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     if (sharedRenderer && !ctxLost(sharedRenderer)) {
       renderer = sharedRenderer;
       if (renderer.domElement.parentElement !== el) el.appendChild(renderer.domElement);
-      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setPixelRatio(viewerPixelRatio(el.clientWidth || 900, el.clientHeight || 600));
       renderer.setSize(el.clientWidth || 900, el.clientHeight || 600, true);
     } else {
       renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
       sharedRenderer = renderer;
-      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setPixelRatio(viewerPixelRatio(el.clientWidth || 900, el.clientHeight || 600));
       renderer.setSize(el.clientWidth || 900, el.clientHeight || 600, true);
       el.appendChild(renderer.domElement);
       renderer.domElement.addEventListener('webglcontextlost', (ev: Event) => {
         ev.preventDefault();
         sharedRenderer = null;                 // 下次打开重新建上下文，不白屏卡死
+        sharedRoomEnv = null;                  // 旧纹理跟着旧上下文一起废
+        sharedRoomEnvRenderer = null;
         try { renderer.dispose(); } catch { /* ignore */ }
         setError('显卡显存不足，预览已停止（再次打开会重建显卡上下文）');
       });
@@ -837,13 +906,15 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     if (renderer.domElement.parentElement !== el) el.appendChild(renderer.domElement);
+    mark('renderer-ready');
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0b0c0e);
     const camera = new THREE.PerspectiveCamera(38, (el.clientWidth || 900) / (el.clientHeight || 600), 0.05, 300);
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    const roomEnv = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    // 环境反射只生成一次（见 getRoomEnv），之后每次打开都是复用
+    const roomEnv = getRoomEnv(renderer);
     scene.environment = roomEnv;
+    mark('env-ready');
 
     const key = new THREE.DirectionalLight(0xffffff, 1.5);
     scene.add(key);
@@ -863,8 +934,11 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     };
 
     let raf = 0;
+    let firstFrame = true;
     const loop = () => {
       if (disposed) return;
+      // 内容没就绪前只排队不渲染：空场景首帧也要编译一遍着色器，纯属浪费打开时间
+      if (!api.current.contentReady) { raf = requestAnimationFrame(loop); return; }
       if (api.current.iesTex || api.current.iesSpot) {
         renderer.toneMappingExposure = ui.current.exposure;
         try { key.intensity = 0; rim.intensity = 0; } catch { /* ignore */ }
@@ -898,6 +972,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         rim.intensity = 0.5;
       }
       renderer.render(scene, camera);
+      if (firstFrame) { firstFrame = false; mark('first-frame'); }
       raf = requestAnimationFrame(loop);
     };
 
@@ -954,11 +1029,16 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
     window.addEventListener('keydown', onKey);
     const ro = new ResizeObserver(() => {
       const w = el.clientWidth, h = el.clientHeight;
-      if (w && h) { renderer.setSize(w, h, true); camera.aspect = w / h; camera.updateProjectionMatrix(); }
+      if (w && h) {
+        renderer.setPixelRatio(viewerPixelRatio(w, h));   // 窗口放大时同步降像素比（大视口更划算）
+        renderer.setSize(w, h, true);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      }
     });
     ro.observe(el);
 
-    api.current = { renderer, scene, camera, key, roomEnv, ctrl, applyCamera, setMaterial: null, setGeom: null, baseMat: null, meshes: [] };
+    api.current = { renderer, scene, camera, key, roomEnv, ctrl, applyCamera, setMaterial: null, setGeom: null, baseMat: null, meshes: [], contentReady: false };
     (window as any).__viewer = api.current;
     applyCamera();
     loop();
@@ -1024,6 +1104,11 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         return out;
       };
 
+      // 只有材质素材才需要「按文件名拼材质球」；模型/HDRI/IES 直接走各自分支。
+      // 以前这里对模型也会先把整套贴图加载一遍（纯浪费：模型自己的贴图由 loader 负责），
+      // 大贴图能白白多花 1 秒以上 —— 这就是「打开查看器卡一下」的主因之一。
+      const mat = new THREE.MeshPhysicalMaterial({ roughness: 1, metalness: 0 });
+      if (asset.type === 'material' || asset.type === 'texture') {
       const packed = findFile(files, '_arm_', '_orm_', '_omr_', '_rma_');
       const base = findFile(files, 'basecolor', 'base_color', 'albedo', 'diffuse', '_diff', 'color');
       const normal = findFile(files, 'normal', 'nor_gl', 'nor_dx', '_nrm');
@@ -1034,7 +1119,6 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       const emis = findFile(files, 'emissive', 'emission', 'emit');
 
       setStatus('加载贴图…');
-      const mat = new THREE.MeshPhysicalMaterial({ roughness: 1, metalness: 0 });
       const uBase = await udimAtlas(files, ['diff', 'albedo', 'basecolor', 'color'], true);
       const uNor = await udimAtlas(files, ['nor', 'normal']);
       const uRough = await udimAtlas(files, ['rough']);
@@ -1078,6 +1162,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           }
         }
       } catch (e: any) { setError('贴图加载失败：' + (e?.message || e)); }
+      }
 
       if (asset.type === 'hdri') {
         const hf = findFile(files, '.exr', '.hdr');
@@ -1103,6 +1188,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         camera.rotation.set(0, 0, 0);
         camera.lookAt(0, 0, -1);
         scene.background = new THREE.Color(0x000000);
+        api.current.contentReady = true;
         setStatus('');
         return;
       }
@@ -1152,6 +1238,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         camera.lookAt(0, 1.1, 0);
         ctrl.target.set(0, 0.9, 0);
         ctrl.dist = 4.8;
+        api.current.contentReady = true;
         setStatus('');
         return;
       }
@@ -1172,7 +1259,9 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           if (bn) fileByName.set(bn.toLowerCase(), f.id);
         }
         // TIFF / TGA 贴图先解码成 PNG blob（浏览器原生解码不了）
-        const special = await preloadSpecialTextures(files);
+        // 没有这类贴图时不要 await（省一个微任务/整帧让出，打开更快）
+        const hasSpecial = files.some(f => SPECIAL_TEX.test(f.rel_path));
+        const special = hasSpecial ? await preloadSpecialTextures(files) : new Map<string, string>();
         api.current.specialMap = special;
         // 同一个 blob 也按「文件 id」索引：FBX 里的贴图文件名常被改写成 Map #1 之类，
         // 单靠文件名匹配会漏掉 TIFF/TGA，浏览器又解不了 TIFF → 贴图变空。
@@ -1202,6 +1291,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           return url;
         });
         setStatus('解析模型…');
+        mark('parse-start');
         let obj: any;
         if (mext === '.fbx') {
           await assertBinaryFbx(modelFile.id, modelFile.rel_path);
@@ -1233,11 +1323,13 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
           obj = gl.scene || gl.scenes?.[0];
         }
         // 显存保护：8K/4K 贴图在加入场景前降采样（否则几十张贴图会把 8G 显卡顶爆 → 上下文丢失）
+        mark('parsed');
         try {
           setStatus('优化贴图显存…');
           const cap = await capTexturesForVram(obj);
           (globalThis as any).__AMGLTEX = cap;
         } catch { /* ignore */ }
+        mark('capped');
         const collected: any[] = [];
         const fileNameOf = (src: string) => {
           try { return decodeURIComponent(String(src).split('/').pop() || ''); } catch { return ''; }
@@ -1597,6 +1689,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         obj.position.sub(center.multiplyScalar(s));
         obj.position.y += (size.y * s) / 2;
         scene.add(obj);
+        mark('added');
         api.current.meshes = collected;
         const gs = [...gmap.entries()].map(([key, meshes], i) => ({
           name: meshes[0].matName || `材质 ${i + 1}`,
@@ -1690,11 +1783,13 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
         setGroupTex(groupTex);
         // 左上角信息层：面数 / 顶点 / 网格 / 材质 / 贴图 / 尺寸（尺寸是缩放前的原始包围盒）
         try {
-          let tris = 0, rawVerts = 0, meshCount = 0, missing = 0;
+          let tris = 0, indexedVerts = 0, meshCount = 0, missing = 0;
           const geoms = new Set<string>();
           const texSet = new Set<string>();
           const vertKeys = new Set<string>();     // 去重后的真实顶点（USD 的网格是不索引的，3 顶点/面）
-          let dedupeOk = true;
+          // 顶点去重很贵（每顶点拼字符串）。给 30 万顶点预算：超出部分退回报 buffer 顶点数（近似），
+          // 否则 44 个网格 × 几万顶点会把「打开」拖慢好几秒（实测 VendingMachine 多花 6 秒）。
+          let dedupeBudget = 300000;
           obj.traverse((o: any) => {
             if (!o.isMesh) return;
             meshCount++;
@@ -1706,13 +1801,15 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
                 geoms.add(g.uuid);
                 const pos = g.attributes?.position;
                 const pn = pos?.count || 0;
-                rawVerts += pn;
-                if (pos && pn <= 600000) {
+                if (g.index) {
+                  indexedVerts += pn;           // 索引网格：position 本身就是唯一顶点
+                } else if (pos && pn <= dedupeBudget) {
+                  dedupeBudget -= pn;
                   for (let i = 0; i < pn; i++) {
                     vertKeys.add(`${pos.getX(i).toFixed(4)},${pos.getY(i).toFixed(4)},${pos.getZ(i).toFixed(4)}`);
                   }
-                } else if (pn > 600000) {
-                  dedupeOk = false;             // 太大：去重会拖慢打开速度，直接报缓冲里的顶点数
+                } else {
+                  indexedVerts += pn;           // 太大/预算用完：直接报缓冲顶点数（近似）
                 }
               }
             }
@@ -1726,7 +1823,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
               }
             }
           });
-          const verts = dedupeOk ? vertKeys.size : rawVerts;
+          const verts = indexedVerts + vertKeys.size;
           const nf = (v: number) => v.toLocaleString('zh-CN');
           const usdStats: any = (globalThis as any).__AMUSD;
           // 尺寸统一显示为「米」：FBX 按 UnitScaleFactor 折算（1 单位 = factor 厘米，默认 1）；
@@ -1816,6 +1913,7 @@ export default function Viewer({ asset, onClose, variants, onVariant }:
       };
       setMeshList([...api.current.meshes]);
       applyCamera();
+      api.current.contentReady = true;
       setStatus('');
     })().catch(e => { setError(String(e?.message || e)); setStatus(''); });
 

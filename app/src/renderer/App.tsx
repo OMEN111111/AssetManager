@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import type { Asset, AssetDetail, Library, ScanState, TagNode, TreeNode } from './types';
+import type { Asset, AssetDetail, Library, ScanState, TagGroup, TagNode, TreeNode } from './types';
 import Viewer from './Viewer';
 import Assembler from './Assembler';
 import { renderThumb } from './thumbnailer';
@@ -154,6 +154,19 @@ export default function App() {
   const [stats, setStats] = useState<Record<string, number>>({});
   const [tree, setTree] = useState<TreeNode[]>([]);
   const [tags, setTags] = useState<TagNode[]>([]);
+  const [tagGroups, setTagGroups] = useState<TagGroup[]>([]);
+  const [ungroupedCount, setUngroupedCount] = useState(0);
+  const [ungroupedTags, setUngroupedTags] = useState(0);
+  // 组默认折叠（只展示组）；用「已展开集合」存，新组自然保持折叠
+  const [tagGroupOpen, setTagGroupOpen] = useState<Set<number>>(() => {
+    try { return new Set((JSON.parse(localStorage.getItem('am-tag-group-open') || '[]') as any[]).map(Number)); } catch { return new Set(); }
+  });
+  const [tagPrimaryOpen, setTagPrimaryOpen] = useState<Set<number>>(() => {
+    try { return new Set((JSON.parse(localStorage.getItem('am-tag-primary-open') || '[]') as any[]).map(Number)); } catch { return new Set(); }
+  });
+  const [mgrGroupOpen, setMgrGroupOpen] = useState<Set<number>>(() => {
+    try { return new Set((JSON.parse(localStorage.getItem('am-mgr-group-open') || '[]') as any[]).map(Number)); } catch { return new Set(); }
+  });
   const [tab, setTab] = useState<'dir' | 'tag'>('dir');
   const [activeTag, setActiveTag] = useState<number | null>(null);
   const [scan, setScan] = useState<ScanState | null>(null);
@@ -223,7 +236,7 @@ export default function App() {
   const ctxRef = useRef<HTMLDivElement>(null);
   const tagMenuRef = useRef<HTMLDivElement>(null);
   const [tagMgrOpen, setTagMgrOpen] = useState(false);
-  const [tagMenu, setTagMenu] = useState<{ x: number; y: number; ids: number[]; kind: 'primary' | 'secondary' | 'empty-primary' | 'empty-secondary' } | null>(null);
+  const [tagMenu, setTagMenu] = useState<{ x: number; y: number; ids: number[]; kind: 'primary' | 'secondary' | 'empty-primary' | 'empty-secondary' | 'group'; groupId?: number } | null>(null);
   // 菜单完全落在窗口内：放不下时向上顶，不出现滚动条
   useLayoutEffect(() => {
     for (const ref of [ctxRef, tagMenuRef]) {
@@ -268,7 +281,7 @@ export default function App() {
   const [tagSel, setTagSel] = useState<Set<number>>(new Set());
   const [tagMulti, setTagMulti] = useState<Set<number>>(new Set());
   const [bulkColor, setBulkColor] = useState('#8b93a1');
-  const [mgrParent, setMgrParent] = useState<number | 'none' | null>(null);
+  const [mgrParent, setMgrParent] = useState<number | null>(null);
   const [sideOpen, setSideOpen] = useState(() => localStorage.getItem('am-side-open') !== '0');
   const [detailW, setDetailW] = useState(() => Number(localStorage.getItem('am-detail-w')) || 340);
   useEffect(() => { localStorage.setItem('am-side-open', sideOpen ? '1' : '0'); }, [sideOpen]);
@@ -382,6 +395,9 @@ export default function App() {
       setCollapsed(parents);
     }
     setTags(tg.tags || []);
+    setTagGroups(tg.groups || []);
+    setUngroupedCount(Number(tg.ungroupedCount || 0));
+    setUngroupedTags(Number(tg.ungroupedTags || 0));
     setExts(ex.exts || []);
     loadMissing(id);
   }
@@ -577,6 +593,10 @@ export default function App() {
   // 筛选条件变化时回到第一页
   useEffect(() => { setPage(1); }, [q, dir, recursive, sort, activeTag, ratingFilter, ratingOp, ratingInc, favFilter, extFilter, excludedTypes, hiddenExts]);
   useEffect(() => { setPageDraft(String(page)); }, [page]);
+  // 选中的一级标签被删掉 / 变成二级标签后，管理页右侧回到「请选择」状态
+  useEffect(() => {
+    if (mgrParent != null && !tags.some(t => t.id === mgrParent)) setMgrParent(null);
+  }, [tags, mgrParent]);
 
   // 按容器宽度算列数（卡片 180 + 间距 16）
   useEffect(() => {
@@ -1462,7 +1482,8 @@ export default function App() {
   const lastTagRef = useRef<number | null>(null);
   function selectTag(id: number, e: any) {
     setActiveTag(null);
-    const ids = tags.map(t => t.id);
+    // Shift 范围选择只在「当前可见的一级标签」里算（组折叠时不会把看不见的标签一起选上）
+    const ids = visiblePrimaries.map(t => t.id);
     const anchor = lastTagRef.current;
     if (e.shiftKey && anchor != null && ids.includes(anchor)) {
       const a = ids.indexOf(anchor), b = ids.indexOf(id);
@@ -1760,14 +1781,85 @@ export default function App() {
     if (v?.trim()) await updateTag(ids[0], { name: v.trim() });
   }
 
-  async function tagNew(parentId: number | null) {
+  async function tagNew(parentId: number | null, groupId?: number | null) {
     const v = await askText(parentId ? '新建二级标签' : '新建一级标签');
     if (!v?.trim()) return;
     await api('/api/tags', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: v.trim(), parentId })
+      body: JSON.stringify({ name: v.trim(), parentId, groupId: parentId ? null : (groupId ?? null) })
     });
     if (lib) loadMeta(lib);
+  }
+
+  // ---------------- 标签组（只组织一级标签，组本身不能给素材打标签） ----------------
+  function toggleTagGroupOpen(id: number) {
+    setTagGroupOpen(prev => {
+      const s = new Set(prev);
+      if (s.has(id)) s.delete(id); else s.add(id);
+      localStorage.setItem('am-tag-group-open', JSON.stringify([...s]));
+      return s;
+    });
+  }
+  function toggleTagPrimaryOpen(id: number) {
+    setTagPrimaryOpen(prev => {
+      const s = new Set(prev);
+      if (s.has(id)) s.delete(id); else s.add(id);
+      localStorage.setItem('am-tag-primary-open', JSON.stringify([...s]));
+      return s;
+    });
+  }
+  function toggleMgrGroupOpen(id: number) {
+    setMgrGroupOpen(prev => {
+      const s = new Set(prev);
+      if (s.has(id)) s.delete(id); else s.add(id);
+      localStorage.setItem('am-mgr-group-open', JSON.stringify([...s]));
+      return s;
+    });
+  }
+
+  async function tagGroupNew() {
+    const v = await askText('新建标签组（组只用来整理一级标签）');
+    if (!v?.trim()) return;
+    await api('/api/tag-groups', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: v.trim() })
+    });
+    if (lib) loadMeta(lib);
+  }
+
+  async function tagGroupRename(id: number) {
+    const g = tagGroups.find(x => x.id === id);
+    const v = await askText('重命名标签组', g?.name || '');
+    if (!v?.trim()) return;
+    await api(`/api/tag-groups/${id}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: v.trim() })
+    });
+    if (lib) loadMeta(lib);
+  }
+
+  async function tagGroupDelete(id: number) {
+    const g = tagGroups.find(x => x.id === id);
+    if (!(await askConfirm(`删除标签组「${g?.name || ''}」？组内一级标签会回到「未分组」，标签和素材关联都不会删。`))) return;
+    await api(`/api/tag-groups/${id}`, { method: 'DELETE' });
+    if (mgrGroupOpen.has(id)) toggleMgrGroupOpen(id);
+    if (lib) loadMeta(lib);
+  }
+
+  /** 把一级标签移入组（groupId=null → 未分组） */
+  async function moveTagsToGroup(ids: number[], groupId: number | null) {
+    if (!ids.length) return;
+    await api('/api/tags/group', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ids, groupId })
+    });
+    if (groupId !== null) {
+      // 移进组后把该组展开，能立刻看到结果
+      setTagGroupOpen(prev => { const s = new Set(prev); s.add(groupId); localStorage.setItem('am-tag-group-open', JSON.stringify([...s])); return s; });
+      setMgrGroupOpen(prev => { const s = new Set(prev); s.add(groupId); localStorage.setItem('am-mgr-group-open', JSON.stringify([...s])); return s; });
+    }
+    if (lib) loadMeta(lib);
+    showToast(`已移动 ${ids.length} 个一级标签`, 'ok');
   }
 
   async function tagSetColor(ids: number[], color: string) {
@@ -1822,10 +1914,10 @@ export default function App() {
 
   async function createSecondaryTag() {
     if (!newTagName.trim()) return;
-    const pid = selParent === 'none' ? null : Number(selParent);
+    if (selParent == null) { showToast('请先在左侧选中一个一级标签', 'err'); return; }
     await api('/api/tags', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: newTagName.trim(), parentId: pid })
+      body: JSON.stringify({ name: newTagName.trim(), parentId: selParent })
     });
     setNewTagName('');
     if (lib) loadMeta(lib);
@@ -1956,12 +2048,28 @@ export default function App() {
   }
 
   const counts = useMemo(() => ({ all: total, ...stats }), [total, stats]);
-  const primaries = useMemo(() => tags.filter(t => t.depth === 0), [tags]);
-  const selParent = mgrParent ?? (primaries[0]?.id ?? 'none');
-  const unclassified = useMemo(() => tags.filter(t => t.depth > 0 && !t.parentId), [tags]);
+  const primaryTags = useMemo(() => tags.filter(t => t.depth === 0), [tags]);
+  /** 组 id → 组内一级标签（0 = 未分组） */
+  const primariesByGroup = useMemo(() => {
+    const m = new Map<number, TagNode[]>();
+    for (const t of primaryTags) {
+      const k = Number(t.groupId || 0);
+      const arr = m.get(k);
+      if (arr) arr.push(t); else m.set(k, [t]);
+    }
+    return m;
+  }, [primaryTags]);
+  /** 侧栏当前可见的一级标签（按组顺序；只有展开的组才在内），用于 Shift 范围选择 */
+  const visiblePrimaries = useMemo(() => {
+    const out: TagNode[] = [];
+    for (const g of tagGroups) if (tagGroupOpen.has(g.id)) out.push(...(primariesByGroup.get(g.id) || []));
+    if (tagGroupOpen.has(0)) out.push(...(primariesByGroup.get(0) || []));
+    return out;
+  }, [tagGroups, primariesByGroup, tagGroupOpen]);
+  const selParent = mgrParent;
   const secondaries = useMemo(
-    () => selParent === 'none' ? unclassified : tags.filter(t => t.parentId === selParent),
-    [tags, selParent, unclassified]
+    () => selParent == null ? [] : tags.filter(t => t.parentId === selParent),
+    [tags, selParent]
   );
 
   useEffect(() => {
@@ -2111,26 +2219,80 @@ export default function App() {
               })}
             </div>
           ) : (
-            <div className="tree" onClick={e => {
-              if (e.target === e.currentTarget) { setTagMulti(new Set()); lastTagRef.current = null; }
-            }}>
-              <div className={'row' + (activeTag === null && tagMulti.size === 0 ? ' on' : '')}
-                onClick={() => { setActiveTag(null); setTagMulti(new Set()); lastTagRef.current = null; }}>
-                <span className="ic">▣</span>全部素材<span className="count">{counts.all}</span>
+            <div className="tag-pane">
+              <div className="tag-toolbar">
+                <button className="btn tiny" onClick={() => setTagMgrOpen(true)}
+                  title="打开标签管理：标签组 / 一级标签 / 二级标签">⚙ 管理标签</button>
               </div>
-              {tags.map(t => (
-                <div key={t.id}
-                  className={'row' + ((activeTag === t.id || tagMulti.has(t.id)) ? ' on' : '')}
-                  style={{ paddingLeft: 8 + t.depth * 14 }} onClick={(e) => selectTag(t.id, e)}
-                  draggable
-                  onDragStart={e => { e.dataTransfer.setData('application/x-am-tag', String(t.id)); e.dataTransfer.effectAllowed = 'copy'; }}>
-                  <span className="tdot" style={{ background: t.color || '#8b93a1' }} />
-                  <span className="label">{t.name}</span>
-                  <span className="count">{t.count}</span>
+              <div className="tree" onClick={e => {
+                if (e.target === e.currentTarget) { setTagMulti(new Set()); lastTagRef.current = null; }
+              }}>
+                <div className={'row' + (activeTag === null && tagMulti.size === 0 ? ' on' : '')}
+                  onClick={() => { setActiveTag(null); setTagMulti(new Set()); lastTagRef.current = null; }}>
+                  <span className="ic">▣</span>全部素材<span className="count">{counts.all}</span>
                 </div>
-              ))}
-              {tags.length === 0 && <div className="thint">还没有标签，选中素材后添加</div>}
-              <div className="row tnew" onClick={() => setTagMgrOpen(true)}><span className="ic">⚙</span>管理标签</div>
+                {(() => {
+                  const renderGroup = (gid: number, name: string, count: number, icon: string) => {
+                    const kids = primariesByGroup.get(gid) || [];
+                    const open = tagGroupOpen.has(gid);
+                    return (
+                      <div className="tg-block" key={'g' + gid}>
+                        <div className={'row grouprow' + (open ? ' open' : '')}
+                          onClick={() => toggleTagGroupOpen(gid)}
+                          title="点击展开/收起（组只用来整理一级标签，不能给素材打标签）">
+                          <span className="caret">{open ? '▾' : '▸'}</span>
+                          <span className="gicon">{icon}</span>
+                          <span className="label">{name}</span>
+                          <span className="count">{count}</span>
+                        </div>
+                        {open && kids.map(t => {
+                          const subs = tags.filter(x => x.parentId === t.id);
+                          const pOpen = tagPrimaryOpen.has(t.id);
+                          return (
+                            <div className="tg-block" key={'t' + t.id}>
+                              <div className={'row tagrow1' + (tagMulti.has(t.id) ? ' on' : '')}
+                                style={{ paddingLeft: 8 + 16 }}
+                                onClick={e => selectTag(t.id, e)}
+                                onContextMenu={e => { e.preventDefault(); setTagMenu({ x: e.clientX, y: e.clientY, ids: [t.id], kind: 'primary' }); }}
+                                draggable
+                                onDragStart={e => { e.dataTransfer.setData('application/x-am-tag', String(t.id)); e.dataTransfer.effectAllowed = 'copy'; }}>
+                                <span className="caret" onClick={e => { e.stopPropagation(); if (subs.length) toggleTagPrimaryOpen(t.id); }}>
+                                  {subs.length ? (pOpen ? '▾' : '▸') : ''}
+                                </span>
+                                <span className="tdot" style={{ background: t.color || '#8b93a1' }} />
+                                <span className="label">{t.name}</span>
+                                <span className="count">{t.count}</span>
+                              </div>
+                              {pOpen && subs.map(s => (
+                                <div key={'s' + s.id} className={'row tagsub' + (tagMulti.has(s.id) ? ' on' : '')}
+                                  style={{ paddingLeft: 8 + 32 }}
+                                  onClick={e => selectTag(s.id, e)}
+                                  onContextMenu={e => { e.preventDefault(); setTagMenu({ x: e.clientX, y: e.clientY, ids: [s.id], kind: 'secondary' }); }}
+                                  draggable
+                                  onDragStart={e => { e.dataTransfer.setData('application/x-am-tag', String(s.id)); e.dataTransfer.effectAllowed = 'copy'; }}>
+                                  <span className="tdot" style={{ background: s.color || '#8b93a1' }} />
+                                  <span className="label">{s.name}</span>
+                                  <span className="count">{s.count}</span>
+                                </div>
+                              ))}
+                            </div>
+                          );
+                        })}
+                        {open && kids.length === 0 && <div className="thint tg-empty">该组还没有一级标签</div>}
+                      </div>
+                    );
+                  };
+                  return (
+                    <>
+                      {tagGroups.map(g => renderGroup(g.id, g.name, g.count, '▤'))}
+                      {(ungroupedTags > 0 || (primariesByGroup.get(0) || []).length > 0) && renderGroup(0, '未分组', ungroupedCount, '▢')}
+                    </>
+                  );
+                })()}
+                {tagGroups.length === 0 && (primariesByGroup.get(0) || []).length === 0 && (
+                  <div className="thint">还没有标签，选中素材后添加</div>
+                )}
+              </div>
             </div>
           )}
           <div className="side-foot">
@@ -3109,7 +3271,7 @@ export default function App() {
                   );
                 })
               ) : (
-                primaries.map(p => (
+                primaryTags.map(p => (
                   <div key={p.id}>
                     <div className={'row' + (pickAssign.all.includes(p.id) ? ' on' : '')}>
                       <span className="tdot" style={{ background: p.color || '#8b93a1' }} />
@@ -3144,7 +3306,7 @@ export default function App() {
       {tagMgrOpen && (
         <div className="modal-mask" onMouseDown={() => setTagMgrOpen(false)}>
           <div className="modal wide" onMouseDown={e => e.stopPropagation()}>
-            <div className="modal-t">标签管理 · {tags.length} 个</div>
+            <div className="modal-t">标签管理 · {tags.length} 个标签 / {tagGroups.length} 个组</div>
             <div className="tagmgr-body">
               <div className="tagmgr-left"
                 onClick={e => { if (e.target === e.currentTarget) { setTagSel(new Set()); tagLastRef.current = null; } }}
@@ -3152,30 +3314,63 @@ export default function App() {
                   e.preventDefault();
                   setTagMenu({ x: e.clientX, y: e.clientY, ids: [], kind: 'empty-primary' });
                 }}>
-                <div className={'tgm-item' + (selParent === 'none' ? ' on' : '')} onClick={() => setMgrParent('none')}>
-                  <span className="label">未分类</span><span className="count">{unclassified.length}</span>
-                </div>
-                {primaries.map(p => (
-                  <div key={p.id}
-                    className={'tgm-item' + (tagSel.has(p.id) ? ' on' : '')}
-                    onClick={e => { setMgrParent(p.id); selectTagRow(p.id, e, primaries.map(x => x.id)); }}
-                    onContextMenu={e => {
-                      e.stopPropagation();
-                      e.preventDefault();
-                      const ids = tagSel.has(p.id) ? [...tagSel] : [p.id];
-                      setTagSel(new Set(ids));
-                      setTagMenu({ x: e.clientX, y: e.clientY, ids, kind: 'primary' });
-                    }}>
-                    <span className="tdot" style={{ background: p.color || '#8b93a1' }} />
-                    <span className="label">{p.name}</span>
-                    <span className="count">{p.count}</span>
-                  </div>
-                ))}
-                <div className="hint" style={{ padding: 8 }}>右键空白处新建一级标签</div>
+                {(() => {
+                  const renderMgrGroup = (gid: number, name: string, count: number, icon: string, real: boolean) => {
+                    const kids = primariesByGroup.get(gid) || [];
+                    const open = mgrGroupOpen.has(gid);
+                    return (
+                      <div className="tg-block" key={'mg' + gid}>
+                        <div className={'tgm-item group' + (open ? ' open' : '')}
+                          onClick={() => toggleMgrGroupOpen(gid)}
+                          title="点击展开/收起组（组只整理一级标签，不能给素材打标签）"
+                          onContextMenu={e => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            if (real) setTagMenu({ x: e.clientX, y: e.clientY, ids: [], kind: 'group', groupId: gid });
+                          }}>
+                          <span className="caret">{open ? '▾' : '▸'}</span>
+                          <span className="gicon">{icon}</span>
+                          <span className="label">{name}</span>
+                          <span className="count">{count}</span>
+                        </div>
+                        {open && kids.map(p => (
+                          <div key={p.id}
+                            className={'tgm-item sub' + (tagSel.has(p.id) ? ' on' : '') + (selParent === p.id ? ' sel' : '')}
+                            style={{ paddingLeft: 24 }}
+                            onClick={e => { setMgrParent(p.id); selectTagRow(p.id, e, kids.map(x => x.id)); }}
+                            onContextMenu={e => {
+                              e.stopPropagation();
+                              e.preventDefault();
+                              const ids = tagSel.has(p.id) ? [...tagSel] : [p.id];
+                              setTagSel(new Set(ids));
+                              setTagMenu({ x: e.clientX, y: e.clientY, ids, kind: 'primary' });
+                            }}>
+                            <span className="tdot" style={{ background: p.color || '#8b93a1' }} />
+                            <span className="label">{p.name}</span>
+                            <span className="count">{p.count}</span>
+                          </div>
+                        ))}
+                        {open && kids.length === 0 && <div className="hint tg-empty">该组还没有一级标签</div>}
+                      </div>
+                    );
+                  };
+                  return (
+                    <>
+                      {tagGroups.map(g => renderMgrGroup(g.id, g.name, g.count, '▤', true))}
+                      {(ungroupedTags > 0 || (primariesByGroup.get(0) || []).length > 0) &&
+                        renderMgrGroup(0, '未分组', ungroupedCount, '▢', false)}
+                    </>
+                  );
+                })()}
+                <div className="hint" style={{ padding: 8 }}>右键空白处新建组 / 一级标签</div>
               </div>
               <div className="tagmgr-right">
                 <div className="tagbar">
-                  <span className="hint">已选 {tagSel.size}</span>
+                  <span className="hint">
+                    {selParent == null
+                      ? '展开左侧组并选中一级标签'
+                      : `二级标签 · ${tags.find(t => t.id === selParent)?.name || ''}`}
+                  </span>
                   <span style={{ flex: 1 }} />
                   <span className="hint">右键标签编辑，右键空白处新建二级标签</span>
                 </div>
@@ -3186,6 +3381,7 @@ export default function App() {
                     setTagMenu({ x: e.clientX, y: e.clientY, ids: [], kind: 'empty-secondary' });
                   }}>
                   <div className="tagchips">
+                    {selParent == null && <div className="hint">左侧选中一个一级标签后，这里显示它的二级标签</div>}
                     {secondaries.map(t => (
                       <button key={t.id}
                         className={'tagchip' + (tagSel.has(t.id) ? ' on' : '')}
@@ -3200,7 +3396,7 @@ export default function App() {
                         <span>{t.name}</span><i>{t.count}</i>
                       </button>
                     ))}
-                    {secondaries.length === 0 && <div className="hint">该分类下没有二级标签（右键新建）</div>}
+                    {selParent != null && secondaries.length === 0 && <div className="hint">该一级标签下没有二级标签（右键新建）</div>}
                   </div>
                 </div>
               </div>
@@ -3218,18 +3414,41 @@ export default function App() {
           top: tagMenu.y
         }}>
           {tagMenu.ids.length === 0 ? (
-            <button onClick={() => {
-              setTagMenu(null);
-              tagNew(tagMenu.kind === 'empty-secondary'
-                ? (selParent !== 'none' ? Number(selParent) : null)
-                : null);
-            }}>{tagMenu.kind === 'empty-secondary' ? '新建二级标签…' : '新建一级标签…'}</button>
+            tagMenu.kind === 'group' ? (
+              <>
+                <button onClick={() => { const gid = tagMenu.groupId!; setTagMenu(null); tagGroupRename(gid); }}>重命名组…</button>
+                <button onClick={() => { const gid = tagMenu.groupId!; setTagMenu(null); tagNew(null, gid); }}>新建一级标签到此组…</button>
+                <div className="ctx-sep" />
+                <button onClick={() => { const gid = tagMenu.groupId!; setTagMenu(null); tagGroupDelete(gid); }}>删除组…</button>
+              </>
+            ) : tagMenu.kind === 'empty-secondary' ? (
+              <button onClick={() => {
+                setTagMenu(null);
+                if (selParent == null) { showToast('请先在左侧选中一个一级标签', 'err'); return; }
+                tagNew(selParent);
+              }}>新建二级标签…</button>
+            ) : (
+              <>
+                <button onClick={() => { setTagMenu(null); tagGroupNew(); }}>新建标签组…</button>
+                <button onClick={() => { setTagMenu(null); tagNew(null, null); }}>新建一级标签（未分组）…</button>
+              </>
+            )
           ) : (<>
             {tagMenu.ids.length === 1 && (
               <button onClick={() => { const ids = tagMenu.ids; setTagMenu(null); tagRename(ids); }}>重命名…</button>
             )}
             {tagMenu.ids.length === 1 && tagMenu.kind === 'primary' && (
               <button onClick={() => { const id = tagMenu.ids[0]; setTagMenu(null); tagNew(id); }}>新建子标签…</button>
+            )}
+            {tagMenu.kind === 'primary' && (
+              <>
+                <div className="ctx-sep" />
+                <div className="ctx-label">移动到组</div>
+                {tagGroups.map(g => (
+                  <button key={g.id} onClick={() => { const ids = tagMenu.ids; setTagMenu(null); moveTagsToGroup(ids, g.id); }}>{g.name}</button>
+                ))}
+                <button onClick={() => { const ids = tagMenu.ids; setTagMenu(null); moveTagsToGroup(ids, null); }}>未分组</button>
+              </>
             )}
             <div className="ctx-sep" />
             <button onClick={() => { const ids = tagMenu.ids; setTagMenu(null); tagDelete(ids); }}>

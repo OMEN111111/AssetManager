@@ -62,7 +62,17 @@ CREATE TABLE IF NOT EXISTS tags(
   id INTEGER PRIMARY KEY,
   parent_id INTEGER,
   name TEXT NOT NULL,
-  color TEXT
+  color TEXT,
+  -- 一级标签所属的标签组（NULL = 未分组；二级标签忽略该字段）
+  group_id INTEGER
+);
+
+-- 标签组：只用来组织一级标签，**不参与给素材打标签**（独立表，asset_tags 里不可能出现组 id）
+CREATE TABLE IF NOT EXISTS tag_groups(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  color TEXT,
+  created_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS asset_tags(
@@ -129,6 +139,13 @@ export function openDb(file: string): DB {
   } catch { /* ignore */ }
   try { db.exec("UPDATE assets SET type='model' WHERE type='scene'"); } catch { /* ignore */ }
   try { db.exec("UPDATE material_overrides SET swizzle='rgb' WHERE swizzle IS NULL"); } catch { /* ignore */ }
+  // 标签组：给已有库补 group_id 列（标签组表本身在 SCHEMA 里 CREATE IF NOT EXISTS）
+  try {
+    const tc = db.prepare('PRAGMA table_info(tags)').all() as any[];
+    if (tc.length && !tc.some(c => c.name === 'group_id')) {
+      db.exec('ALTER TABLE tags ADD COLUMN group_id INTEGER');
+    }
+  } catch { /* ignore */ }
   return db;
 }
 

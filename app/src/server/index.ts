@@ -1574,48 +1574,148 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
 
   if (p === '/api/tags' && req.method === 'GET') {
     const lib = Number(url.searchParams.get('lib') || 0);
-    const tags = db.prepare('SELECT id,parent_id,name,color FROM tags ORDER BY name').all() as any[];
-    const rows = db.prepare(`SELECT at.tag_id tid, COUNT(DISTINCT at.asset_id) c FROM asset_tags at
-      JOIN assets a ON a.id=at.asset_id WHERE a.library_id=? GROUP BY at.tag_id`).all(lib) as any[];
-    const own = new Map<number, number>(rows.map(r => [r.tid, r.c]));
+    const tags = db.prepare('SELECT id,parent_id,name,color,group_id FROM tags ORDER BY name').all() as any[];
+    const groups = db.prepare('SELECT id,name,color FROM tag_groups ORDER BY id').all() as any[];
+    // tag → 素材集合（用于「一级标签 = 自己 + 二级」以及「组 = 组内一级标签并集」的去重计数）
+    const pairs = db.prepare(`SELECT at.tag_id tid, at.asset_id aid FROM asset_tags at
+      JOIN assets a ON a.id=at.asset_id WHERE a.library_id=?`).all(lib) as any[];
+    const byTag = new Map<number, Set<number>>();
+    for (const r of pairs) {
+      const k = Number(r.tid);
+      if (!byTag.has(k)) byTag.set(k, new Set());
+      byTag.get(k)!.add(Number(r.aid));
+    }
     const byParent = new Map<number, any[]>();
     for (const t of tags) {
       const k = t.parent_id || 0;
       if (!byParent.has(k)) byParent.set(k, []);
       byParent.get(k)!.push(t);
     }
+    // 一级标签的素材集合（含其二级标签），组计数用它做并集
+    const primarySets = new Map<number, Set<number>>();
+    for (const t of tags) {
+      if (t.parent_id) continue;
+      const s = new Set<number>(byTag.get(Number(t.id)) || []);
+      for (const c of byParent.get(Number(t.id)) || []) {
+        for (const a of byTag.get(Number(c.id)) || []) s.add(a);
+      }
+      primarySets.set(Number(t.id), s);
+    }
     const out: any[] = [];
     const walk = (parent: number, depth: number) => {
       for (const t of byParent.get(parent) || []) {
-        const kids = byParent.get(t.id) || [];
-        const count = (own.get(t.id) || 0) + kids.reduce((s, k) => s + (own.get(k.id) || 0), 0);
-        out.push({ id: t.id, parentId: t.parent_id, name: t.name, color: t.color, depth, count });
+        const count = primarySets.get(Number(t.id))?.size ?? (byTag.get(Number(t.id))?.size || 0);
+        out.push({
+          id: t.id, parentId: t.parent_id, name: t.name, color: t.color,
+          groupId: t.group_id ?? null, depth, count
+        });
         walk(t.id, depth + 1);
       }
     };
     walk(0, 0);
-    return json(res, 200, { tags: out });
+    // 组计数 = 组内一级标签的并集（不是简单相加，避免同一素材被算多次）
+    const groupsOut = groups.map(g => {
+      const s = new Set<number>();
+      for (const t of tags) {
+        if (t.parent_id) continue;
+        if (Number(t.group_id) !== Number(g.id)) continue;
+        for (const a of primarySets.get(Number(t.id)) || []) s.add(a);
+      }
+      return { id: Number(g.id), name: String(g.name), color: g.color || null, count: s.size };
+    });
+    const ungroupedSet = new Set<number>();
+    for (const t of tags) {
+      if (t.parent_id || t.group_id) continue;
+      for (const a of primarySets.get(Number(t.id)) || []) ungroupedSet.add(a);
+    }
+    return json(res, 200, {
+      tags: out,
+      groups: groupsOut,
+      ungroupedCount: ungroupedSet.size,
+      ungroupedTags: tags.filter(t => !t.parent_id && !t.group_id).length
+    });
   }
 
   if (p === '/api/tags' && req.method === 'POST') {
     const b = await body(req);
     if (!b.name) return json(res, 400, { error: 'name required' });
-    const info = db.prepare('INSERT INTO tags(parent_id,name,color) VALUES(?,?,?)')
-      .run(b.parentId ?? null, String(b.name), b.color ?? '#8b93a1');
+    const parentId = b.parentId ?? null;
+    // 组只能挂在一级标签上（二级标签忽略 groupId）
+    const groupId = parentId ? null : (b.groupId ?? null);
+    const info = db.prepare('INSERT INTO tags(parent_id,name,color,group_id) VALUES(?,?,?,?)')
+      .run(parentId, String(b.name), b.color ?? '#8b93a1', groupId);
     return json(res, 200, db.prepare('SELECT * FROM tags WHERE id=?').get(Number(info.lastInsertRowid)));
   }
 
   const mTag = p.match(/^\/api\/tags\/(\d+)$/);
   if (mTag && req.method === 'PATCH') {
+    const id = Number(mTag[1]);
     const b = await body(req);
-    if (b.name !== undefined) db.prepare('UPDATE tags SET name=? WHERE id=?').run(String(b.name), Number(mTag[1]));
-    if (b.color !== undefined) db.prepare('UPDATE tags SET color=? WHERE id=?').run(String(b.color), Number(mTag[1]));
-    if (b.parentId !== undefined) db.prepare('UPDATE tags SET parent_id=? WHERE id=?').run(b.parentId, Number(mTag[1]));
-    return json(res, 200, db.prepare('SELECT * FROM tags WHERE id=?').get(Number(mTag[1])));
+    if (b.name !== undefined) db.prepare('UPDATE tags SET name=? WHERE id=?').run(String(b.name), id);
+    if (b.color !== undefined) db.prepare('UPDATE tags SET color=? WHERE id=?').run(String(b.color), id);
+    if (b.parentId !== undefined) {
+      db.prepare('UPDATE tags SET parent_id=? WHERE id=?').run(b.parentId, id);
+      // 变成二级标签后不再属于任何组
+      if (b.parentId !== null && b.parentId !== '') db.prepare('UPDATE tags SET group_id=NULL WHERE id=?').run(id);
+    }
+    if (b.groupId !== undefined) {
+      // 只有一级标签才能进组
+      const row = db.prepare('SELECT parent_id FROM tags WHERE id=?').get(id) as any;
+      if (row && !row.parent_id) db.prepare('UPDATE tags SET group_id=? WHERE id=?').run(b.groupId ?? null, id);
+    }
+    return json(res, 200, db.prepare('SELECT * FROM tags WHERE id=?').get(id));
   }
   if (mTag && req.method === 'DELETE') {
-    db.prepare('DELETE FROM tags WHERE id=?').run(Number(mTag[1]));
+    const id = Number(mTag[1]);
+    // 删一级标签时，它下面的二级标签升为一级并继承组，避免变成取不到父级的孤儿
+    const row = db.prepare('SELECT parent_id,group_id FROM tags WHERE id=?').get(id) as any;
+    if (row && !row.parent_id) {
+      db.prepare('UPDATE tags SET parent_id=NULL, group_id=? WHERE parent_id=?').run(row.group_id ?? null, id);
+    }
+    db.prepare('DELETE FROM tags WHERE id=?').run(id);
     return json(res, 200, { ok: true });
+  }
+
+  // ---------------- 标签组（只组织一级标签，不能给素材打标签） ----------------
+  if (p === '/api/tag-groups' && req.method === 'GET') {
+    const groups = db.prepare('SELECT id,name,color FROM tag_groups ORDER BY id').all();
+    return json(res, 200, { groups });
+  }
+  if (p === '/api/tag-groups' && req.method === 'POST') {
+    const b = await body(req);
+    if (!String(b.name || '').trim()) return json(res, 400, { error: 'name required' });
+    const info = db.prepare('INSERT INTO tag_groups(name,color,created_at) VALUES(?,?,?)')
+      .run(String(b.name).trim(), b.color ?? '#8b93a1', Date.now());
+    return json(res, 200, db.prepare('SELECT * FROM tag_groups WHERE id=?').get(Number(info.lastInsertRowid)));
+  }
+  const mTagGroup = p.match(/^\/api\/tag-groups\/(\d+)$/);
+  if (mTagGroup && req.method === 'PATCH') {
+    const id = Number(mTagGroup[1]);
+    const b = await body(req);
+    if (b.name !== undefined) db.prepare('UPDATE tag_groups SET name=? WHERE id=?').run(String(b.name), id);
+    if (b.color !== undefined) db.prepare('UPDATE tag_groups SET color=? WHERE id=?').run(String(b.color), id);
+    return json(res, 200, db.prepare('SELECT * FROM tag_groups WHERE id=?').get(id));
+  }
+  if (mTagGroup && req.method === 'DELETE') {
+    const id = Number(mTagGroup[1]);
+    // 只删组本身：组内一级标签退回「未分组」，标签与素材关联都不动
+    db.prepare('UPDATE tags SET group_id=NULL WHERE group_id=?').run(id);
+    db.prepare('DELETE FROM tag_groups WHERE id=?').run(id);
+    return json(res, 200, { ok: true });
+  }
+  // 批量把一级标签移入/移出组（groupId=null 表示未分组）
+  if (p === '/api/tags/group' && req.method === 'POST') {
+    const b = await body(req);
+    const ids: number[] = (b.ids || []).map(Number).filter(Boolean);
+    const groupId = b.groupId === null || b.groupId === undefined || b.groupId === '' ? null : Number(b.groupId);
+    if (!ids.length) return json(res, 400, { error: 'ids required' });
+    if (groupId !== null) {
+      const g = db.prepare('SELECT id FROM tag_groups WHERE id=?').get(groupId);
+      if (!g) return json(res, 404, { error: 'group not found' });
+    }
+    const st = db.prepare('UPDATE tags SET group_id=? WHERE id=? AND parent_id IS NULL');
+    for (const id of ids) st.run(groupId, id);
+    return json(res, 200, { ok: true, moved: ids.length });
   }
 
   if (p === '/api/tags/assign' && req.method === 'POST') {
